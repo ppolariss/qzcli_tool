@@ -15,10 +15,12 @@ setup(
     install_requires=[
         "requests>=2.28",
         "rich>=13.0",
+        "mcp>=1.0,<2.0",
     ],
     entry_points={
         "console_scripts": [
             "qzcli=qzcli.cli:main",
+            "qzcli-mcp=qzcli.mcp_server:main",
         ],
     },
 )

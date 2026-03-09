@@ -28,7 +28,7 @@ qzcli login -u 用户名 -p 密码 && qzcli avail
 ## 安装依赖
 
 ```bash
-pip install rich requests
+pip install rich requests mcp
 ```
 
 ## 快速开始
@@ -51,6 +51,82 @@ qzcli ls -c -r
 > - 首次使用必须执行 `qzcli res -u`，会自动发现并缓存所有你有权限访问的工作空间
 > - 如果遇到 `未找到名称为 'xxx' 的工作空间` 错误，说明缓存需要更新，请重新执行 `qzcli res -u`
 > - 新加入的工作空间/项目需要重新执行 `qzcli res -u` 来更新缓存
+
+## MCP Server
+
+如果你想在 Codex 或 Claude 里直接调用启智平台相关能力，可以把 `qzcli` 作为 MCP 工具接进去。
+
+```bash
+# 1. 进入项目目录（自行替换 xxxxx）
+cd /inspire/xxxxx/qzcli_tool
+
+# 2. 安装
+python -m pip install -e .
+```
+
+安装完成后，可以先检查命令是否已经可用：
+
+```bash
+which qzcli-mcp
+```
+
+### 接入 Codex
+
+执行下面两条命令即可：
+
+```bash
+codex mcp add qzcli -- qzcli-mcp
+codex mcp list
+```
+
+如果你想固定使用绝对路径，也可以这样写：
+
+```bash
+codex mcp add qzcli -- /root/miniconda3/bin/qzcli-mcp （根据 which qzcli-mcp 的返回地址改)
+```
+
+### 接入 Claude Code
+
+执行下面两条命令即可：
+
+```bash
+claude mcp add qzcli -- qzcli-mcp
+claude mcp list
+```
+
+如果你想固定使用绝对路径，也可以这样写：
+
+```bash
+claude mcp add qzcli -- /root/miniconda3/bin/qzcli-mcp （根据 which qzcli-mcp 的返回地址改)
+```
+
+### 使用说明
+
+正常使用时，**不需要**你手动先运行 `qzcli-mcp`。
+
+把它加到 Codex 或 Claude 后，客户端会自动调用它，你手动运行 `qzcli-mcp`，一般只是为了排查问题，你可以直接这样告诉你的 Codex 或者 Claude Code：
+
+```bash
+开工了，我要登陆启智平台！
+
+帮我看下现在有多少张华为Atlas950是空闲的
+
+帮我看下现在有多少台某型号卡是空闲的，我要整台的8卡
+```
+
+即便数字部某天又在生产环境修改了返回值字段，模型也能根据原始返回JSON快速判断现在哪个字段代表原来的意图，无需手动再次重装qzcli工具（依赖于模型的上下文理解能力）
+
+#### 常见排障
+
+- 如果提示找不到 `qzcli-mcp`，通常重新执行一次安装即可：
+
+```bash
+cd /inspire/xxxxx/qzcli_tool
+python -m pip install -e .
+```
+
+- 如果已经注册过但客户端里看不到，先执行一次 `codex mcp list` 或 `claude mcp list` 确认是否注册成功
+- 如果你手动运行 `qzcli-mcp` 后立刻报错，先修复启动报错，再回到客户端里接入
 
 ## 推荐工作流
 
