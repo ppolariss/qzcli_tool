@@ -8,7 +8,7 @@ import time
 import argparse
 import unicodedata
 from pathlib import Path
-from typing import Optional, List, Sequence
+from typing import Optional, List, Sequence, Dict, Any
 
 from . import __version__
 from .config import (
@@ -138,6 +138,223 @@ def _format_percent(numerator: int, denominator: int) -> str:
     return f"{(numerator / denominator) * 100:.1f}%"
 
 
+def _cache_workspace_resources(api, workspace_id: str, cookie: str, workspace_name: str = "") -> Dict[str, int]:
+    """从 API 拉取并缓存单个工作空间的资源信息。"""
+    result = api.list_jobs_with_cookie(workspace_id, cookie, page_size=200)
+    jobs = result.get("jobs", [])
+    resources = api.extract_resources_from_jobs(jobs)
+
+    # 使用 cluster_basic_info 获取完整计算组列表，避免仅依赖历史任务。
+    try:
+        cluster_info = api.get_cluster_basic_info(workspace_id, cookie)
+        compute_groups_from_api = []
+
+        for cg in cluster_info.get("compute_groups", []):
+            for lcg in cg.get("logic_compute_groups", []):
+                lcg_id = lcg.get("logic_compute_group_id", "")
+                lcg_name = lcg.get("logic_compute_group_name", "")
+                brand = lcg.get("brand", "")
+                resource_types = lcg.get("resource_types", [])
+                gpu_type = resource_types[0] if resource_types else ""
+
+                if lcg_id:
+                    compute_groups_from_api.append({
+                        "id": lcg_id,
+                        "name": lcg_name,
+                        "gpu_type": brand or gpu_type,
+                        "workspace_id": workspace_id,
+                    })
+
+        if compute_groups_from_api:
+            resources["compute_groups"] = compute_groups_from_api
+    except Exception:
+        pass
+
+    save_resources(workspace_id, resources, workspace_name)
+    return {
+        "projects": len(resources.get("projects", [])),
+        "compute_groups": len(resources.get("compute_groups", [])),
+    }
+
+
+def _parse_cpu_thresholds(raw_values: Optional[List[str]]) -> List[Dict[str, float]]:
+    """解析 --cpu-th 参数。"""
+    default_values = ["40,200", "55,300",  "55,500", "100,400", "100,2000", "120,500"]
+    values = raw_values if raw_values else default_values
+    thresholds = []
+
+    for raw in values:
+        text = str(raw).strip()
+        if "," not in text:
+            raise ValueError(f"无效阈值 '{text}'，格式应为 cpu,mem")
+        cpu_s, mem_s = text.split(",", 1)
+        try:
+            cpu = float(cpu_s.strip())
+            mem = float(mem_s.strip())
+        except ValueError:
+            raise ValueError(f"无效阈值 '{text}'，cpu/mem 必须是数字")
+        thresholds.append({"cpu": cpu, "mem": mem})
+
+    return thresholds
+
+
+def _resource_free_value(resource: Dict[str, Any]) -> float:
+    """统一读取资源空闲值（优先 free，其次 total-used）。"""
+    if not resource:
+        return 0.0
+    free_value = resource.get("free")
+    if free_value is not None:
+        try:
+            return float(free_value)
+        except Exception:
+            return 0.0
+    try:
+        total = float(resource.get("total", resource.get("total_gib", 0)) or 0)
+        used = float(resource.get("used", resource.get("used_gib", 0)) or 0)
+        return max(total - used, 0.0)
+    except Exception:
+        return 0.0
+
+
+def _node_type_name(node: Dict[str, Any]) -> str:
+    """提取节点类型名称。"""
+    return (
+        node.get("node_type")
+        or node.get("type")
+        or node.get("node_type_display")
+        or node.get("node_kind")
+        or "unknown"
+    )
+
+
+def _analyze_cpu_capacity(nodes: List[Dict[str, Any]], thresholds: List[Dict[str, float]]) -> Dict[str, Any]:
+    """按节点类型统计 ready 节点的 CPU/MEM 空闲容量。"""
+    groups: Dict[str, Dict[str, Any]] = {}
+    for node in nodes:
+        if str(node.get("status", "")).lower() != "ready":
+            continue
+
+        node_type = _node_type_name(node)
+        cpu_free = _resource_free_value(node.get("cpu", {}))
+        mem_free = _resource_free_value(node.get("memory", {}))
+
+        group = groups.setdefault(
+            node_type,
+            {
+                "ready": 0,
+                "cpu_free": 0.0,
+                "mem_free": 0.0,
+                "above": [0] * len(thresholds),
+            },
+        )
+        group["ready"] += 1
+        group["cpu_free"] += cpu_free
+        group["mem_free"] += mem_free
+
+        for idx, threshold in enumerate(thresholds):
+            if cpu_free >= threshold["cpu"] and mem_free >= threshold["mem"]:
+                group["above"][idx] += 1
+
+    overall = {
+        "ready": 0,
+        "cpu_free": 0.0,
+        "mem_free": 0.0,
+        "above": [0] * len(thresholds),
+    }
+    for group in groups.values():
+        overall["ready"] += group["ready"]
+        overall["cpu_free"] += group["cpu_free"]
+        overall["mem_free"] += group["mem_free"]
+        overall["above"] = [a + b for a, b in zip(overall["above"], group["above"])]
+
+    return {"groups": groups, "overall": overall}
+
+
+def _collect_nodes_for_compute_group(
+    api,
+    workspace_id: str,
+    cookie: str,
+    logic_compute_group_id: str,
+    page_size: int = 200,
+) -> List[Dict[str, Any]]:
+    """分页拉取某个计算组的全部节点。"""
+    nodes: List[Dict[str, Any]] = []
+    page_num = 1
+    while True:
+        data = api.list_node_dimension(
+            workspace_id,
+            cookie,
+            logic_compute_group_id=logic_compute_group_id,
+            page_num=page_num,
+            page_size=page_size,
+        )
+        page_nodes = data.get("node_dimensions", [])
+        if not page_nodes:
+            break
+
+        nodes.extend(page_nodes)
+        total = data.get("total")
+        if total is not None and len(nodes) >= int(total):
+            break
+        if len(page_nodes) < page_size:
+            break
+        page_num += 1
+
+    return nodes
+
+
+def _print_cpu_capacity_table(display, title: str, analysis: Dict[str, Any], thresholds: List[Dict[str, float]]) -> None:
+    """输出 CPU/MEM 空闲容量统计表。"""
+    groups = analysis["groups"]
+    overall = analysis["overall"]
+
+    threshold_labels = [f"{t['cpu']:g},{t['mem']:g}" for t in thresholds]
+    headers = ["节点类型", "Ready", "CPU空闲", "MEM空闲"] + [f">={label}" for label in threshold_labels]
+
+    rows = []
+    for node_type in sorted(groups.keys()):
+        group = groups[node_type]
+        rows.append(
+            [
+                node_type,
+                group["ready"],
+                f"{group['cpu_free']:.2f}",
+                f"{group['mem_free']:.2f}",
+                *group["above"],
+            ]
+        )
+
+    rows.append(
+        [
+            "ALL",
+            overall["ready"],
+            f"{overall['cpu_free']:.2f}",
+            f"{overall['mem_free']:.2f}",
+            *overall["above"],
+        ]
+    )
+
+    display.print(f"[bold]{title}[/bold]")
+    if RICH_TABLE_AVAILABLE and getattr(display, "console", None):
+        table = Table(box=box.MINIMAL, show_header=True, header_style="bold", expand=False, padding=(0, 1))
+        table.add_column("节点类型", style="cyan", overflow="fold")
+        table.add_column("Ready", justify="right")
+        table.add_column("CPU空闲", justify="right")
+        table.add_column("MEM空闲", justify="right")
+        for label in threshold_labels:
+            table.add_column(f">={label}", justify="right")
+
+        for row in rows:
+            table.add_row(*[str(col) for col in row])
+        display.console.print(table)
+    else:
+        aligns = ["left", "right", "right", "right"] + ["right"] * len(threshold_labels)
+        table_lines = _render_plain_table(headers=headers, rows=rows, aligns=aligns, max_widths=[26, 7, 12, 12] + [9] * len(threshold_labels))
+        for line in table_lines:
+            display.print(line)
+    display.print("")
+
+
 def cmd_init(args):
     """初始化配置"""
     display = get_display()
@@ -163,6 +380,45 @@ def cmd_init(args):
     if api.test_connection():
         display.print_success("配置成功！认证信息已保存")
         display.print(f"配置目录: {CONFIG_DIR}")
+
+        # init 后自动完成 cookie 登录并预拉取全部工作空间到本地缓存，
+        # 这样后续可以直接使用 qzcli avail。
+        try:
+            display.print("[dim]正在获取登录 Cookie...[/dim]")
+            cookie = api.login_with_cas(username, password)
+            save_cookie(cookie)
+            display.print_success("Cookie 已保存")
+
+            display.print("[dim]正在获取可访问的工作空间列表...[/dim]")
+            workspaces = api.list_workspaces(cookie)
+            if not workspaces:
+                display.print_warning("未发现可访问的工作空间，已跳过缓存预热")
+                return 0
+
+            display.print(f"[dim]正在预热缓存（共 {len(workspaces)} 个工作空间）...[/dim]")
+            success_count = 0
+            for ws in workspaces:
+                ws_id = ws.get("id", "")
+                ws_name = ws.get("name", "")
+                if not ws_id:
+                    continue
+                try:
+                    stats = _cache_workspace_resources(api, ws_id, cookie, ws_name)
+                    success_count += 1
+                    display.print(
+                        f"  ✓ {ws_name or ws_id}: {stats['projects']} 项目, {stats['compute_groups']} 计算组"
+                    )
+                except Exception as e:
+                    display.print_warning(f"  ✗ {ws_name or ws_id}: {e}")
+
+            if success_count > 0:
+                display.print_success("缓存预热完成，后续可直接运行 qzcli avail")
+            else:
+                display.print_warning("缓存预热未成功，请稍后手动运行 qzcli res -u")
+        except QzAPIError as e:
+            display.print_warning(f"自动登录或缓存预热失败: {e}")
+            display.print("[dim]可稍后手动运行: qzcli login && qzcli res -u[/dim]")
+
         return 0
     else:
         display.print_error("认证失败，请检查用户名和密码")
@@ -717,43 +973,9 @@ def cmd_workspaces(args):
                 display.print(f"[dim]正在更新 {ws_name or ws_id}...[/dim]")
                 
                 try:
-                    # 1. 从任务历史提取项目和规格信息
-                    result = api.list_jobs_with_cookie(ws_id, cookie, page_size=200)
-                    jobs = result.get("jobs", [])
-                    resources = api.extract_resources_from_jobs(jobs)
-                    
-                    # 2. 使用 cluster_basic_info API 获取完整的计算组列表
-                    try:
-                        cluster_info = api.get_cluster_basic_info(ws_id, cookie)
-                        compute_groups_from_api = []
-                        
-                        for cg in cluster_info.get("compute_groups", []):
-                            for lcg in cg.get("logic_compute_groups", []):
-                                lcg_id = lcg.get("logic_compute_group_id", "")
-                                lcg_name = lcg.get("logic_compute_group_name", "")
-                                brand = lcg.get("brand", "")
-                                resource_types = lcg.get("resource_types", [])
-                                gpu_type = resource_types[0] if resource_types else ""
-                                
-                                if lcg_id:
-                                    compute_groups_from_api.append({
-                                        "id": lcg_id,
-                                        "name": lcg_name,
-                                        "gpu_type": brand or gpu_type,
-                                        "workspace_id": ws_id,
-                                    })
-                        
-                        # 合并计算组（API 获取的优先）
-                        if compute_groups_from_api:
-                            resources["compute_groups"] = compute_groups_from_api
-                    except Exception:
-                        pass  # 获取计算组失败不影响其他资源
-                    
-                    # 保存到本地缓存
-                    save_resources(ws_id, resources, ws_name)
-                    
-                    projects_count = len(resources.get("projects", []))
-                    cg_count = len(resources.get("compute_groups", []))
+                    stats = _cache_workspace_resources(api, ws_id, cookie, ws_name)
+                    projects_count = stats["projects"]
+                    cg_count = stats["compute_groups"]
                     display.print(f"  ✓ {ws_name or ws_id}: {projects_count} 项目, {cg_count} 计算组")
                 except Exception as e:
                     display.print_warning(f"  ✗ {ws_name or ws_id}: {e}")
@@ -1038,6 +1260,22 @@ def cmd_avail(args):
     required_nodes = args.nodes
     group_filter = args.group
     all_results = []  # 所有工作空间的结果汇总
+    cpu_workspace_results = []
+
+    if args.cpu and args.export:
+        display.print_warning("--cpu 模式下忽略 --export")
+    if args.cpu and args.low_priority:
+        display.print_warning("--cpu 模式下忽略 --lp/--low-priority")
+    if args.cpu and required_nodes:
+        display.print_warning("--cpu 模式下忽略 --nodes")
+
+    cpu_thresholds: List[Dict[str, float]] = []
+    if args.cpu:
+        try:
+            cpu_thresholds = _parse_cpu_thresholds(args.cpu_th)
+        except ValueError as e:
+            display.print_error(str(e))
+            return 1
     
     from collections import defaultdict
     
@@ -1070,6 +1308,37 @@ def cmd_avail(args):
             continue
         
         display.print(f"[dim]正在查询 {ws_name} 的 {len(compute_groups)} 个计算组...[/dim]")
+
+        if args.cpu:
+            workspace_nodes = []
+            for lcg_id in compute_groups.keys():
+                try:
+                    workspace_nodes.extend(
+                        _collect_nodes_for_compute_group(
+                            api,
+                            workspace_id,
+                            cookie,
+                            logic_compute_group_id=lcg_id,
+                            page_size=max(1, args.cpu_page_size),
+                        )
+                    )
+                except QzAPIError as e:
+                    display.print_warning(f"查询 {ws_name} 的计算组 {lcg_id} 失败: {e}")
+                    continue
+
+            if not workspace_nodes:
+                display.print_warning(f"{ws_name} 未获取到节点数据")
+                continue
+
+            analysis = _analyze_cpu_capacity(workspace_nodes, cpu_thresholds)
+            cpu_workspace_results.append(
+                {
+                    "workspace_id": workspace_id,
+                    "workspace_name": ws_name,
+                    "analysis": analysis,
+                }
+            )
+            continue
         
         # 低优任务统计（仅在 --lp 参数启用时计算）
         node_low_priority_gpu = defaultdict(int)  # node_name -> low_priority_gpu_count
@@ -1189,6 +1458,39 @@ def cmd_avail(args):
                 return 1
             display.print_warning(f"查询 {ws_name} 失败: {e}")
             continue
+
+    if args.cpu:
+        if not cpu_workspace_results:
+            display.print_error("未能获取任何工作空间的 CPU/MEM 节点数据")
+            return 1
+
+        display.print(f"\n[bold]CPU/MEM 空闲资源汇总[/bold]\n")
+        for entry in cpu_workspace_results:
+            ws_name = entry["workspace_name"] or entry["workspace_id"]
+            _print_cpu_capacity_table(display, f"工作空间: {ws_name}", entry["analysis"], cpu_thresholds)
+
+        if len(cpu_workspace_results) > 1:
+            merged_overall = {
+                "ready": 0,
+                "cpu_free": 0.0,
+                "mem_free": 0.0,
+                "above": [0] * len(cpu_thresholds),
+            }
+            for entry in cpu_workspace_results:
+                overall = entry["analysis"]["overall"]
+                merged_overall["ready"] += overall["ready"]
+                merged_overall["cpu_free"] += overall["cpu_free"]
+                merged_overall["mem_free"] += overall["mem_free"]
+                merged_overall["above"] = [
+                    a + b for a, b in zip(merged_overall["above"], overall["above"])
+                ]
+            _print_cpu_capacity_table(
+                display,
+                "总计（所有工作空间）",
+                {"groups": {}, "overall": merged_overall},
+                cpu_thresholds,
+            )
+        return 0
     
     if not all_results:
         display.print_error("未能获取任何计算组的节点信息")
@@ -2341,6 +2643,9 @@ def main():
     avail_parser.add_argument("--export", "-e", action="store_true", help="输出可用于脚本的环境变量格式")
     avail_parser.add_argument("--verbose", "-v", action="store_true", help="显示空闲节点名称列表")
     avail_parser.add_argument("--lp", "--low-priority", action="store_true", dest="low_priority", help="计算低优任务占用节点（较慢）")
+    avail_parser.add_argument("--cpu", action="store_true", help="按节点类型统计 CPU/MEM 空闲资源")
+    avail_parser.add_argument("--cpu-th", action="append", help="CPU/MEM 阈值，格式 cpu,mem；可重复")
+    avail_parser.add_argument("--cpu-page-size", type=int, default=200, help="CPU 统计模式节点分页大小（默认 200）")
     
     # usage 命令
     usage_parser = subparsers.add_parser("usage", help="统计工作空间的 GPU 使用分布")
