@@ -2423,7 +2423,7 @@ def cmd_batch(args):
             project=defaults.get("project", ""),
             compute_group=defaults.get("compute_group", ""),
             spec=defaults.get("spec", ""),
-            image=defaults.get("image", "docker.sii.shaipower.online/inspire-studio/dhyu-wan-torch29:0.4"),
+            image=defaults.get("image", ""),
             image_type=defaults.get("image_type", "SOURCE_PRIVATE"),
             instances=defaults.get("instances", 1),
             shm=defaults.get("shm", 1200),
@@ -2663,7 +2663,7 @@ def main():
     create_parser.add_argument("--project", "-p", help="项目 ID 或名称（不指定则自动选择）")
     create_parser.add_argument("--compute-group", "-g", dest="compute_group", help="计算组 ID 或名称")
     create_parser.add_argument("--spec", "-s", help="资源规格 ID（不指定则自动选择）")
-    create_parser.add_argument("--image", "-i", default="docker.sii.shaipower.online/inspire-studio/dhyu-wan-torch29:0.4", help="Docker 镜像")
+    create_parser.add_argument("--image", "-i", help="Docker 镜像")
     create_parser.add_argument("--image-type", dest="image_type", default="SOURCE_PRIVATE", help="镜像类型（默认 SOURCE_PRIVATE）")
     create_parser.add_argument("--instances", type=int, default=1, help="实例数量（默认 1）")
     create_parser.add_argument("--shm", type=int, default=1200, help="共享内存 GiB（默认 1200）")
