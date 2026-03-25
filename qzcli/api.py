@@ -144,6 +144,11 @@ class QzAPI:
         """创建任务"""
         result = self._request("/openapi/v1/train_job/create", config)
         return result.get("data", result)
+
+    def create_hpc_job(self, config: Dict[str, Any]) -> Dict[str, Any]:
+        """创建 HPC 任务"""
+        result = self._request("/openapi/v1/hpc_jobs/create", config)
+        return result.get("data", result)
     
     def test_connection(self) -> bool:
         """测试连接"""

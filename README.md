@@ -259,6 +259,7 @@ qzcli ls --no-refresh       # 不刷新状态
 | 命令 | 别名 | 说明 |
 |------|------|------|
 | `create` | `create-job` | 创建并提交任务 |
+| `create-hpc` | `create-hpc-job` | 创建并提交 HPC 任务 |
 | `batch` | | 从 JSON 配置文件批量提交任务 |
 
 ```bash
@@ -287,6 +288,21 @@ qzcli create --name test --command "echo hi" --workspace "分布式训练" --dry
 
 # JSON 输出（供脚本集成）
 qzcli create --name test --command "echo hi" --workspace "分布式训练" --json
+
+# 创建 HPC 任务
+qzcli create-hpc \
+  --name "my-hpc-job" \
+  --entrypoint "bash /workspace/run_hpc.sh" \
+  --workspace "分布式训练" \
+  --project "扩散" \
+  --compute-group "3号机房-2" \
+  --spec b618f5cb-c119-4422-937e-f39131853076 \
+  --image "docker.sii.shaipower.online/inspire-studio/dhyu-wan-torch29:0.4" \
+  --instances 2 \
+  --number-of-tasks 16 \
+  --cpus-per-task 8 \
+  --memory-per-cpu 8Gi \
+  --enable-hyper-threading
 ```
 
 **参数说明:**
@@ -309,6 +325,56 @@ qzcli create --name test --command "echo hi" --workspace "分布式训练" --jso
 | `--json` | | | JSON 输出 |
 
 > **提示**: `--project`、`--compute-group`、`--spec` 省略时会自动从 `qzcli res` 缓存中选取第一个。首次使用前请先运行 `qzcli res -u` 发现资源。
+
+### 创建 HPC 任务
+
+```bash
+# 提交 HPC 任务
+qzcli create-hpc \
+  --name "my-hpc-job" \
+  --entrypoint "bash /workspace/run_hpc.sh" \
+  --workspace "分布式训练" \
+  --project "扩散" \
+  --compute-group "3号机房-2" \
+  --spec b618f5cb-c119-4422-937e-f39131853076 \
+  --image "docker.sii.shaipower.online/inspire-studio/dhyu-wan-torch29:0.4" \
+  --instances 2 \
+  --number-of-tasks 16 \
+  --cpus-per-task 8 \
+  --memory-per-cpu 8Gi
+
+# 预览 payload 不提交
+qzcli create-hpc --name test-hpc --entrypoint "hostname" --workspace "分布式训练" --image repo/hpc:latest --memory-per-cpu 4Gi --dry-run
+
+# JSON 输出
+qzcli create-hpc --name test-hpc --entrypoint "hostname" --workspace "分布式训练" --image repo/hpc:latest --memory-per-cpu 4Gi --json
+
+# 如需写入本地任务记录，显式开启追踪
+qzcli create-hpc --name test-hpc --entrypoint "hostname" --workspace "分布式训练" --image repo/hpc:latest --memory-per-cpu 4Gi --track
+```
+
+**参数说明:**
+
+| 参数 | 短选项 | 默认值 | 说明 |
+|------|--------|--------|------|
+| `--name` | `-n` | (必填) | 任务名称 |
+| `--entrypoint` / `--command` | `-c` | (必填) | HPC 入口命令 |
+| `--workspace` | `-w` | | 工作空间 ID 或名称 |
+| `--project` | `-p` | (自动选择) | 项目 ID 或名称 |
+| `--compute-group` | `-g` | (自动选择) | 计算组 ID 或名称 |
+| `--spec` | `-s` | (自动选择) | 资源规格 ID |
+| `--image` | `-i` | (必填) | Docker 镜像 |
+| `--image-type` | | `SOURCE_PRIVATE` | 镜像类型 |
+| `--instances` / `--instance-count` | | 1 | 实例数量 |
+| `--number-of-tasks` | | 1 | 任务总数 |
+| `--cpus-per-task` | | 1 | 每个任务的 CPU 数 |
+| `--memory-per-cpu` | | (必填) | 每个 CPU 的内存，如 `8Gi` |
+| `--enable-hyper-threading` | | 关闭 | 启用超线程 |
+| `--track` | | | 写入本地任务记录 |
+| `--dry-run` | | | 只预览不提交 |
+| `--json` | | | JSON 输出 |
+
+> **提示**: `create-hpc` 默认不自动追踪到本地，因为当前 `qzcli` 的状态刷新接口只适配了 `train_job/*`，HPC 任务如需本地记录请显式加 `--track`。
 
 ### 批量提交任务
 

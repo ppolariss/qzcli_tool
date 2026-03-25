@@ -2160,13 +2160,8 @@ def _auto_select_resource(workspace_id, resource_type):
     return first["id"], first.get("name", first["id"])
 
 
-def cmd_create(args):
-    """创建任务"""
-    display = get_display()
-    api = get_api()
-    store = get_store()
-
-    # --- Resolve workspace ---
+def _resolve_create_context(args, display):
+    """Resolve workspace, project, compute group and spec for create-style commands."""
     workspace_id = None
     ws_display = ""
     if args.workspace:
@@ -2177,15 +2172,14 @@ def cmd_create(args):
             if not workspace_id:
                 display.print_error(f"未找到名称为 '{args.workspace}' 的工作空间")
                 display.print("[dim]使用 qzcli res --list 查看已缓存的工作空间[/dim]")
-                return 1
+                return None
         ws_resources = get_workspace_resources(workspace_id)
         ws_display = (ws_resources or {}).get("name", workspace_id)
     else:
         display.print_error("请指定工作空间: --workspace <名称或ID>")
         display.print("[dim]使用 qzcli res --list 查看已缓存的工作空间[/dim]")
-        return 1
+        return None
 
-    # --- Resolve project ---
     project_id = None
     proj_display = ""
     if args.project:
@@ -2197,16 +2191,15 @@ def cmd_create(args):
             if not project_id:
                 display.print_error(f"未找到项目 '{args.project}'")
                 display.print("[dim]使用 qzcli res -w <workspace> 查看可用项目[/dim]")
-                return 1
+                return None
     else:
         project_id, proj_display = _auto_select_resource(workspace_id, "projects")
         if not project_id:
             display.print_error("未指定项目且缓存中无可用项目")
             display.print("[dim]使用 --project 指定，或先运行 qzcli res -u[/dim]")
-            return 1
+            return None
         display.print(f"[dim]自动选择项目: {proj_display} ({project_id})[/dim]")
 
-    # --- Resolve compute group ---
     compute_group_id = None
     cg_display = ""
     if args.compute_group:
@@ -2218,43 +2211,66 @@ def cmd_create(args):
             if not compute_group_id:
                 display.print_error(f"未找到计算组 '{args.compute_group}'")
                 display.print("[dim]使用 qzcli res -w <workspace> 查看可用计算组[/dim]")
-                return 1
+                return None
     else:
         compute_group_id, cg_display = _auto_select_resource(workspace_id, "compute_groups")
         if not compute_group_id:
             display.print_error("未指定计算组且缓存中无可用计算组")
             display.print("[dim]使用 --compute-group 指定，或先运行 qzcli res -u[/dim]")
-            return 1
+            return None
         display.print(f"[dim]自动选择计算组: {cg_display} ({compute_group_id})[/dim]")
 
-    # --- Resolve spec ---
     spec_id = None
+    spec_display = ""
     if args.spec:
         spec_id = args.spec
+        spec_display = spec_id
         if not (spec_id.count("-") >= 4 or len(spec_id) > 20):
-            resolved, _ = _resolve_resource_id(workspace_id, "specs", spec_id)
+            resolved, resolved_name = _resolve_resource_id(workspace_id, "specs", spec_id)
             if resolved:
                 spec_id = resolved
+                spec_display = resolved_name or resolved
     else:
         spec_id, spec_display = _auto_select_resource(workspace_id, "specs")
         if not spec_id:
             display.print_error("未指定资源规格且缓存中无可用规格")
             display.print("[dim]使用 --spec 指定，或先运行 qzcli res -u[/dim]")
-            return 1
+            return None
         display.print(f"[dim]自动选择规格: {spec_display} ({spec_id})[/dim]")
+
+    return {
+        "workspace_id": workspace_id,
+        "workspace_display": ws_display,
+        "project_id": project_id,
+        "project_display": proj_display,
+        "compute_group_id": compute_group_id,
+        "compute_group_display": cg_display,
+        "spec_id": spec_id,
+        "spec_display": spec_display or spec_id,
+    }
+
+
+def cmd_create(args):
+    """创建任务"""
+    display = get_display()
+    api = get_api()
+    store = get_store()
+    ctx = _resolve_create_context(args, display)
+    if not ctx:
+        return 1
 
     # --- Build payload ---
     payload = {
         "name": args.name,
-        "logic_compute_group_id": compute_group_id,
-        "project_id": project_id,
-        "workspace_id": workspace_id,
+        "logic_compute_group_id": ctx["compute_group_id"],
+        "project_id": ctx["project_id"],
+        "workspace_id": ctx["workspace_id"],
         "framework": args.framework,
         "command": args.cmd_str,
         "task_priority": args.priority,
         "auto_fault_tolerance": False,
         "framework_config": [{
-            "spec_id": spec_id,
+            "spec_id": ctx["spec_id"],
             "image": args.image,
             "image_type": args.image_type,
             "instance_count": args.instances,
@@ -2272,10 +2288,10 @@ def cmd_create(args):
     # --- Show summary ---
     display.print(f"\n[bold]创建任务[/bold]")
     display.print(f"  名称: {args.name}")
-    display.print(f"  工作空间: {ws_display} ({workspace_id})")
-    display.print(f"  项目: {proj_display} ({project_id})")
-    display.print(f"  计算组: {cg_display} ({compute_group_id})")
-    display.print(f"  规格: {spec_id}")
+    display.print(f"  工作空间: {ctx['workspace_display']} ({ctx['workspace_id']})")
+    display.print(f"  项目: {ctx['project_display']} ({ctx['project_id']})")
+    display.print(f"  计算组: {ctx['compute_group_display']} ({ctx['compute_group_id']})")
+    display.print(f"  规格: {ctx['spec_display']} ({ctx['spec_id']})")
     display.print(f"  镜像: {args.image}")
     display.print(f"  实例数: {args.instances}")
     display.print(f"  共享内存: {args.shm} GiB")
@@ -2291,7 +2307,7 @@ def cmd_create(args):
         return 1
 
     job_id = result.get("job_id", "")
-    resp_ws_id = result.get("workspace_id", workspace_id)
+    resp_ws_id = result.get("workspace_id", ctx["workspace_id"])
 
     if not job_id:
         display.print_error("任务创建失败: 响应中未包含 job_id")
@@ -2313,7 +2329,7 @@ def cmd_create(args):
             name=args.name,
             status="job_pending",
             workspace_id=resp_ws_id,
-            project_id=project_id,
+            project_id=ctx["project_id"],
             source="qzcli create",
             command=args.cmd_str,
             url=job_url,
@@ -2331,6 +2347,114 @@ def cmd_create(args):
             "workspace_id": resp_ws_id,
             "url": job_url,
             "name": args.name,
+        }
+        print(json_mod.dumps(output, ensure_ascii=False))
+
+    return 0
+
+
+def cmd_create_hpc(args):
+    """创建 HPC 任务"""
+    display = get_display()
+    api = get_api()
+    store = get_store()
+
+    ctx = _resolve_create_context(args, display)
+    if not ctx:
+        return 1
+
+    payload = {
+        "name": args.name,
+        "logic_compute_group_id": ctx["compute_group_id"],
+        "project_id": ctx["project_id"],
+        "workspace_id": ctx["workspace_id"],
+        "entrypoint": args.entrypoint,
+        "image": args.image,
+        "image_type": args.image_type,
+        "instance_count": args.instances,
+        "spec_id": ctx["spec_id"],
+        "number_of_tasks": args.number_of_tasks,
+        "cpus_per_task": args.cpus_per_task,
+        "memory_per_cpu": args.memory_per_cpu,
+        "enable_hyper_threading": args.enable_hyper_threading,
+    }
+
+    if args.dry_run:
+        import json as json_mod
+        display.print("[bold]Dry run - 以下为将要提交的 HPC payload:[/bold]\n")
+        print(json_mod.dumps(payload, indent=2, ensure_ascii=False))
+        return 0
+
+    display.print(f"\n[bold]创建 HPC 任务[/bold]")
+    display.print(f"  名称: {args.name}")
+    display.print(f"  工作空间: {ctx['workspace_display']} ({ctx['workspace_id']})")
+    display.print(f"  项目: {ctx['project_display']} ({ctx['project_id']})")
+    display.print(f"  计算组: {ctx['compute_group_display']} ({ctx['compute_group_id']})")
+    display.print(f"  规格: {ctx['spec_display']} ({ctx['spec_id']})")
+    display.print(f"  镜像: {args.image}")
+    display.print(f"  实例数: {args.instances}")
+    display.print(f"  任务数: {args.number_of_tasks}")
+    display.print(f"  每任务 CPU: {args.cpus_per_task}")
+    display.print(f"  每 CPU 内存: {args.memory_per_cpu}")
+    display.print(f"  超线程: {'开启' if args.enable_hyper_threading else '关闭'}")
+    display.print(f"  入口命令: {args.entrypoint[:120]}{'...' if len(args.entrypoint) > 120 else ''}")
+    display.print("")
+
+    try:
+        result = api.create_hpc_job(payload)
+    except QzAPIError as e:
+        display.print_error(f"HPC 任务创建失败: {e}")
+        return 1
+
+    job_id = result.get("job_id", "")
+    resp_ws_id = result.get("workspace_id", ctx["workspace_id"])
+
+    if not job_id:
+        display.print_error("HPC 任务创建失败: 响应中未包含 job_id")
+        if args.output_json:
+            import json as json_mod
+            print(json_mod.dumps(result, indent=2, ensure_ascii=False))
+        return 1
+
+    job_url = f"{api.base_url}/jobs/distributedTrainingDetail/{job_id}?spaceId={resp_ws_id}"
+
+    display.print_success("HPC 任务创建成功!")
+    display.print(f"  Job ID: [cyan]{job_id}[/cyan]")
+    display.print(f"  链接: {job_url}")
+
+    if args.track:
+        job = JobRecord(
+            job_id=job_id,
+            name=args.name,
+            status="job_pending",
+            workspace_id=resp_ws_id,
+            project_id=ctx["project_id"],
+            source="qzcli create-hpc",
+            command=args.entrypoint,
+            url=job_url,
+            instance_count=args.instances,
+            metadata={
+                "job_type": "hpc",
+                "number_of_tasks": args.number_of_tasks,
+                "cpus_per_task": args.cpus_per_task,
+                "memory_per_cpu": args.memory_per_cpu,
+                "enable_hyper_threading": args.enable_hyper_threading,
+            },
+        )
+        store.add(job)
+        display.print("  [dim]已写入本地追踪；当前状态刷新接口未单独适配 HPC 任务[/dim]")
+    else:
+        display.print("  [dim]默认未加入本地追踪；如需记录到本地请加 --track[/dim]")
+
+    if args.output_json:
+        import json as json_mod
+        output = {
+            "job_id": job_id,
+            "workspace_id": resp_ws_id,
+            "url": job_url,
+            "name": args.name,
+            "job_type": "hpc",
+            "tracked": args.track,
         }
         print(json_mod.dumps(output, ensure_ascii=False))
 
@@ -2672,7 +2796,28 @@ def main():
     create_parser.add_argument("--no-track", action="store_true", help="不自动追踪任务")
     create_parser.add_argument("--dry-run", action="store_true", help="只显示 payload 不提交")
     create_parser.add_argument("--json", dest="output_json", action="store_true", help="输出 JSON 格式（供脚本集成）")
-    
+
+    # create-hpc 命令 - 创建 HPC 任务
+    create_hpc_parser = subparsers.add_parser("create-hpc", aliases=["create-hpc-job"], help="创建并提交 HPC 任务到启智平台")
+    create_hpc_parser.add_argument("--name", "-n", required=True, help="任务名称")
+    create_hpc_parser.add_argument("--entrypoint", "--command", "-c", dest="entrypoint", required=True, help="HPC 入口命令")
+    create_hpc_parser.add_argument("--workspace", "-w", help="工作空间 ID 或名称（从 qzcli res 缓存解析）")
+    create_hpc_parser.add_argument("--project", "-p", help="项目 ID 或名称（不指定则自动选择）")
+    create_hpc_parser.add_argument("--compute-group", "-g", dest="compute_group", help="计算组 ID 或名称")
+    create_hpc_parser.add_argument("--spec", "-s", help="资源规格 ID（不指定则自动选择）")
+    create_hpc_parser.add_argument("--image", "-i", required=True, help="Docker 镜像")
+    create_hpc_parser.add_argument("--image-type", dest="image_type", default="SOURCE_PRIVATE", help="镜像类型（默认 SOURCE_PRIVATE）")
+    create_hpc_parser.add_argument("--instances", "--instance-count", dest="instances", type=int, default=1, help="实例数量（默认 1）")
+    create_hpc_parser.add_argument("--number-of-tasks", type=int, default=1, help="任务总数（默认 1）")
+    create_hpc_parser.add_argument("--cpus-per-task", type=int, default=1, help="每个任务的 CPU 数（默认 1）")
+    create_hpc_parser.add_argument("--memory-per-cpu", required=True, help="每个 CPU 的内存，例如 8Gi")
+    create_hpc_parser.add_argument("--enable-hyper-threading", action="store_true", dest="enable_hyper_threading", help="启用超线程")
+    create_hpc_parser.add_argument("--disable-hyper-threading", action="store_false", dest="enable_hyper_threading", help="禁用超线程")
+    create_hpc_parser.set_defaults(enable_hyper_threading=False)
+    create_hpc_parser.add_argument("--track", action="store_true", help="写入本地追踪（当前状态刷新未单独适配 HPC 任务）")
+    create_hpc_parser.add_argument("--dry-run", action="store_true", help="只显示 payload 不提交")
+    create_hpc_parser.add_argument("--json", dest="output_json", action="store_true", help="输出 JSON 格式（供脚本集成）")
+
     # batch 命令 - 批量提交任务
     batch_parser = subparsers.add_parser("batch", help="从 JSON 配置文件批量提交任务")
     batch_parser.add_argument("config", help="批量配置文件路径（JSON 格式）")
@@ -2714,6 +2859,8 @@ def main():
         "usage": cmd_usage,
         "create": cmd_create,
         "create-job": cmd_create,
+        "create-hpc": cmd_create_hpc,
+        "create-hpc-job": cmd_create_hpc,
         "batch": cmd_batch,
     }
     
