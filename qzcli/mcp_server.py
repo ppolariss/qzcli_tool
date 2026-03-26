@@ -12,15 +12,17 @@ from mcp.server.fastmcp import FastMCP
 
 from .api import QzAPIError, get_api
 from .config import (
-    find_resource_by_name,
-    find_workspace_by_name,
     get_cookie,
     get_workspace_resources,
     list_cached_workspaces,
     save_cookie,
     save_resources,
-    update_workspace_compute_groups,
-    update_workspace_projects,
+)
+from .resource_resolution import (
+    ResourceResolutionError,
+    resolve_cached_resource_ref,
+    resolve_create_refs,
+    resolve_workspace_ref,
 )
 from .store import JobRecord, get_store
 
@@ -112,9 +114,10 @@ def _cookie_preview(cookie: str) -> str:
 
 
 def _require_cookie() -> tuple[str, dict[str, Any]]:
-    cookie_data = get_cookie()
-    if not cookie_data or not cookie_data.get("cookie"):
-        raise RuntimeError("未设置 cookie，请先运行 qzcli login / qzcli cookie，或调用 qz_auth_login / qz_set_cookie。")
+    try:
+        cookie_data = get_api().ensure_cookie()
+    except QzAPIError as exc:
+        raise RuntimeError(str(exc)) from exc
     return cookie_data["cookie"], cookie_data
 
 
@@ -122,14 +125,29 @@ def _match_workspace_from_remote(name: str, cookie: str) -> Optional[dict[str, s
     api = get_api()
     workspaces = api.list_workspaces(cookie)
 
-    for workspace in workspaces:
-        if workspace.get("name", "") == name:
-            return workspace
+    exact_matches = [workspace for workspace in workspaces if workspace.get("name", "") == name]
+    if len(exact_matches) == 1:
+        return exact_matches[0]
+    if len(exact_matches) > 1:
+        lines = [f"工作空间 '{name}' 匹配到多个远端结果:"]
+        for workspace in exact_matches:
+            lines.append(f"- {workspace.get('name', '') or workspace.get('id', '')} ({workspace.get('id', '')})")
+        lines.append("请使用更精确的名称或直接传 ID。")
+        raise RuntimeError("\n".join(lines))
 
     lowered = name.lower()
-    for workspace in workspaces:
-        if lowered in workspace.get("name", "").lower():
-            return workspace
+    fuzzy_matches = [
+        workspace for workspace in workspaces
+        if lowered in workspace.get("name", "").lower()
+    ]
+    if len(fuzzy_matches) == 1:
+        return fuzzy_matches[0]
+    if len(fuzzy_matches) > 1:
+        lines = [f"工作空间 '{name}' 匹配到多个远端结果:"]
+        for workspace in fuzzy_matches:
+            lines.append(f"- {workspace.get('name', '') or workspace.get('id', '')} ({workspace.get('id', '')})")
+        lines.append("请使用更精确的名称或直接传 ID。")
+        raise RuntimeError("\n".join(lines))
 
     return None
 
@@ -150,22 +168,23 @@ def _resolve_workspace_refs(
             cookie_data = {}
 
     if all_workspaces:
+        if cookie:
+            return get_api().list_workspaces(cookie)
         cached = list_cached_workspaces()
         if cached:
             return [{"id": item["id"], "name": item.get("name", "")} for item in cached]
-        if not cookie:
-            raise RuntimeError("没有已缓存的工作空间，且当前没有可用 cookie 用于远端发现。")
-        return get_api().list_workspaces(cookie)
+        raise RuntimeError("没有已缓存的工作空间，且当前没有可用 cookie 用于远端发现。")
 
     if workspace:
         if workspace.startswith("ws-"):
             ws_resources = get_workspace_resources(workspace)
             return [{"id": workspace, "name": (ws_resources or {}).get("name", "")}]
 
-        workspace_id = find_workspace_by_name(workspace)
-        if workspace_id:
-            ws_resources = get_workspace_resources(workspace_id)
-            return [{"id": workspace_id, "name": (ws_resources or {}).get("name", workspace)}]
+        try:
+            workspace_id, workspace_name = resolve_workspace_ref(workspace)
+            return [{"id": workspace_id, "name": workspace_name}]
+        except ResourceResolutionError:
+            pass
 
         if not cookie:
             cookie, _ = _require_cookie()
@@ -569,9 +588,13 @@ def qz_get_availability(
                 else:
                     continue
             else:
-                found = find_resource_by_name(workspace_id, "compute_groups", group)
-                if found:
-                    compute_groups = {found["id"]: found}
+                try:
+                    group_id, _ = resolve_cached_resource_ref(workspace_id, "compute_groups", group)
+                except ResourceResolutionError as exc:
+                    warnings.append(f"{workspace_name or workspace_id}: {exc}")
+                    continue
+                if group_id in compute_groups:
+                    compute_groups = {group_id: compute_groups[group_id]}
                 else:
                     continue
 
@@ -780,19 +803,13 @@ def qz_get_usage(workspace: str = "") -> dict[str, Any]:
             type_stats: dict[str, dict[str, int]] = defaultdict(lambda: {"count": 0, "gpu": 0})
             priority_stats: dict[int, dict[str, int]] = defaultdict(lambda: {"count": 0, "gpu": 0})
             total_gpu = 0
-            projects_found: dict[str, dict[str, str]] = {}
-
             for task in tasks:
                 gpu_total = task.get("gpu", {}).get("total", 0)
                 user_name = task.get("user", {}).get("name", "未知")
                 project_info = task.get("project", {})
                 project_name = project_info.get("name", "未知")
-                project_id = project_info.get("id", "")
                 task_type = task.get("type", "unknown")
                 priority = task.get("priority", 0)
-
-                if project_id and project_id not in projects_found:
-                    projects_found[project_id] = {"id": project_id, "name": project_name}
 
                 gpu_distribution[gpu_total] += 1
                 user_gpu[user_name] += gpu_total
@@ -802,29 +819,6 @@ def qz_get_usage(workspace: str = "") -> dict[str, Any]:
                 priority_stats[priority]["count"] += 1
                 priority_stats[priority]["gpu"] += gpu_total
                 total_gpu += gpu_total
-
-            if projects_found:
-                update_workspace_projects(workspace_id, list(projects_found.values()), workspace_name)
-
-            try:
-                node_data = api.list_node_dimension(workspace_id, cookie, page_size=500)
-                nodes = node_data.get("node_dimensions", [])
-                compute_groups_found: dict[str, dict[str, str]] = {}
-                for node in nodes:
-                    logic_group = node.get("logic_compute_group", {})
-                    logic_group_id = logic_group.get("id", "")
-                    logic_group_name = logic_group.get("name", "")
-                    if logic_group_id and logic_group_id not in compute_groups_found:
-                        compute_groups_found[logic_group_id] = {
-                            "id": logic_group_id,
-                            "name": logic_group_name,
-                            "gpu_type": node.get("gpu", {}).get("type", ""),
-                            "workspace_id": workspace_id,
-                        }
-                if compute_groups_found:
-                    update_workspace_compute_groups(workspace_id, list(compute_groups_found.values()), workspace_name)
-            except QzAPIError:
-                pass
 
             all_stats.append(
                 {
@@ -990,44 +984,11 @@ def qz_list_tracked_jobs(limit: int = 20, running_only: bool = False, refresh: b
         warnings=warnings,
     )
 
-
-def _resolve_resource_id_mcp(
-    workspace_id: str, resource_type: str, value: str
-) -> tuple[Optional[str], Optional[str]]:
-    """Resolve a resource name or ID to (id, display_name) for MCP tools."""
-    if not value:
-        return None, None
-    prefixes = {"projects": "project-", "compute_groups": "lcg-"}
-    prefix = prefixes.get(resource_type, "")
-    if prefix and value.startswith(prefix):
-        return value, value
-    if resource_type == "specs" and len(value) > 20:
-        return value, value
-    found = find_resource_by_name(workspace_id, resource_type, value)
-    if found:
-        return found["id"], found.get("name", value)
-    return None, None
-
-
-def _auto_select_resource_mcp(
-    workspace_id: str, resource_type: str
-) -> tuple[Optional[str], Optional[str]]:
-    """Auto-select the first resource of a given type from cache."""
-    ws_resources = get_workspace_resources(workspace_id)
-    if not ws_resources:
-        return None, None
-    resources = ws_resources.get(resource_type, {})
-    if not resources:
-        return None, None
-    first = next(iter(resources.values()))
-    return first["id"], first.get("name", first["id"])
-
-
 @server.tool(
     description=(
         "创建并提交任务到启智平台。workspace/project/compute_group 支持名称或 ID"
         "（名称从 qz_refresh_resources 缓存解析）。"
-        "省略 project/spec 时自动从缓存选取第一个。"
+        "省略 project/compute_group/spec 时，仅在缓存中存在唯一候选时自动选择。"
     )
 )
 def qz_create_job(
@@ -1049,63 +1010,35 @@ def qz_create_job(
     store = get_store()
     warnings: list[str] = []
 
-    # Resolve workspace
-    if workspace.startswith("ws-"):
-        workspace_id = workspace
-    else:
-        workspace_id = find_workspace_by_name(workspace)
-        if not workspace_id:
-            raise RuntimeError(f"未找到名称为 '{workspace}' 的工作空间。请先运行 qz_refresh_resources。")
+    try:
+        ctx = resolve_create_refs(
+            workspace=workspace,
+            project=project,
+            compute_group=compute_group,
+            spec=spec,
+        )
+    except ResourceResolutionError as exc:
+        raise RuntimeError(str(exc)) from exc
 
-    # Resolve project
-    if project:
-        if project.startswith("project-"):
-            project_id = project
-        else:
-            project_id, _ = _resolve_resource_id_mcp(workspace_id, "projects", project)
-            if not project_id:
-                raise RuntimeError(f"未找到项目 '{project}'。")
-    else:
-        project_id, proj_name = _auto_select_resource_mcp(workspace_id, "projects")
-        if not project_id:
-            raise RuntimeError("未指定项目且缓存中无可用项目。请指定 project 或先调用 qz_refresh_resources。")
-        warnings.append(f"自动选择项目: {proj_name} ({project_id})")
-
-    # Resolve compute group
-    if compute_group:
-        if compute_group.startswith("lcg-"):
-            compute_group_id = compute_group
-        else:
-            compute_group_id, _ = _resolve_resource_id_mcp(workspace_id, "compute_groups", compute_group)
-            if not compute_group_id:
-                raise RuntimeError(f"未找到计算组 '{compute_group}'。")
-    else:
-        compute_group_id, cg_name = _auto_select_resource_mcp(workspace_id, "compute_groups")
-        if not compute_group_id:
-            raise RuntimeError("未指定计算组且缓存中无可用计算组。请指定 compute_group 或先调用 qz_refresh_resources。")
-        warnings.append(f"自动选择计算组: {cg_name} ({compute_group_id})")
-
-    # Resolve spec
-    if spec:
-        spec_id = spec
-    else:
-        spec_id, spec_name = _auto_select_resource_mcp(workspace_id, "specs")
-        if not spec_id:
-            raise RuntimeError("未指定规格且缓存中无可用规格。请指定 spec 或先调用 qz_refresh_resources。")
-        warnings.append(f"自动选择规格: {spec_name} ({spec_id})")
+    if ctx.auto_project:
+        warnings.append(f"自动选择项目: {ctx.project_display} ({ctx.project_id})")
+    if ctx.auto_compute_group:
+        warnings.append(f"自动选择计算组: {ctx.compute_group_display} ({ctx.compute_group_id})")
+    if ctx.auto_spec:
+        warnings.append(f"自动选择规格: {ctx.spec_display} ({ctx.spec_id})")
 
     payload = {
         "name": name,
-        "logic_compute_group_id": compute_group_id,
-        "project_id": project_id,
-        "workspace_id": workspace_id,
+        "logic_compute_group_id": ctx.compute_group_id,
+        "project_id": ctx.project_id,
+        "workspace_id": ctx.workspace_id,
         "framework": framework,
         "command": command,
         "task_priority": priority,
         "auto_fault_tolerance": False,
         "framework_config": [
             {
-                "spec_id": spec_id,
+                "spec_id": ctx.spec_id,
                 "image": image,
                 "image_type": image_type,
                 "instance_count": instances,
@@ -1116,7 +1049,7 @@ def qz_create_job(
 
     result = api.create_job(payload)
     job_id = result.get("job_id", "")
-    resp_ws_id = result.get("workspace_id", workspace_id)
+    resp_ws_id = result.get("workspace_id", ctx.workspace_id)
 
     if not job_id:
         raise RuntimeError(f"任务创建失败: 响应中未包含 job_id。raw={result}")
@@ -1129,7 +1062,7 @@ def qz_create_job(
             name=name,
             status="job_pending",
             workspace_id=resp_ws_id,
-            project_id=project_id,
+            project_id=ctx.project_id,
             source="qz_create_job",
             command=command,
             url=job_url,
@@ -1146,6 +1079,9 @@ def qz_create_job(
             "name": name,
             "tracked": track,
             "payload": payload,
+            "project_id": ctx.project_id,
+            "compute_group_id": ctx.compute_group_id,
+            "spec_id": ctx.spec_id,
         },
         message="任务创建成功。",
         warnings=warnings,

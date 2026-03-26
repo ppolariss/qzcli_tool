@@ -152,6 +152,88 @@ def clear_cookie() -> None:
 
 # 资源缓存文件
 RESOURCES_FILE = CONFIG_DIR / "resources.json"
+WORKSPACE_ALIASES_FILE = CONFIG_DIR / "workspace_aliases.json"
+
+
+def _load_json_file(path: Path, default: Any) -> Any:
+    if not path.exists():
+        return default
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, IOError):
+        return default
+
+
+def _save_json_file(path: Path, data: Any) -> None:
+    ensure_config_dir()
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+
+
+def load_workspace_aliases() -> Dict[str, str]:
+    """加载工作空间别名。"""
+    raw = _load_json_file(WORKSPACE_ALIASES_FILE, {})
+    if not isinstance(raw, dict):
+        return {}
+    return {
+        str(workspace_id): str(alias).strip()
+        for workspace_id, alias in raw.items()
+        if str(alias).strip()
+    }
+
+
+def save_workspace_aliases(aliases: Dict[str, str]) -> None:
+    """保存工作空间别名。"""
+    sanitized = {
+        str(workspace_id): str(alias).strip()
+        for workspace_id, alias in aliases.items()
+        if str(alias).strip()
+    }
+    _save_json_file(WORKSPACE_ALIASES_FILE, sanitized)
+
+
+def _load_raw_resources() -> Dict[str, Any]:
+    """加载资源快照原始数据，不叠加别名。"""
+    raw = _load_json_file(RESOURCES_FILE, {})
+    if not isinstance(raw, dict):
+        return {}
+    return raw
+
+
+def _normalize_workspace_snapshot(workspace_id: str, workspace_data: Dict[str, Any], aliases: Dict[str, str]) -> Dict[str, Any]:
+    official_name = workspace_data.get("official_name")
+    if official_name is None:
+        official_name = workspace_data.get("name", "")
+
+    alias = aliases.get(workspace_id, "")
+    display_name = alias or official_name or workspace_data.get("id", workspace_id)
+
+    normalized = dict(workspace_data)
+    normalized["id"] = workspace_id
+    normalized["official_name"] = official_name
+    normalized["alias"] = alias
+    normalized["name"] = display_name
+    return normalized
+
+
+def _prepare_workspace_snapshot(
+    workspace_id: str,
+    existing: Optional[Dict[str, Any]] = None,
+    *,
+    official_name: str = "",
+) -> Dict[str, Any]:
+    base = dict(existing or {})
+    if official_name:
+        base["official_name"] = official_name
+    else:
+        base["official_name"] = base.get("official_name", base.get("name", ""))
+
+    base["id"] = workspace_id
+    base["projects"] = dict(base.get("projects", {}))
+    base["compute_groups"] = dict(base.get("compute_groups", {}))
+    base["specs"] = dict(base.get("specs", {}))
+    return base
 
 
 def save_resources(workspace_id: str, resources: Dict[str, Any], name: str = "") -> None:
@@ -163,37 +245,31 @@ def save_resources(workspace_id: str, resources: Dict[str, Any], name: str = "")
         resources: 资源配置（projects, compute_groups, specs）
         name: 工作空间名称（可选）
     """
-    ensure_config_dir()
-    
     import time
-    
-    # 读取现有缓存
-    all_resources = load_all_resources()
-    
-    # 更新该工作空间的资源
+
+    all_resources = _load_raw_resources()
+    existing = all_resources.get(workspace_id, {})
+
     all_resources[workspace_id] = {
         "id": workspace_id,
-        "name": name or all_resources.get(workspace_id, {}).get("name", ""),
+        "official_name": name or existing.get("official_name", existing.get("name", "")),
         "projects": {p["id"]: p for p in resources.get("projects", [])},
         "compute_groups": {g["id"]: g for g in resources.get("compute_groups", [])},
         "specs": {s["id"]: s for s in resources.get("specs", [])},
         "updated_at": time.time(),
     }
-    
-    with open(RESOURCES_FILE, "w", encoding="utf-8") as f:
-        json.dump(all_resources, f, indent=2, ensure_ascii=False)
+
+    _save_json_file(RESOURCES_FILE, all_resources)
 
 
 def load_all_resources() -> Dict[str, Any]:
     """加载所有工作空间的资源缓存"""
-    if not RESOURCES_FILE.exists():
-        return {}
-    
-    try:
-        with open(RESOURCES_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except (json.JSONDecodeError, IOError):
-        return {}
+    raw_resources = _load_raw_resources()
+    aliases = load_workspace_aliases()
+    return {
+        workspace_id: _normalize_workspace_snapshot(workspace_id, workspace_data, aliases)
+        for workspace_id, workspace_data in raw_resources.items()
+    }
 
 
 def get_workspace_resources(workspace_id: str) -> Optional[Dict[str, Any]]:
@@ -221,52 +297,39 @@ def set_workspace_name(workspace_id: str, name: str) -> bool:
     Returns:
         是否成功
     """
-    all_resources = load_all_resources()
-    
-    if workspace_id not in all_resources:
-        # 创建一个空的工作空间条目
-        import time
-        all_resources[workspace_id] = {
-            "id": workspace_id,
-            "name": name,
-            "projects": {},
-            "compute_groups": {},
-            "specs": {},
-            "updated_at": time.time(),
-        }
+    aliases = load_workspace_aliases()
+    normalized_name = name.strip()
+
+    if normalized_name:
+        aliases[workspace_id] = normalized_name
     else:
-        all_resources[workspace_id]["name"] = name
-    
-    ensure_config_dir()
-    with open(RESOURCES_FILE, "w", encoding="utf-8") as f:
-        json.dump(all_resources, f, indent=2, ensure_ascii=False)
-    
+        aliases.pop(workspace_id, None)
+
+    save_workspace_aliases(aliases)
     return True
 
 
 def find_workspace_by_name(name: str) -> Optional[str]:
     """
-    通过名称查找工作空间 ID
+    通过名称查找工作空间 ID。
+
+    使用统一的资源解析逻辑；当名称歧义时抛出 ResourceResolutionError。
     
     Args:
-        name: 工作空间名称（支持模糊匹配）
+        name: 工作空间名称（支持唯一精确/模糊匹配）
         
     Returns:
         工作空间 ID，或 None
     """
-    all_resources = load_all_resources()
-    
-    # 精确匹配优先
-    for ws_id, ws_data in all_resources.items():
-        if ws_data.get("name", "") == name:
-            return ws_id
-    
-    # 模糊匹配
-    for ws_id, ws_data in all_resources.items():
-        if name.lower() in ws_data.get("name", "").lower():
-            return ws_id
-    
-    return None
+    from .resource_resolution import ResourceResolutionError, resolve_workspace_ref
+
+    try:
+        workspace_id, _ = resolve_workspace_ref(name)
+        return workspace_id
+    except ResourceResolutionError as exc:
+        if str(exc).startswith("未找到"):
+            return None
+        raise
 
 
 def find_resource_by_name(
@@ -275,35 +338,32 @@ def find_resource_by_name(
     name: str
 ) -> Optional[Dict[str, Any]]:
     """
-    通过名称查找资源（项目、计算组、规格）
+    通过名称查找资源（项目、计算组、规格）。
+
+    使用统一的资源解析逻辑；当名称歧义时抛出 ResourceResolutionError。
     
     Args:
         workspace_id: 工作空间 ID
         resource_type: 资源类型 (projects, compute_groups, specs)
-        name: 资源名称（支持模糊匹配）
+        name: 资源名称（支持唯一精确/模糊匹配）
         
     Returns:
         资源配置字典，或 None
     """
+    from .resource_resolution import ResourceResolutionError, resolve_cached_resource_ref
+
     ws_resources = get_workspace_resources(workspace_id)
     if not ws_resources:
         return None
-    
-    resources = ws_resources.get(resource_type, {})
-    
-    # 精确匹配优先
-    for res_id, res_data in resources.items():
-        res_name = res_data.get("name", "")
-        if res_name == name:
-            return res_data
-    
-    # 模糊匹配
-    for res_id, res_data in resources.items():
-        res_name = res_data.get("name", "")
-        if name.lower() in res_name.lower():
-            return res_data
-    
-    return None
+
+    try:
+        resource_id, _ = resolve_cached_resource_ref(workspace_id, resource_type, name)
+    except ResourceResolutionError as exc:
+        if str(exc).startswith("未找到"):
+            return None
+        raise
+
+    return ws_resources.get(resource_type, {}).get(resource_id)
 
 
 def list_cached_workspaces() -> List[Dict[str, Any]]:
@@ -320,6 +380,8 @@ def list_cached_workspaces() -> List[Dict[str, Any]]:
         result.append({
             "id": ws_id,
             "name": ws_data.get("name", ""),
+            "official_name": ws_data.get("official_name", ""),
+            "alias": ws_data.get("alias", ""),
             "updated_at": ws_data.get("updated_at", 0),
             "project_count": len(ws_data.get("projects", {})),
             "compute_group_count": len(ws_data.get("compute_groups", {})),
@@ -341,31 +403,16 @@ def update_workspace_projects(workspace_id: str, projects: List[Dict[str, Any]],
     Returns:
         新增的项目数量
     """
-    ensure_config_dir()
-    
     import time
-    
-    # 读取现有缓存
-    all_resources = load_all_resources()
-    
-    # 获取或创建该工作空间的条目
-    if workspace_id not in all_resources:
-        all_resources[workspace_id] = {
-            "id": workspace_id,
-            "name": name,
-            "projects": {},
-            "compute_groups": {},
-            "specs": {},
-            "updated_at": time.time(),
-        }
-    
-    ws_data = all_resources[workspace_id]
+
+    all_resources = _load_raw_resources()
+    ws_data = _prepare_workspace_snapshot(
+        workspace_id,
+        all_resources.get(workspace_id),
+        official_name=name,
+    )
     existing_projects = ws_data.get("projects", {})
-    
-    # 更新名称（如果提供）
-    if name:
-        ws_data["name"] = name
-    
+
     # 增量更新项目
     new_count = 0
     for proj in projects:
@@ -379,9 +426,8 @@ def update_workspace_projects(workspace_id: str, projects: List[Dict[str, Any]],
     
     ws_data["projects"] = existing_projects
     ws_data["updated_at"] = time.time()
-    
-    with open(RESOURCES_FILE, "w", encoding="utf-8") as f:
-        json.dump(all_resources, f, indent=2, ensure_ascii=False)
+    all_resources[workspace_id] = ws_data
+    _save_json_file(RESOURCES_FILE, all_resources)
     
     return new_count
 
@@ -398,31 +444,16 @@ def update_workspace_compute_groups(workspace_id: str, compute_groups: List[Dict
     Returns:
         新增的计算组数量
     """
-    ensure_config_dir()
-    
     import time
-    
-    # 读取现有缓存
-    all_resources = load_all_resources()
-    
-    # 获取或创建该工作空间的条目
-    if workspace_id not in all_resources:
-        all_resources[workspace_id] = {
-            "id": workspace_id,
-            "name": name,
-            "projects": {},
-            "compute_groups": {},
-            "specs": {},
-            "updated_at": time.time(),
-        }
-    
-    ws_data = all_resources[workspace_id]
+
+    all_resources = _load_raw_resources()
+    ws_data = _prepare_workspace_snapshot(
+        workspace_id,
+        all_resources.get(workspace_id),
+        official_name=name,
+    )
     existing_groups = ws_data.get("compute_groups", {})
-    
-    # 更新名称（如果提供）
-    if name:
-        ws_data["name"] = name
-    
+
     # 增量更新计算组
     new_count = 0
     for group in compute_groups:
@@ -436,8 +467,7 @@ def update_workspace_compute_groups(workspace_id: str, compute_groups: List[Dict
     
     ws_data["compute_groups"] = existing_groups
     ws_data["updated_at"] = time.time()
-    
-    with open(RESOURCES_FILE, "w", encoding="utf-8") as f:
-        json.dump(all_resources, f, indent=2, ensure_ascii=False)
+    all_resources[workspace_id] = ws_data
+    _save_json_file(RESOURCES_FILE, all_resources)
     
     return new_count

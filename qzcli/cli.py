@@ -6,353 +6,30 @@ qzcli - 启智平台任务管理 CLI
 import sys
 import time
 import argparse
-import unicodedata
 from pathlib import Path
-from typing import Optional, List, Sequence, Dict, Any
 
 from . import __version__
 from .config import (
-    init_config, get_credentials, load_config, CONFIG_DIR, 
+    init_config, CONFIG_DIR,
     save_cookie, get_cookie, clear_cookie,
-    save_resources, get_workspace_resources, load_all_resources,
-    set_workspace_name, find_workspace_by_name, find_resource_by_name,
-    list_cached_workspaces, update_workspace_projects, update_workspace_compute_groups,
+    get_workspace_resources, load_all_resources,
 )
 from .api import get_api, QzAPIError
 from .store import get_store, JobRecord
 from .display import get_display, format_duration, format_time_ago
-
-try:
-    from rich.table import Table
-    from rich import box
-    RICH_TABLE_AVAILABLE = True
-except ImportError:
-    RICH_TABLE_AVAILABLE = False
-    Table = None  # type: ignore
-    box = None  # type: ignore
-
-
-def _char_display_width(ch: str) -> int:
-    """计算单个字符在终端中的显示宽度（中文等宽字符按 2 计算）。"""
-    if not ch:
-        return 0
-    if unicodedata.combining(ch):
-        return 0
-    if unicodedata.east_asian_width(ch) in ("F", "W"):
-        return 2
-    return 1
-
-
-def _display_width(text: object) -> int:
-    """计算字符串在终端中的显示宽度。"""
-    return sum(_char_display_width(ch) for ch in str(text))
-
-
-def _truncate_display_text(text: object, max_width: int) -> str:
-    """按显示宽度截断文本。"""
-    value = str(text)
-    if max_width <= 0:
-        return ""
-    if _display_width(value) <= max_width:
-        return value
-    if max_width <= 3:
-        return "." * max_width
-
-    keep_width = max_width - 3
-    chars = []
-    used = 0
-    for ch in value:
-        ch_width = _char_display_width(ch)
-        if used + ch_width > keep_width:
-            break
-        chars.append(ch)
-        used += ch_width
-    return "".join(chars) + "..."
-
-
-def _format_cell(text: object, width: int, align: str = "left") -> str:
-    """按显示宽度对齐单元格内容。"""
-    value = _truncate_display_text(text, width)
-    padding = max(0, width - _display_width(value))
-    if align == "right":
-        return " " * padding + value
-    return value + " " * padding
-
-
-def _render_plain_table(
-    headers: Sequence[str],
-    rows: Sequence[Sequence[object]],
-    aligns: Sequence[str],
-    *,
-    min_widths: Optional[Sequence[int]] = None,
-    max_widths: Optional[Sequence[int]] = None,
-    section_break_after_rows: Optional[Sequence[int]] = None,
-    indent: str = "  ",
-    col_gap: int = 2,
-) -> List[str]:
-    """渲染纯文本表格（按显示宽度对齐，兼容中文）。"""
-    col_count = len(headers)
-    if col_count == 0:
-        return []
-
-    min_widths = min_widths or [0] * col_count
-    max_widths = max_widths or [0] * col_count
-    align_list = list(aligns) if aligns else ["left"] * col_count
-    if len(align_list) < col_count:
-        align_list.extend(["left"] * (col_count - len(align_list)))
-
-    col_widths: List[int] = []
-    for i in range(col_count):
-        width = _display_width(headers[i])
-        for row in rows:
-            if i < len(row):
-                width = max(width, _display_width(row[i]))
-        if i < len(min_widths):
-            width = max(width, min_widths[i])
-        if i < len(max_widths) and max_widths[i] > 0:
-            width = min(width, max_widths[i])
-        col_widths.append(width)
-
-    def build_line(cells: Sequence[object]) -> str:
-        rendered = []
-        for i in range(col_count):
-            value = cells[i] if i < len(cells) else ""
-            rendered.append(_format_cell(value, col_widths[i], align_list[i]))
-        return indent + (" " * col_gap).join(rendered)
-
-    lines = [build_line(headers)]
-    separator = indent + "-" * (sum(col_widths) + col_gap * (col_count - 1))
-    lines.append(separator)
-    section_breaks = set(section_break_after_rows or [])
-    for row_idx, row in enumerate(rows):
-        lines.append(build_line(row))
-        if row_idx in section_breaks and row_idx < len(rows) - 1:
-            lines.append(separator)
-    return lines
-
-
-def _format_percent(numerator: int, denominator: int) -> str:
-    """格式化百分比。"""
-    if denominator <= 0:
-        return "-"
-    return f"{(numerator / denominator) * 100:.1f}%"
-
-
-def _cache_workspace_resources(api, workspace_id: str, cookie: str, workspace_name: str = "") -> Dict[str, int]:
-    """从 API 拉取并缓存单个工作空间的资源信息。"""
-    result = api.list_jobs_with_cookie(workspace_id, cookie, page_size=200)
-    jobs = result.get("jobs", [])
-    resources = api.extract_resources_from_jobs(jobs)
-
-    # 使用 cluster_basic_info 获取完整计算组列表，避免仅依赖历史任务。
-    try:
-        cluster_info = api.get_cluster_basic_info(workspace_id, cookie)
-        compute_groups_from_api = []
-
-        for cg in cluster_info.get("compute_groups", []):
-            for lcg in cg.get("logic_compute_groups", []):
-                lcg_id = lcg.get("logic_compute_group_id", "")
-                lcg_name = lcg.get("logic_compute_group_name", "")
-                brand = lcg.get("brand", "")
-                resource_types = lcg.get("resource_types", [])
-                gpu_type = resource_types[0] if resource_types else ""
-
-                if lcg_id:
-                    compute_groups_from_api.append({
-                        "id": lcg_id,
-                        "name": lcg_name,
-                        "gpu_type": brand or gpu_type,
-                        "workspace_id": workspace_id,
-                    })
-
-        if compute_groups_from_api:
-            resources["compute_groups"] = compute_groups_from_api
-    except Exception:
-        pass
-
-    save_resources(workspace_id, resources, workspace_name)
-    return {
-        "projects": len(resources.get("projects", [])),
-        "compute_groups": len(resources.get("compute_groups", [])),
-    }
-
-
-def _parse_cpu_thresholds(raw_values: Optional[List[str]]) -> List[Dict[str, float]]:
-    """解析 --cpu-th 参数。"""
-    default_values = ["40,200", "55,300",  "55,500", "100,400", "100,2000", "120,500"]
-    values = raw_values if raw_values else default_values
-    thresholds = []
-
-    for raw in values:
-        text = str(raw).strip()
-        if "," not in text:
-            raise ValueError(f"无效阈值 '{text}'，格式应为 cpu,mem")
-        cpu_s, mem_s = text.split(",", 1)
-        try:
-            cpu = float(cpu_s.strip())
-            mem = float(mem_s.strip())
-        except ValueError:
-            raise ValueError(f"无效阈值 '{text}'，cpu/mem 必须是数字")
-        thresholds.append({"cpu": cpu, "mem": mem})
-
-    return thresholds
-
-
-def _resource_free_value(resource: Dict[str, Any]) -> float:
-    """统一读取资源空闲值（优先 free，其次 total-used）。"""
-    if not resource:
-        return 0.0
-    free_value = resource.get("free")
-    if free_value is not None:
-        try:
-            return float(free_value)
-        except Exception:
-            return 0.0
-    try:
-        total = float(resource.get("total", resource.get("total_gib", 0)) or 0)
-        used = float(resource.get("used", resource.get("used_gib", 0)) or 0)
-        return max(total - used, 0.0)
-    except Exception:
-        return 0.0
-
-
-def _node_type_name(node: Dict[str, Any]) -> str:
-    """提取节点类型名称。"""
-    return (
-        node.get("node_type")
-        or node.get("type")
-        or node.get("node_type_display")
-        or node.get("node_kind")
-        or "unknown"
-    )
-
-
-def _analyze_cpu_capacity(nodes: List[Dict[str, Any]], thresholds: List[Dict[str, float]]) -> Dict[str, Any]:
-    """按节点类型统计 ready 节点的 CPU/MEM 空闲容量。"""
-    groups: Dict[str, Dict[str, Any]] = {}
-    for node in nodes:
-        if str(node.get("status", "")).lower() != "ready":
-            continue
-
-        node_type = _node_type_name(node)
-        cpu_free = _resource_free_value(node.get("cpu", {}))
-        mem_free = _resource_free_value(node.get("memory", {}))
-
-        group = groups.setdefault(
-            node_type,
-            {
-                "ready": 0,
-                "cpu_free": 0.0,
-                "mem_free": 0.0,
-                "above": [0] * len(thresholds),
-            },
-        )
-        group["ready"] += 1
-        group["cpu_free"] += cpu_free
-        group["mem_free"] += mem_free
-
-        for idx, threshold in enumerate(thresholds):
-            if cpu_free >= threshold["cpu"] and mem_free >= threshold["mem"]:
-                group["above"][idx] += 1
-
-    overall = {
-        "ready": 0,
-        "cpu_free": 0.0,
-        "mem_free": 0.0,
-        "above": [0] * len(thresholds),
-    }
-    for group in groups.values():
-        overall["ready"] += group["ready"]
-        overall["cpu_free"] += group["cpu_free"]
-        overall["mem_free"] += group["mem_free"]
-        overall["above"] = [a + b for a, b in zip(overall["above"], group["above"])]
-
-    return {"groups": groups, "overall": overall}
-
-
-def _collect_nodes_for_compute_group(
-    api,
-    workspace_id: str,
-    cookie: str,
-    logic_compute_group_id: str,
-    page_size: int = 200,
-) -> List[Dict[str, Any]]:
-    """分页拉取某个计算组的全部节点。"""
-    nodes: List[Dict[str, Any]] = []
-    page_num = 1
-    while True:
-        data = api.list_node_dimension(
-            workspace_id,
-            cookie,
-            logic_compute_group_id=logic_compute_group_id,
-            page_num=page_num,
-            page_size=page_size,
-        )
-        page_nodes = data.get("node_dimensions", [])
-        if not page_nodes:
-            break
-
-        nodes.extend(page_nodes)
-        total = data.get("total")
-        if total is not None and len(nodes) >= int(total):
-            break
-        if len(page_nodes) < page_size:
-            break
-        page_num += 1
-
-    return nodes
-
-
-def _print_cpu_capacity_table(display, title: str, analysis: Dict[str, Any], thresholds: List[Dict[str, float]]) -> None:
-    """输出 CPU/MEM 空闲容量统计表。"""
-    groups = analysis["groups"]
-    overall = analysis["overall"]
-
-    threshold_labels = [f"{t['cpu']:g},{t['mem']:g}" for t in thresholds]
-    headers = ["节点类型", "Ready", "CPU空闲", "MEM空闲"] + [f">={label}" for label in threshold_labels]
-
-    rows = []
-    for node_type in sorted(groups.keys()):
-        group = groups[node_type]
-        rows.append(
-            [
-                node_type,
-                group["ready"],
-                f"{group['cpu_free']:.2f}",
-                f"{group['mem_free']:.2f}",
-                *group["above"],
-            ]
-        )
-
-    rows.append(
-        [
-            "ALL",
-            overall["ready"],
-            f"{overall['cpu_free']:.2f}",
-            f"{overall['mem_free']:.2f}",
-            *overall["above"],
-        ]
-    )
-
-    display.print(f"[bold]{title}[/bold]")
-    if RICH_TABLE_AVAILABLE and getattr(display, "console", None):
-        table = Table(box=box.MINIMAL, show_header=True, header_style="bold", expand=False, padding=(0, 1))
-        table.add_column("节点类型", style="cyan", overflow="fold")
-        table.add_column("Ready", justify="right")
-        table.add_column("CPU空闲", justify="right")
-        table.add_column("MEM空闲", justify="right")
-        for label in threshold_labels:
-            table.add_column(f">={label}", justify="right")
-
-        for row in rows:
-            table.add_row(*[str(col) for col in row])
-        display.console.print(table)
-    else:
-        aligns = ["left", "right", "right", "right"] + ["right"] * len(threshold_labels)
-        table_lines = _render_plain_table(headers=headers, rows=rows, aligns=aligns, max_widths=[26, 7, 12, 12] + [9] * len(threshold_labels))
-        for line in table_lines:
-            display.print(line)
-    display.print("")
+from .create_commands import (
+    cmd_batch as _cmd_batch_impl,
+    cmd_create as _cmd_create_impl,
+    cmd_create_hpc as _cmd_create_hpc_impl,
+    resolve_create_context as _resolve_create_context_impl,
+)
+from .resource_commands import (
+    _cache_workspace_resources,
+    cmd_avail as _cmd_avail_impl,
+    cmd_resources as _cmd_resources_impl,
+    cmd_workspaces as _cmd_workspaces_impl,
+)
+from .resource_resolution import ResourceResolutionError, resolve_workspace_ref
 
 
 def cmd_init(args):
@@ -414,10 +91,10 @@ def cmd_init(args):
             if success_count > 0:
                 display.print_success("缓存预热完成，后续可直接运行 qzcli avail")
             else:
-                display.print_warning("缓存预热未成功，请稍后手动运行 qzcli res -u")
+                display.print_warning("缓存预热未成功，请稍后手动运行 qzcli catalog -u")
         except QzAPIError as e:
             display.print_warning(f"自动登录或缓存预热失败: {e}")
-            display.print("[dim]可稍后手动运行: qzcli login && qzcli res -u[/dim]")
+            display.print("[dim]可稍后手动运行: qzcli login && qzcli catalog -u[/dim]")
 
         return 0
     else:
@@ -431,9 +108,10 @@ def cmd_list_cookie(args):
     api = get_api()
     
     # 获取 cookie
-    cookie_data = get_cookie()
-    if not cookie_data or not cookie_data.get("cookie"):
-        display.print_error("未设置 cookie，请先运行: qzcli cookie -f cookies.txt")
+    try:
+        cookie_data = api.ensure_cookie()
+    except QzAPIError as e:
+        display.print_error(str(e))
         return 1
     
     cookie = cookie_data["cookie"]
@@ -446,24 +124,17 @@ def cmd_list_cookie(args):
         all_resources = load_all_resources()
         if not all_resources:
             display.print_error("没有已缓存的工作空间")
-            display.print("[dim]请先运行: qzcli res -w <workspace_id> -u[/dim]")
+            display.print("[dim]请先运行: qzcli catalog -w <workspace_id> -u[/dim]")
             return 1
         workspace_ids = [(ws_id, data.get("name", "")) for ws_id, data in all_resources.items()]
     elif workspace_input:
         # 指定的工作空间
-        if workspace_input.startswith("ws-"):
-            workspace_id = workspace_input
-            ws_resources = get_workspace_resources(workspace_id)
-            ws_name = ws_resources.get("name", "") if ws_resources else ""
-        else:
-            workspace_id = find_workspace_by_name(workspace_input)
-            if workspace_id:
-                ws_resources = get_workspace_resources(workspace_id)
-                ws_name = ws_resources.get("name", "") if ws_resources else workspace_input
-            else:
-                display.print_error(f"未找到名称为 '{workspace_input}' 的工作空间")
-                display.print("[dim]使用 qzcli res --list 查看已缓存的工作空间[/dim]")
-                return 1
+        try:
+            workspace_id, ws_name = resolve_workspace_ref(workspace_input)
+        except ResourceResolutionError as e:
+            display.print_error(str(e))
+            display.print("[dim]使用 qzcli catalog --list 查看已缓存的工作空间[/dim]")
+            return 1
         workspace_ids = [(workspace_id, ws_name)]
     else:
         # 使用默认工作空间
@@ -905,858 +576,17 @@ def cmd_cookie(args):
 
 def cmd_workspaces(args):
     """从历史任务中提取工作空间和资源配置（支持本地缓存）"""
-    display = get_display()
-    api = get_api()
-    
-    # 如果是列出所有已缓存的工作空间
-    if args.list:
-        cached = list_cached_workspaces()
-        if not cached:
-            display.print("[dim]暂无已缓存的工作空间，使用 qzcli res -w <workspace_id> 添加[/dim]")
-            return 0
-        
-        display.print(f"\n[bold]已缓存的工作空间 ({len(cached)} 个)[/bold]\n")
-        for ws in cached:
-            name = ws.get("name") or "[未命名]"
-            import datetime
-            updated = datetime.datetime.fromtimestamp(ws.get("updated_at", 0)).strftime("%Y-%m-%d %H:%M")
-            display.print(f"  [bold]{name}[/bold]")
-            display.print(f"    ID: [cyan]{ws['id']}[/cyan]")
-            display.print(f"    资源: {ws['project_count']} 项目, {ws['compute_group_count']} 计算组, {ws['spec_count']} 规格")
-            display.print(f"    更新: {updated}")
-            display.print("")
-        
-        display.print("[dim]使用方法:[/dim]")
-        display.print("  qzcli res -w <名称或ID>      # 查看资源")
-        display.print("  qzcli res -w <ID> -u         # 更新缓存")
-        display.print("  qzcli res -w <ID> --name 别名  # 设置名称")
-        return 0
-    
-    # 如果只设置名称（没有 -u 参数）
-    if hasattr(args, 'name') and args.name and not args.update:
-        workspace_id = args.workspace
-        if not workspace_id:
-            display.print_error("请指定工作空间 ID: qzcli res -w <workspace_id> --name <名称>")
-            return 1
-        set_workspace_name(workspace_id, args.name)
-        display.print_success(f"已设置工作空间名称: {args.name}")
-        return 0
-    
-    # 记录要设置的名称（如果有）
-    pending_name = args.name if hasattr(args, 'name') else None
-    
-    # 解析 workspace 参数（支持名称或 ID）
-    workspace_input = args.workspace
-    cookie_data = get_cookie()
-    
-    # 如果使用 -u 但没有指定工作空间，自动发现所有可访问的工作空间
-    if args.update and not workspace_input:
-        if not cookie_data or not cookie_data.get("cookie"):
-            display.print_error("未设置 cookie，请先运行: qzcli login")
-            return 1
-        
-        cookie = cookie_data["cookie"]
-        display.print("[dim]正在获取可访问的工作空间列表...[/dim]")
-        
-        try:
-            workspaces = api.list_workspaces(cookie)
-            if not workspaces:
-                display.print_warning("未找到可访问的工作空间")
-                return 0
-            
-            display.print(f"\n[bold]发现 {len(workspaces)} 个可访问的工作空间[/bold]\n")
-            
-            # 更新每个工作空间
-            for ws in workspaces:
-                ws_id = ws.get("id")
-                ws_name = ws.get("name", "")
-                display.print(f"[dim]正在更新 {ws_name or ws_id}...[/dim]")
-                
-                try:
-                    stats = _cache_workspace_resources(api, ws_id, cookie, ws_name)
-                    projects_count = stats["projects"]
-                    cg_count = stats["compute_groups"]
-                    display.print(f"  ✓ {ws_name or ws_id}: {projects_count} 项目, {cg_count} 计算组")
-                except Exception as e:
-                    display.print_warning(f"  ✗ {ws_name or ws_id}: {e}")
-            
-            display.print("")
-            display.print_success("工作空间缓存更新完成！")
-            display.print("[dim]使用 qzcli res --list 查看所有已缓存的工作空间[/dim]")
-            return 0
-            
-        except QzAPIError as e:
-            if "401" in str(e) or "过期" in str(e):
-                display.print_error("Cookie 已过期，请重新登录: qzcli login")
-            else:
-                display.print_error(f"获取工作空间列表失败: {e}")
-            return 1
-    
-    if not workspace_input:
-        workspace_id = cookie_data.get("workspace_id", "") if cookie_data else ""
-    elif workspace_input.startswith("ws-"):
-        workspace_id = workspace_input
-    else:
-        # 尝试通过名称查找
-        workspace_id = find_workspace_by_name(workspace_input)
-        if workspace_id:
-            display.print(f"[dim]匹配到工作空间: {workspace_input} -> {workspace_id}[/dim]")
-        else:
-            display.print_error(f"未找到名称为 '{workspace_input}' 的工作空间")
-            display.print("[dim]使用 qzcli res --list 查看已缓存的工作空间[/dim]")
-            return 1
-    
-    if not workspace_id:
-        display.print_error("请指定工作空间: qzcli res -w <名称或ID>")
-        display.print("[dim]使用 qzcli res --list 查看已缓存的工作空间[/dim]")
-        return 1
-    
-    # 检查是否需要从 API 更新
-    cached_resources = get_workspace_resources(workspace_id)
-    use_cache = cached_resources and not args.update
-    
-    if use_cache:
-        # 使用缓存
-        import datetime
-        updated = datetime.datetime.fromtimestamp(cached_resources.get("updated_at", 0)).strftime("%Y-%m-%d %H:%M")
-        ws_name = cached_resources.get("name", "")
-        title = f"资源配置"
-        if ws_name:
-            title += f" [{ws_name}]"
-        title += f" (缓存于 {updated})"
-        
-        display.print(f"\n[bold]{title}[/bold]")
-        display.print(f"[dim]工作空间: {workspace_id}[/dim]\n")
-        
-        # 转换缓存格式为列表格式
-        projects = list(cached_resources.get("projects", {}).values())
-        compute_groups = list(cached_resources.get("compute_groups", {}).values())
-        specs = list(cached_resources.get("specs", {}).values())
-    else:
-        # 从 API 获取
-        if not cookie_data or not cookie_data.get("cookie"):
-            display.print_error("未设置 cookie，请先运行: qzcli cookie -f cookies.txt")
-            display.print("[dim]提示: 从浏览器 F12 获取 cookie[/dim]")
-            return 1
-        
-        cookie = cookie_data["cookie"]
-        
-        try:
-            display.print("[dim]正在从历史任务中提取资源配置...[/dim]")
-            
-            # 获取任务列表
-            result = api.list_jobs_with_cookie(workspace_id, cookie, page_size=200)
-            jobs = result.get("jobs", [])
-            total = result.get("total", 0)
-            
-            if not jobs:
-                display.print("[dim]未找到自己的任务，尝试从工作空间任务获取资源信息...[/dim]")
-                
-                projects_found = {}
-                compute_groups_found = {}
-                gpu_types_found = {}  # 从节点获取 GPU 类型
-                
-                # 1. 先从 list_task_dimension 获取项目信息（包含所有用户的任务）
-                try:
-                    task_data = api.list_task_dimension(workspace_id, cookie, page_size=200)
-                    tasks = task_data.get("task_dimensions", [])
-                    
-                    for task in tasks:
-                        # 提取项目
-                        proj = task.get("project", {})
-                        proj_id = proj.get("id", "")
-                        proj_name = proj.get("name", "")
-                        if proj_id and proj_id not in projects_found:
-                            projects_found[proj_id] = {
-                                "id": proj_id,
-                                "name": proj_name,
-                                "workspace_id": workspace_id,
-                            }
-                except QzAPIError:
-                    pass
-                
-                # 2. 从 list_node_dimension 获取计算组和 GPU 类型信息
-                try:
-                    node_data = api.list_node_dimension(workspace_id, cookie, page_size=500)
-                    nodes = node_data.get("node_dimensions", [])
-                    
-                    for node in nodes:
-                        # 尝试从 logic_compute_group 获取计算组
-                        lcg_info = node.get("logic_compute_group", {})
-                        lcg_id = lcg_info.get("id", "")
-                        lcg_name = lcg_info.get("name", "")
-                        if lcg_id and lcg_id not in compute_groups_found:
-                            gpu_info = node.get("gpu_info", {})
-                            gpu_type = gpu_info.get("gpu_product_simple", "")
-                            compute_groups_found[lcg_id] = {
-                                "id": lcg_id,
-                                "name": lcg_name,
-                                "gpu_type": gpu_type,
-                                "workspace_id": workspace_id,
-                            }
-                        
-                        # 收集 GPU 类型信息
-                        gpu_info = node.get("gpu_info", {})
-                        gpu_type = gpu_info.get("gpu_product_simple", "")
-                        if gpu_type and gpu_type not in gpu_types_found:
-                            gpu_types_found[gpu_type] = {
-                                "type": gpu_type,
-                                "display": gpu_info.get("gpu_type_display", ""),
-                                "memory_gb": gpu_info.get("gpu_memory_size_gb", 0),
-                            }
-                except QzAPIError:
-                    pass
-                
-                # 构建资源数据
-                resources = {
-                    "projects": list(projects_found.values()),
-                    "compute_groups": list(compute_groups_found.values()),
-                    "specs": [],
-                }
-                
-                # 保存到本地缓存
-                ws_name = pending_name or ""
-                save_resources(workspace_id, resources, ws_name)
-                
-                # 显示结果
-                display.print_success("已添加工作空间到缓存")
-                
-                if projects_found:
-                    display.print(f"\n[bold]项目 ({len(projects_found)} 个)[/bold]")
-                    for proj in projects_found.values():
-                        display.print(f"  - {proj['name']}")
-                        display.print(f"    [cyan]{proj['id']}[/cyan]")
-                
-                if compute_groups_found:
-                    display.print(f"\n[bold]计算组 ({len(compute_groups_found)} 个)[/bold]")
-                    for cg in compute_groups_found.values():
-                        display.print(f"  - {cg['name']} [{cg['gpu_type']}]")
-                        display.print(f"    [cyan]{cg['id']}[/cyan]")
-                
-                if gpu_types_found:
-                    display.print(f"\n[bold]可用 GPU 类型 ({len(gpu_types_found)} 种)[/bold]")
-                    for gt in gpu_types_found.values():
-                        display.print(f"  - {gt['type']} ({gt['display']}, {gt['memory_gb']}GB)")
-                
-                if not projects_found and not compute_groups_found:
-                    display.print("[dim]未发现项目或计算组信息[/dim]")
-                
-                return 0
-            
-            # 提取资源信息
-            resources = api.extract_resources_from_jobs(jobs)
-            
-            # 保存到本地缓存
-            ws_name = pending_name or (cached_resources.get("name", "") if cached_resources else "")
-            save_resources(workspace_id, resources, ws_name)
-            display.print_success("资源配置已保存到本地缓存")
-            
-            display.print(f"\n[bold]资源配置（从 {len(jobs)}/{total} 个任务中提取）[/bold]")
-            display.print(f"[dim]工作空间: {workspace_id}[/dim]\n")
-            
-            projects = resources.get("projects", [])
-            compute_groups = resources.get("compute_groups", [])
-            specs = resources.get("specs", [])
-            
-        except QzAPIError as e:
-            if "401" in str(e) or "过期" in str(e):
-                display.print_error("Cookie 已过期，请重新设置: qzcli cookie -f <cookie_file>")
-            else:
-                display.print_error(f"获取失败: {e}")
-            return 1
-    
-    # 显示项目
-    if projects:
-        display.print(f"[bold]项目 ({len(projects)} 个)[/bold]")
-        for proj in projects:
-            display.print(f"  - {proj['name']}")
-            display.print(f"    [cyan]{proj['id']}[/cyan]")
-        display.print("")
-    
-    # 显示计算组
-    if compute_groups:
-        display.print(f"[bold]计算组 ({len(compute_groups)} 个)[/bold]")
-        for group in compute_groups:
-            gpu_type = group.get("gpu_type", "")
-            gpu_display = group.get("gpu_type_display", "")
-            display.print(f"  - {group['name']} [{gpu_type}]")
-            if gpu_display:
-                display.print(f"    [dim]{gpu_display}[/dim]")
-            display.print(f"    [cyan]{group['id']}[/cyan]")
-        display.print("")
-    
-    # 显示规格
-    if specs:
-        display.print(f"[bold]GPU 规格 ({len(specs)} 个)[/bold]")
-        for spec in specs:
-            gpu_type = spec.get("gpu_type", "")
-            gpu_count = spec.get("gpu_count", 0)
-            cpu_count = spec.get("cpu_count", 0)
-            mem_gb = spec.get("memory_gb", 0)
-            display.print(f"  - {gpu_count}x {gpu_type} + {cpu_count}核CPU + {mem_gb}GB内存")
-            display.print(f"    [cyan]{spec['id']}[/cyan]")
-        display.print("")
-    
-    # 导出格式
-    if args.export:
-        display.print("[bold]导出格式（可用于 shell 脚本）:[/bold]")
-        display.print(f'WORKSPACE_ID="{workspace_id}"')
-        if projects:
-            display.print(f'PROJECT_ID="{projects[0]["id"]}"  # {projects[0]["name"]}')
-        if compute_groups:
-            for group in compute_groups:
-                display.print(f'# {group["name"]} [{group.get("gpu_type", "")}]')
-                display.print(f'LOGIC_COMPUTE_GROUP_ID="{group["id"]}"')
-        if specs:
-            for spec in specs:
-                display.print(f'# {spec.get("gpu_count", 0)}x {spec.get("gpu_type", "")}')
-                display.print(f'SPEC_ID="{spec["id"]}"')
-    
-    return 0
+    return _cmd_workspaces_impl(args)
 
 
 def cmd_resources(args):
     """列出工作空间内可用的计算资源（cmd_workspaces 的别名）"""
-    # 直接调用 workspaces 命令
-    return cmd_workspaces(args)
+    return _cmd_resources_impl(args)
 
 
 def cmd_avail(args):
     """查询计算组空余节点，帮助决定任务应该提交到哪里"""
-    display = get_display()
-    api = get_api()
-    
-    # 获取 cookie
-    cookie_data = get_cookie()
-    if not cookie_data or not cookie_data.get("cookie"):
-        display.print_error("未设置 cookie，请先运行: qzcli cookie -f cookies.txt")
-        return 1
-    
-    cookie = cookie_data["cookie"]
-    
-    # 解析 workspace 参数（支持名称或 ID）
-    workspace_input = args.workspace
-    
-    # 如果不指定 workspace，查询所有已缓存的工作空间
-    if not workspace_input:
-        all_resources = load_all_resources()
-        if not all_resources:
-            display.print_error("没有已缓存的工作空间")
-            display.print("[dim]请先运行: qzcli res -w <workspace_id> -u[/dim]")
-            return 1
-        workspace_ids = list(all_resources.keys())
-    elif workspace_input.startswith("ws-"):
-        workspace_ids = [workspace_input]
-    else:
-        workspace_id = find_workspace_by_name(workspace_input)
-        if workspace_id:
-            workspace_ids = [workspace_id]
-            display.print(f"[dim]匹配到工作空间: {workspace_input} -> {workspace_id}[/dim]")
-        else:
-            display.print_error(f"未找到名称为 '{workspace_input}' 的工作空间")
-            display.print("[dim]使用 qzcli res --list 查看已缓存的工作空间[/dim]")
-            return 1
-    
-    required_nodes = args.nodes
-    group_filter = args.group
-    all_results = []  # 所有工作空间的结果汇总
-    cpu_workspace_results = []
-
-    if args.cpu and args.export:
-        display.print_warning("--cpu 模式下忽略 --export")
-    if args.cpu and args.low_priority:
-        display.print_warning("--cpu 模式下忽略 --lp/--low-priority")
-    if args.cpu and required_nodes:
-        display.print_warning("--cpu 模式下忽略 --nodes")
-
-    cpu_thresholds: List[Dict[str, float]] = []
-    if args.cpu:
-        try:
-            cpu_thresholds = _parse_cpu_thresholds(args.cpu_th)
-        except ValueError as e:
-            display.print_error(str(e))
-            return 1
-    
-    from collections import defaultdict
-    
-    for workspace_id in workspace_ids:
-        # 获取计算组列表（从缓存）
-        cached_resources = get_workspace_resources(workspace_id)
-        if not cached_resources:
-            display.print_warning(f"未缓存工作空间 {workspace_id} 的资源信息，跳过")
-            continue
-        
-        compute_groups = cached_resources.get("compute_groups", {})
-        specs = cached_resources.get("specs", {})
-        ws_name = cached_resources.get("name", "") or workspace_id
-        
-        # 如果指定了特定计算组
-        if group_filter:
-            if group_filter.startswith("lcg-"):
-                if group_filter in compute_groups:
-                    compute_groups = {group_filter: compute_groups[group_filter]}
-                else:
-                    continue  # 该工作空间没有这个计算组
-            else:
-                found = find_resource_by_name(workspace_id, "compute_groups", group_filter)
-                if found:
-                    compute_groups = {found["id"]: found}
-                else:
-                    continue
-        
-        if not compute_groups:
-            continue
-        
-        display.print(f"[dim]正在查询 {ws_name} 的 {len(compute_groups)} 个计算组...[/dim]")
-
-        if args.cpu:
-            workspace_nodes = []
-            for lcg_id in compute_groups.keys():
-                try:
-                    workspace_nodes.extend(
-                        _collect_nodes_for_compute_group(
-                            api,
-                            workspace_id,
-                            cookie,
-                            logic_compute_group_id=lcg_id,
-                            page_size=max(1, args.cpu_page_size),
-                        )
-                    )
-                except QzAPIError as e:
-                    display.print_warning(f"查询 {ws_name} 的计算组 {lcg_id} 失败: {e}")
-                    continue
-
-            if not workspace_nodes:
-                display.print_warning(f"{ws_name} 未获取到节点数据")
-                continue
-
-            analysis = _analyze_cpu_capacity(workspace_nodes, cpu_thresholds)
-            cpu_workspace_results.append(
-                {
-                    "workspace_id": workspace_id,
-                    "workspace_name": ws_name,
-                    "analysis": analysis,
-                }
-            )
-            continue
-        
-        # 低优任务统计（仅在 --lp 参数启用时计算）
-        node_low_priority_gpu = defaultdict(int)  # node_name -> low_priority_gpu_count
-        
-        if args.low_priority:
-            display.print(f"[dim]正在获取低优任务数据（这可能较慢）...[/dim]")
-            low_priority_threshold = 3  # 优先级 <= 3 为低优任务
-            
-            try:
-                # 分页获取所有任务
-                tasks = []
-                page_num = 1
-                while True:
-                    task_data = api.list_task_dimension(workspace_id, cookie, page_num=page_num, page_size=200)
-                    page_tasks = task_data.get("task_dimensions", [])
-                    tasks.extend(page_tasks)
-                    if len(tasks) >= task_data.get("total", 0) or not page_tasks:
-                        break
-                    page_num += 1
-                
-                # 统计每个节点上低优任务占用的 GPU 数
-                for task in tasks:
-                    priority = task.get("priority", 10)
-                    if priority <= low_priority_threshold:
-                        gpu_total = task.get("gpu", {}).get("total", 0)
-                        nodes_occupied = task.get("nodes_occupied", {}).get("nodes", [])
-                        # 平均分配 GPU 到各节点（多节点任务）
-                        gpu_per_node = gpu_total // len(nodes_occupied) if nodes_occupied else 0
-                        for node_name in nodes_occupied:
-                            node_low_priority_gpu[node_name] += gpu_per_node if len(nodes_occupied) > 1 else gpu_total
-            except QzAPIError:
-                pass  # 获取任务数据失败不影响主要功能
-        
-        try:
-            for lcg_id, lcg_info in compute_groups.items():
-                lcg_name = lcg_info.get("name", lcg_id)
-                gpu_type = lcg_info.get("gpu_type", "")
-                
-                try:
-                    data = api.list_node_dimension(workspace_id, cookie, lcg_id, page_size=1000)
-                    nodes = data.get("node_dimensions", [])
-                    total_nodes = len(nodes)
-                    
-                    # 统计空闲节点（GPU 使用数为 0）和空闲 GPU 分布
-                    free_nodes = []
-                    low_priority_free_nodes = []  # 低优空余节点
-                    gpu_free_distribution = {}  # free_gpu_count -> node_count
-                    total_free_gpus = 0
-                    total_gpus = 0
-                    
-                    for node in nodes:
-                        node_name = node.get("name", "")
-                        node_status = node.get("status", "")
-                        cordon_type = node.get("cordon_type", "")
-                        gpu_info = node.get("gpu", {})
-                        gpu_used = gpu_info.get("used", 0)
-                        gpu_total = gpu_info.get("total", 0)
-                        
-                        # 跳过异常节点（gpu_total=0 但有任务在跑，可能是故障节点）
-                        if gpu_total == 0:
-                            continue
-                        
-                        # 判断节点是否可调度
-                        # - 状态必须是 Ready
-                        # - 不能有 cordon 标记（hardware-fault, software-fault 等）
-                        is_schedulable = (node_status == "Ready" and not cordon_type)
-                        
-                        gpu_free = max(0, gpu_total - gpu_used)  # 避免负数
-                        
-                        total_gpus += gpu_total
-                        
-                        # 只有可调度节点的空闲 GPU 才计入统计
-                        if is_schedulable:
-                            total_free_gpus += gpu_free
-                            
-                            # 统计空闲 GPU 分布
-                            if gpu_free > 0:
-                                gpu_free_distribution[gpu_free] = gpu_free_distribution.get(gpu_free, 0) + 1
-                            
-                            if gpu_used == 0 and gpu_total > 0:
-                                free_nodes.append({
-                                    "name": node_name,
-                                    "gpu_total": gpu_total,
-                                })
-                            
-                            # 检查是否为低优空余节点（低优任务占满整节点）
-                            low_priority_gpu = node_low_priority_gpu.get(node_name, 0)
-                            if low_priority_gpu >= gpu_total and gpu_used > 0:
-                                low_priority_free_nodes.append({
-                                    "name": node_name,
-                                    "low_priority_gpu": low_priority_gpu,
-                                    "gpu_total": gpu_total,
-                                })
-                    
-                    all_results.append({
-                        "workspace_id": workspace_id,
-                        "workspace_name": ws_name,
-                        "id": lcg_id,
-                        "name": lcg_name,
-                        "gpu_type": gpu_type,
-                        "total_nodes": total_nodes,
-                        "free_nodes": len(free_nodes),
-                        "free_node_list": free_nodes,
-                        "low_priority_free_nodes": len(low_priority_free_nodes),
-                        "low_priority_free_node_list": low_priority_free_nodes,
-                        "total_gpus": total_gpus,
-                        "total_free_gpus": total_free_gpus,
-                        "gpu_free_distribution": gpu_free_distribution,
-                        "specs": specs,
-                    })
-                except QzAPIError as e:
-                    display.print_warning(f"查询 {lcg_name} 失败: {e}")
-                    continue
-        except QzAPIError as e:
-            if "401" in str(e) or "过期" in str(e):
-                display.print_error("Cookie 已过期，请重新设置: qzcli cookie -f <cookie_file>")
-                return 1
-            display.print_warning(f"查询 {ws_name} 失败: {e}")
-            continue
-
-    if args.cpu:
-        if not cpu_workspace_results:
-            display.print_error("未能获取任何工作空间的 CPU/MEM 节点数据")
-            return 1
-
-        display.print(f"\n[bold]CPU/MEM 空闲资源汇总[/bold]\n")
-        for entry in cpu_workspace_results:
-            ws_name = entry["workspace_name"] or entry["workspace_id"]
-            _print_cpu_capacity_table(display, f"工作空间: {ws_name}", entry["analysis"], cpu_thresholds)
-
-        if len(cpu_workspace_results) > 1:
-            merged_overall = {
-                "ready": 0,
-                "cpu_free": 0.0,
-                "mem_free": 0.0,
-                "above": [0] * len(cpu_thresholds),
-            }
-            for entry in cpu_workspace_results:
-                overall = entry["analysis"]["overall"]
-                merged_overall["ready"] += overall["ready"]
-                merged_overall["cpu_free"] += overall["cpu_free"]
-                merged_overall["mem_free"] += overall["mem_free"]
-                merged_overall["above"] = [
-                    a + b for a, b in zip(merged_overall["above"], overall["above"])
-                ]
-            _print_cpu_capacity_table(
-                display,
-                "总计（所有工作空间）",
-                {"groups": {}, "overall": merged_overall},
-                cpu_thresholds,
-            )
-        return 0
-    
-    if not all_results:
-        display.print_error("未能获取任何计算组的节点信息")
-        return 1
-    
-    display.print(f"\n[bold]空余节点汇总[/bold]\n")
-    
-    # 如果指定了节点需求，过滤并推荐
-    if required_nodes:
-        # 按空闲节点数降序排序
-        if args.low_priority:
-            # 考虑低优空余
-            all_results.sort(key=lambda x: (x["free_nodes"] + x.get("low_priority_free_nodes", 0), x["free_nodes"]), reverse=True)
-            available = [r for r in all_results if r["free_nodes"] + r.get("low_priority_free_nodes", 0) >= required_nodes]
-        else:
-            all_results.sort(key=lambda x: x["free_nodes"], reverse=True)
-            available = [r for r in all_results if r["free_nodes"] >= required_nodes]
-        
-        if not available:
-            if args.low_priority:
-                display.print(f"[red]没有计算组有 >= {required_nodes} 个可用节点（空闲+低优空余）[/red]\n")
-            else:
-                display.print(f"[red]没有计算组有 >= {required_nodes} 个空闲节点[/red]\n")
-            display.print("当前各计算组节点情况：")
-            for r in all_results:
-                if args.low_priority:
-                    lp_free = r.get('low_priority_free_nodes', 0)
-                    display.print(f"  [{r['workspace_name']}] {r['name']}: {r['free_nodes']} 空节点 + {lp_free} 低优空余 [{r['gpu_type']}]")
-                else:
-                    display.print(f"  [{r['workspace_name']}] {r['name']}: {r['free_nodes']} 空节点 [{r['gpu_type']}]")
-            return 1
-        
-        display.print(f"需要 {required_nodes} 个节点，以下计算组可用：\n")
-        
-        for r in available:
-            if args.low_priority:
-                lp_free = r.get('low_priority_free_nodes', 0)
-                total_avail = r['free_nodes'] + lp_free
-                display.print(f"[green]✓[/green] [{r['workspace_name']}] [bold]{r['name']}[/bold]  {r['free_nodes']} 空节点 + {lp_free} 低优空余 = {total_avail} 可用 [{r['gpu_type']}]")
-            else:
-                display.print(f"[green]✓[/green] [{r['workspace_name']}] [bold]{r['name']}[/bold]  {r['free_nodes']} 空节点 [{r['gpu_type']}]")
-            display.print(f"  [cyan]{r['id']}[/cyan]")
-            # 显示空闲节点列表
-            if args.verbose and r.get('free_node_list'):
-                node_names = [n['name'] for n in r['free_node_list']]
-                display.print(f"  [dim]空闲节点: {', '.join(node_names)}[/dim]")
-            if args.verbose and args.low_priority and r.get('low_priority_free_node_list'):
-                lp_node_names = [n['name'] for n in r['low_priority_free_node_list']]
-                display.print(f"  [dim]低优空余: {', '.join(lp_node_names)}[/dim]")
-        
-        # 导出格式
-        if args.export:
-            display.print("")
-            best = available[0]
-            display.print(f"# 推荐: [{best['workspace_name']}] {best['name']} ({best['free_nodes']} 空节点)")
-            display.print(f'WORKSPACE_ID="{best["workspace_id"]}"')
-            display.print(f'LOGIC_COMPUTE_GROUP_ID="{best["id"]}"')
-            specs = best.get("specs", {})
-            if specs:
-                spec = list(specs.values())[0]
-                display.print(f'SPEC_ID="{spec["id"]}"  # {spec.get("gpu_count", 0)}x {spec.get("gpu_type", "")}')
-    else:
-        # 全分区统一大表展示
-        if args.low_priority:
-            sorted_results = sorted(
-                all_results,
-                key=lambda x: (
-                    x["free_nodes"] + x.get("low_priority_free_nodes", 0),
-                    x["free_nodes"],
-                    x.get("total_free_gpus", 0),
-                ),
-                reverse=True,
-            )
-        else:
-            sorted_results = sorted(
-                all_results,
-                key=lambda x: (x["free_nodes"], x.get("total_free_gpus", 0)),
-                reverse=True,
-            )
-
-        workspace_order: List[str] = []
-        workspace_grouped_results: dict[str, List[dict]] = {}
-        for r in sorted_results:
-            ws_name = r.get("workspace_name", "")
-            if ws_name not in workspace_grouped_results:
-                workspace_grouped_results[ws_name] = []
-                workspace_order.append(ws_name)
-            workspace_grouped_results[ws_name].append(r)
-
-        grouped_results: List[dict] = []
-        section_break_after_rows: List[int] = []
-        row_cursor = 0
-        for ws_name in workspace_order:
-            ws_rows = workspace_grouped_results[ws_name]
-            grouped_results.extend(ws_rows)
-            row_cursor += len(ws_rows)
-            if row_cursor < len(sorted_results):
-                section_break_after_rows.append(row_cursor - 1)
-
-        total_groups = len(sorted_results)
-        total_free_nodes = sum(r.get("free_nodes", 0) for r in sorted_results)
-        total_nodes = sum(r.get("total_nodes", 0) for r in sorted_results)
-        total_free_gpus = sum(r.get("total_free_gpus", 0) for r in sorted_results)
-        total_gpus = sum(r.get("total_gpus", 0) for r in sorted_results)
-        total_used_gpus = max(0, total_gpus - total_free_gpus)
-        total_gpu_util_ratio = _format_percent(total_used_gpus, total_gpus)
-
-        display.print(f"[bold]全分区总览 ({total_groups} 个计算组)[/bold]")
-        display.print(
-            f"[dim]空节点 {total_free_nodes}/{total_nodes} | 空GPU {total_free_gpus}/{total_gpus} | GPU利用率 {total_gpu_util_ratio}[/dim]"
-        )
-
-        if RICH_TABLE_AVAILABLE and getattr(display, "console", None):
-            table = Table(
-                box=box.MINIMAL,
-                show_header=True,
-                header_style="bold",
-                expand=False,
-                padding=(0, 1),
-            )
-            table.add_column("排名", justify="right", style="dim")
-            table.add_column("分区", style="cyan", overflow="fold")
-            table.add_column("计算组", style="white", overflow="fold")
-            table.add_column("空节点", justify="right")
-            if args.low_priority:
-                table.add_column("低优空余", justify="right")
-                table.add_column("可用节点", justify="right")
-            table.add_column("总节点", justify="right", style="dim")
-            table.add_column("空GPU", justify="right")
-            table.add_column("GPU利用率", justify="right")
-            table.add_column("GPU类型", style="magenta", no_wrap=True)
-
-            section_break_set = set(section_break_after_rows)
-            for idx, r in enumerate(grouped_results, 1):
-                free_nodes = r.get("free_nodes", 0)
-                low_priority_free = r.get("low_priority_free_nodes", 0)
-                total_available = free_nodes + low_priority_free
-                total_gpu = r.get("total_gpus", 0)
-                total_free_gpu = r.get("total_free_gpus", 0)
-
-                free_nodes_text = f"[green]{free_nodes}[/green]" if free_nodes > 0 else "[dim]0[/dim]"
-                low_priority_text = (
-                    f"[yellow]{low_priority_free}[/yellow]"
-                    if low_priority_free > 0
-                    else "[dim]0[/dim]"
-                )
-                total_available_text = (
-                    f"[green]{total_available}[/green]"
-                    if total_available > 0
-                    else "[dim]0[/dim]"
-                )
-
-                used_gpu = max(0, total_gpu - total_free_gpu)
-                gpu_util_text = _format_percent(used_gpu, total_gpu)
-                if total_gpu > 0:
-                    gpu_util_ratio = used_gpu / total_gpu
-                    if gpu_util_ratio >= 0.8:
-                        gpu_util_text = f"[green]{gpu_util_text}[/green]"
-                    elif gpu_util_ratio >= 0.4:
-                        gpu_util_text = f"[yellow]{gpu_util_text}[/yellow]"
-                    else:
-                        gpu_util_text = f"[red]{gpu_util_text}[/red]"
-                else:
-                    gpu_util_text = "[dim]-[/dim]"
-
-                row = [
-                    str(idx),
-                    r.get("workspace_name", ""),
-                    r.get("name", ""),
-                    free_nodes_text,
-                ]
-                if args.low_priority:
-                    row.extend([low_priority_text, total_available_text])
-                row.extend(
-                    [
-                        str(r.get("total_nodes", 0)),
-                        f"{total_free_gpu}/{total_gpu}",
-                        gpu_util_text,
-                        r.get("gpu_type", "") or "-",
-                    ]
-                )
-                table.add_row(*row, end_section=((idx - 1) in section_break_set))
-
-            display.console.print(table)
-        else:
-            table_rows = []
-            for idx, r in enumerate(grouped_results, 1):
-                total_gpu = r.get("total_gpus", 0)
-                total_free_gpu = r.get("total_free_gpus", 0)
-                row = [
-                    idx,
-                    r.get("workspace_name", ""),
-                    r.get("name", ""),
-                    r.get("free_nodes", 0),
-                ]
-                if args.low_priority:
-                    low_priority_free = r.get("low_priority_free_nodes", 0)
-                    row.extend([low_priority_free, r.get("free_nodes", 0) + low_priority_free])
-                row.extend(
-                    [
-                        r.get("total_nodes", 0),
-                        f"{total_free_gpu}/{total_gpu}",
-                        _format_percent(max(0, total_gpu - total_free_gpu), total_gpu),
-                        r.get("gpu_type", "") or "-",
-                    ]
-                )
-                table_rows.append(row)
-
-            headers = ["排名", "分区", "计算组", "空节点"]
-            aligns = ["right", "left", "left", "right"]
-            max_widths = [4, 24, 30, 6]
-            if args.low_priority:
-                headers.extend(["低优空余", "可用节点"])
-                aligns.extend(["right", "right"])
-                max_widths.extend([8, 8])
-            headers.extend(["总节点", "空GPU", "GPU利用率", "GPU类型"])
-            aligns.extend(["right", "right", "right", "left"])
-            max_widths.extend([6, 12, 9, 10])
-
-            table_lines = _render_plain_table(
-                headers=headers,
-                rows=table_rows,
-                aligns=aligns,
-                max_widths=max_widths,
-                section_break_after_rows=section_break_after_rows,
-            )
-            for line in table_lines:
-                display.print(line)
-
-        # 显示空闲 GPU 分布（-v 模式）
-        if args.verbose:
-            display.print("")
-            display.print("[bold]详细分布[/bold]")
-            has_detail = False
-            for r in grouped_results:
-                prefix = f"[{r.get('workspace_name', '')}] {r.get('name', '')}"
-                dist = r.get("gpu_free_distribution", {})
-                if dist:
-                    dist_parts = []
-                    for gpu_count in sorted(dist.keys(), reverse=True):
-                        node_count = dist[gpu_count]
-                        dist_parts.append(f"空{gpu_count}卡×{node_count}")
-                    display.print(f"  [dim]{prefix}: {', '.join(dist_parts)}[/dim]")
-                    has_detail = True
-                if r.get("free_node_list"):
-                    node_names = [n["name"] for n in r["free_node_list"]]
-                    display.print(f"  [dim]{prefix} 全空节点: {', '.join(node_names)}[/dim]")
-                    has_detail = True
-                if args.low_priority and r.get("low_priority_free_node_list"):
-                    lp_node_names = [n["name"] for n in r["low_priority_free_node_list"]]
-                    display.print(f"  [dim]{prefix} 低优空余: {', '.join(lp_node_names)}[/dim]")
-                    has_detail = True
-            if not has_detail:
-                display.print("  [dim]暂无可展示的详细分布[/dim]")
-        display.print("")
-        
-        # 导出格式
-        if args.export:
-            display.print("[bold]导出格式:[/bold]")
-            for r in sorted(all_results, key=lambda x: x["free_nodes"], reverse=True):
-                if r['free_nodes'] > 0:
-                    display.print(f"# [{r['workspace_name']}] {r['name']} ({r['free_nodes']} 空节点)")
-                    display.print(f'WORKSPACE_ID="{r["workspace_id"]}"')
-                    display.print(f'LOGIC_COMPUTE_GROUP_ID="{r["id"]}"')
-    
-    return 0
+    return _cmd_avail_impl(args)
 
 
 def cmd_usage(args):
@@ -1765,9 +595,10 @@ def cmd_usage(args):
     api = get_api()
     
     # 获取 cookie
-    cookie_data = get_cookie()
-    if not cookie_data or not cookie_data.get("cookie"):
-        display.print_error("未设置 cookie，请先运行: qzcli login")
+    try:
+        cookie_data = api.ensure_cookie()
+    except QzAPIError as e:
+        display.print_error(str(e))
         return 1
     
     cookie = cookie_data["cookie"]
@@ -1780,22 +611,20 @@ def cmd_usage(args):
         all_resources = load_all_resources()
         if not all_resources:
             display.print_error("没有已缓存的工作空间")
-            display.print("[dim]请先运行: qzcli res -u[/dim]")
+            display.print("[dim]请先运行: qzcli catalog -u[/dim]")
             return 1
         workspace_ids = [(ws_id, data.get("name", "")) for ws_id, data in all_resources.items()]
-    elif workspace_input.startswith("ws-"):
+    else:
+        try:
+            workspace_id, ws_name = resolve_workspace_ref(workspace_input)
+            workspace_ids = [(workspace_id, ws_name)]
+        except ResourceResolutionError as e:
+            display.print_error(str(e))
+            return 1
+    if workspace_input and workspace_input.startswith("ws-"):
         ws_resources = get_workspace_resources(workspace_input)
         ws_name = ws_resources.get("name", "") if ws_resources else ""
         workspace_ids = [(workspace_input, ws_name)]
-    else:
-        workspace_id = find_workspace_by_name(workspace_input)
-        if workspace_id:
-            ws_resources = get_workspace_resources(workspace_id)
-            ws_name = ws_resources.get("name", "") if ws_resources else workspace_input
-            workspace_ids = [(workspace_id, ws_name)]
-        else:
-            display.print_error(f"未找到名称为 '{workspace_input}' 的工作空间")
-            return 1
     
     from collections import defaultdict
     
@@ -1840,25 +669,14 @@ def cmd_usage(args):
                 "training": "训练",
             }
             
-            # 提取项目信息用于更新 resources.json
-            projects_found = {}
-            
             for task in tasks:
                 gpu_info = task.get("gpu", {})
                 gpu_total = gpu_info.get("total", 0)
                 user_name = task.get("user", {}).get("name", "未知")
                 project_info = task.get("project", {})
                 project_name = project_info.get("name", "未知")
-                project_id = project_info.get("id", "")
                 task_type = task.get("type", "unknown")
                 priority = task.get("priority", 0)
-                
-                # 收集项目信息
-                if project_id and project_id not in projects_found:
-                    projects_found[project_id] = {
-                        "id": project_id,
-                        "name": project_name,
-                    }
                 
                 gpu_distribution[gpu_total] += 1
                 user_gpu[user_name] += gpu_total
@@ -1868,49 +686,6 @@ def cmd_usage(args):
                 priority_stats[priority]["count"] += 1
                 priority_stats[priority]["gpu"] += gpu_total
                 total_gpu += gpu_total
-            
-            # 增量更新 resources.json 中的项目列表
-            if projects_found:
-                new_count = update_workspace_projects(
-                    workspace_id, 
-                    list(projects_found.values()),
-                    ws_name
-                )
-                if new_count > 0:
-                    display.print(f"[dim]发现 {new_count} 个新项目，已更新到本地缓存[/dim]")
-            
-            # 通过 list_node_dimension 发现计算组
-            try:
-                node_data = api.list_node_dimension(workspace_id, cookie, page_size=500)
-                nodes = node_data.get("node_dimensions", [])
-                
-                # 从节点信息中提取计算组
-                compute_groups_found = {}
-                for node in nodes:
-                    lcg_info = node.get("logic_compute_group", {})
-                    lcg_id = lcg_info.get("id", "")
-                    lcg_name = lcg_info.get("name", "")
-                    if lcg_id and lcg_id not in compute_groups_found:
-                        # 获取 GPU 类型信息
-                        gpu_info = node.get("gpu", {})
-                        gpu_type = gpu_info.get("type", "")
-                        compute_groups_found[lcg_id] = {
-                            "id": lcg_id,
-                            "name": lcg_name,
-                            "gpu_type": gpu_type,
-                            "workspace_id": workspace_id,
-                        }
-                
-                if compute_groups_found:
-                    new_cg_count = update_workspace_compute_groups(
-                        workspace_id,
-                        list(compute_groups_found.values()),
-                        ws_name
-                    )
-                    if new_cg_count > 0:
-                        display.print(f"[dim]发现 {new_cg_count} 个新计算组，已更新到本地缓存[/dim]")
-            except QzAPIError:
-                pass  # 忽略节点查询失败，不影响主要功能
             
             all_stats.append({
                 "workspace_id": workspace_id,
@@ -1993,19 +768,27 @@ def cmd_usage(args):
 
 
 def cmd_workspace(args):
-    """查看工作空间内所有运行任务"""
+    """查看工作空间内运行任务。"""
     display = get_display()
     api = get_api()
     
     # 获取 cookie
-    cookie_data = get_cookie()
-    if not cookie_data or not cookie_data.get("cookie"):
-        display.print_error("未设置 cookie，请先运行: qzcli cookie -f cookies.txt")
-        display.print("[dim]提示: 从浏览器 F12 获取 cookie[/dim]")
+    try:
+        cookie_data = api.ensure_cookie()
+    except QzAPIError as e:
+        display.print_error(str(e))
         return 1
     
     cookie = cookie_data["cookie"]
-    workspace_id = args.workspace or cookie_data.get("workspace_id", "")
+    workspace_arg = args.workspace
+    if workspace_arg:
+        try:
+            workspace_id, _ = resolve_workspace_ref(workspace_arg)
+        except ResourceResolutionError as e:
+            display.print_error(str(e))
+            return 1
+    else:
+        workspace_id = cookie_data.get("workspace_id", "")
     
     # 如果没有指定 workspace，列出可用的 workspace 供选择
     if not workspace_id:
@@ -2021,7 +804,7 @@ def cmd_workspace(args):
                     display.print(f"      [dim]{ws_id}[/dim]")
                 display.print("")
                 display.print("[dim]使用方法:[/dim]")
-                display.print("  qzcli ws -w <workspace_id>")
+                display.print("  qzcli ws -w <工作空间名称或ID>")
                 display.print("  qzcli cookie -w <workspace_id>  # 设置默认")
             else:
                 display.print_error("未找到可访问的工作空间")
@@ -2132,462 +915,20 @@ def cmd_workspace(args):
         return 1
 
 
-def _resolve_resource_id(workspace_id, resource_type, value):
-    """Resolve a resource name or ID to its ID. Returns (resolved_id, display_name)."""
-    if not value:
-        return None, None
-    prefixes = {"projects": "project-", "compute_groups": "lcg-", "specs": ""}
-    prefix = prefixes.get(resource_type, "")
-    if prefix and value.startswith(prefix):
-        return value, value
-    if resource_type == "specs" and len(value) > 20:
-        return value, value
-    found = find_resource_by_name(workspace_id, resource_type, value)
-    if found:
-        return found["id"], found.get("name", value)
-    return None, None
-
-
-def _auto_select_resource(workspace_id, resource_type):
-    """Auto-select the first resource of a given type from cache."""
-    ws_resources = get_workspace_resources(workspace_id)
-    if not ws_resources:
-        return None, None
-    resources = ws_resources.get(resource_type, {})
-    if not resources:
-        return None, None
-    first = next(iter(resources.values()))
-    return first["id"], first.get("name", first["id"])
-
-
 def _resolve_create_context(args, display):
-    """Resolve workspace, project, compute group and spec for create-style commands."""
-    workspace_id = None
-    ws_display = ""
-    if args.workspace:
-        if args.workspace.startswith("ws-"):
-            workspace_id = args.workspace
-        else:
-            workspace_id = find_workspace_by_name(args.workspace)
-            if not workspace_id:
-                display.print_error(f"未找到名称为 '{args.workspace}' 的工作空间")
-                display.print("[dim]使用 qzcli res --list 查看已缓存的工作空间[/dim]")
-                return None
-        ws_resources = get_workspace_resources(workspace_id)
-        ws_display = (ws_resources or {}).get("name", workspace_id)
-    else:
-        display.print_error("请指定工作空间: --workspace <名称或ID>")
-        display.print("[dim]使用 qzcli res --list 查看已缓存的工作空间[/dim]")
-        return None
-
-    project_id = None
-    proj_display = ""
-    if args.project:
-        if args.project.startswith("project-"):
-            project_id = args.project
-            proj_display = project_id
-        else:
-            project_id, proj_display = _resolve_resource_id(workspace_id, "projects", args.project)
-            if not project_id:
-                display.print_error(f"未找到项目 '{args.project}'")
-                display.print("[dim]使用 qzcli res -w <workspace> 查看可用项目[/dim]")
-                return None
-    else:
-        project_id, proj_display = _auto_select_resource(workspace_id, "projects")
-        if not project_id:
-            display.print_error("未指定项目且缓存中无可用项目")
-            display.print("[dim]使用 --project 指定，或先运行 qzcli res -u[/dim]")
-            return None
-        display.print(f"[dim]自动选择项目: {proj_display} ({project_id})[/dim]")
-
-    compute_group_id = None
-    cg_display = ""
-    if args.compute_group:
-        if args.compute_group.startswith("lcg-"):
-            compute_group_id = args.compute_group
-            cg_display = compute_group_id
-        else:
-            compute_group_id, cg_display = _resolve_resource_id(workspace_id, "compute_groups", args.compute_group)
-            if not compute_group_id:
-                display.print_error(f"未找到计算组 '{args.compute_group}'")
-                display.print("[dim]使用 qzcli res -w <workspace> 查看可用计算组[/dim]")
-                return None
-    else:
-        compute_group_id, cg_display = _auto_select_resource(workspace_id, "compute_groups")
-        if not compute_group_id:
-            display.print_error("未指定计算组且缓存中无可用计算组")
-            display.print("[dim]使用 --compute-group 指定，或先运行 qzcli res -u[/dim]")
-            return None
-        display.print(f"[dim]自动选择计算组: {cg_display} ({compute_group_id})[/dim]")
-
-    spec_id = None
-    spec_display = ""
-    if args.spec:
-        spec_id = args.spec
-        spec_display = spec_id
-        if not (spec_id.count("-") >= 4 or len(spec_id) > 20):
-            resolved, resolved_name = _resolve_resource_id(workspace_id, "specs", spec_id)
-            if resolved:
-                spec_id = resolved
-                spec_display = resolved_name or resolved
-    else:
-        spec_id, spec_display = _auto_select_resource(workspace_id, "specs")
-        if not spec_id:
-            display.print_error("未指定资源规格且缓存中无可用规格")
-            display.print("[dim]使用 --spec 指定，或先运行 qzcli res -u[/dim]")
-            return None
-        display.print(f"[dim]自动选择规格: {spec_display} ({spec_id})[/dim]")
-
-    return {
-        "workspace_id": workspace_id,
-        "workspace_display": ws_display,
-        "project_id": project_id,
-        "project_display": proj_display,
-        "compute_group_id": compute_group_id,
-        "compute_group_display": cg_display,
-        "spec_id": spec_id,
-        "spec_display": spec_display or spec_id,
-    }
+    return _resolve_create_context_impl(args, display)
 
 
 def cmd_create(args):
-    """创建任务"""
-    display = get_display()
-    api = get_api()
-    store = get_store()
-    ctx = _resolve_create_context(args, display)
-    if not ctx:
-        return 1
-
-    # --- Build payload ---
-    payload = {
-        "name": args.name,
-        "logic_compute_group_id": ctx["compute_group_id"],
-        "project_id": ctx["project_id"],
-        "workspace_id": ctx["workspace_id"],
-        "framework": args.framework,
-        "command": args.cmd_str,
-        "task_priority": args.priority,
-        "auto_fault_tolerance": False,
-        "framework_config": [{
-            "spec_id": ctx["spec_id"],
-            "image": args.image,
-            "image_type": args.image_type,
-            "instance_count": args.instances,
-            "shm_gi": args.shm,
-        }],
-    }
-
-    # --- Dry run ---
-    if args.dry_run:
-        import json as json_mod
-        display.print("[bold]Dry run - 以下为将要提交的 payload:[/bold]\n")
-        print(json_mod.dumps(payload, indent=2, ensure_ascii=False))
-        return 0
-
-    # --- Show summary ---
-    display.print(f"\n[bold]创建任务[/bold]")
-    display.print(f"  名称: {args.name}")
-    display.print(f"  工作空间: {ctx['workspace_display']} ({ctx['workspace_id']})")
-    display.print(f"  项目: {ctx['project_display']} ({ctx['project_id']})")
-    display.print(f"  计算组: {ctx['compute_group_display']} ({ctx['compute_group_id']})")
-    display.print(f"  规格: {ctx['spec_display']} ({ctx['spec_id']})")
-    display.print(f"  镜像: {args.image}")
-    display.print(f"  实例数: {args.instances}")
-    display.print(f"  共享内存: {args.shm} GiB")
-    display.print(f"  优先级: {args.priority}")
-    display.print(f"  命令: {args.cmd_str[:120]}{'...' if len(args.cmd_str) > 120 else ''}")
-    display.print("")
-
-    # --- Submit ---
-    try:
-        result = api.create_job(payload)
-    except QzAPIError as e:
-        display.print_error(f"任务创建失败: {e}")
-        return 1
-
-    job_id = result.get("job_id", "")
-    resp_ws_id = result.get("workspace_id", ctx["workspace_id"])
-
-    if not job_id:
-        display.print_error("任务创建失败: 响应中未包含 job_id")
-        if args.output_json:
-            import json as json_mod
-            print(json_mod.dumps(result, indent=2, ensure_ascii=False))
-        return 1
-
-    job_url = f"https://qz.sii.edu.cn/jobs/distributedTrainingDetail/{job_id}?spaceId={resp_ws_id}"
-
-    display.print_success(f"任务创建成功!")
-    display.print(f"  Job ID: [cyan]{job_id}[/cyan]")
-    display.print(f"  链接: {job_url}")
-
-    # --- Auto track ---
-    if not args.no_track:
-        job = JobRecord(
-            job_id=job_id,
-            name=args.name,
-            status="job_pending",
-            workspace_id=resp_ws_id,
-            project_id=ctx["project_id"],
-            source="qzcli create",
-            command=args.cmd_str,
-            url=job_url,
-            instance_count=args.instances,
-            priority_level=str(args.priority),
-        )
-        store.add(job)
-        display.print(f"  [dim]已自动追踪到本地[/dim]")
-
-    # --- JSON output ---
-    if args.output_json:
-        import json as json_mod
-        output = {
-            "job_id": job_id,
-            "workspace_id": resp_ws_id,
-            "url": job_url,
-            "name": args.name,
-        }
-        print(json_mod.dumps(output, ensure_ascii=False))
-
-    return 0
+    return _cmd_create_impl(args)
 
 
 def cmd_create_hpc(args):
-    """创建 HPC 任务"""
-    display = get_display()
-    api = get_api()
-    store = get_store()
-
-    ctx = _resolve_create_context(args, display)
-    if not ctx:
-        return 1
-
-    payload = {
-        "name": args.name,
-        "logic_compute_group_id": ctx["compute_group_id"],
-        "project_id": ctx["project_id"],
-        "workspace_id": ctx["workspace_id"],
-        "entrypoint": args.entrypoint,
-        "image": args.image,
-        "image_type": args.image_type,
-        "instance_count": args.instances,
-        "spec_id": ctx["spec_id"],
-        "number_of_tasks": args.number_of_tasks,
-        "cpus_per_task": args.cpus_per_task,
-        "memory_per_cpu": args.memory_per_cpu,
-        "enable_hyper_threading": args.enable_hyper_threading,
-    }
-
-    if args.dry_run:
-        import json as json_mod
-        display.print("[bold]Dry run - 以下为将要提交的 HPC payload:[/bold]\n")
-        print(json_mod.dumps(payload, indent=2, ensure_ascii=False))
-        return 0
-
-    display.print(f"\n[bold]创建 HPC 任务[/bold]")
-    display.print(f"  名称: {args.name}")
-    display.print(f"  工作空间: {ctx['workspace_display']} ({ctx['workspace_id']})")
-    display.print(f"  项目: {ctx['project_display']} ({ctx['project_id']})")
-    display.print(f"  计算组: {ctx['compute_group_display']} ({ctx['compute_group_id']})")
-    display.print(f"  规格: {ctx['spec_display']} ({ctx['spec_id']})")
-    display.print(f"  镜像: {args.image}")
-    display.print(f"  实例数: {args.instances}")
-    display.print(f"  任务数: {args.number_of_tasks}")
-    display.print(f"  每任务 CPU: {args.cpus_per_task}")
-    display.print(f"  每 CPU 内存: {args.memory_per_cpu}")
-    display.print(f"  超线程: {'开启' if args.enable_hyper_threading else '关闭'}")
-    display.print(f"  入口命令: {args.entrypoint[:120]}{'...' if len(args.entrypoint) > 120 else ''}")
-    display.print("")
-
-    try:
-        result = api.create_hpc_job(payload)
-    except QzAPIError as e:
-        display.print_error(f"HPC 任务创建失败: {e}")
-        return 1
-
-    job_id = result.get("job_id", "")
-    resp_ws_id = result.get("workspace_id", ctx["workspace_id"])
-
-    if not job_id:
-        display.print_error("HPC 任务创建失败: 响应中未包含 job_id")
-        if args.output_json:
-            import json as json_mod
-            print(json_mod.dumps(result, indent=2, ensure_ascii=False))
-        return 1
-
-    job_url = f"{api.base_url}/jobs/distributedTrainingDetail/{job_id}?spaceId={resp_ws_id}"
-
-    display.print_success("HPC 任务创建成功!")
-    display.print(f"  Job ID: [cyan]{job_id}[/cyan]")
-    display.print(f"  链接: {job_url}")
-
-    if args.track:
-        job = JobRecord(
-            job_id=job_id,
-            name=args.name,
-            status="job_pending",
-            workspace_id=resp_ws_id,
-            project_id=ctx["project_id"],
-            source="qzcli create-hpc",
-            command=args.entrypoint,
-            url=job_url,
-            instance_count=args.instances,
-            metadata={
-                "job_type": "hpc",
-                "number_of_tasks": args.number_of_tasks,
-                "cpus_per_task": args.cpus_per_task,
-                "memory_per_cpu": args.memory_per_cpu,
-                "enable_hyper_threading": args.enable_hyper_threading,
-            },
-        )
-        store.add(job)
-        display.print("  [dim]已写入本地追踪；当前状态刷新接口未单独适配 HPC 任务[/dim]")
-    else:
-        display.print("  [dim]默认未加入本地追踪；如需记录到本地请加 --track[/dim]")
-
-    if args.output_json:
-        import json as json_mod
-        output = {
-            "job_id": job_id,
-            "workspace_id": resp_ws_id,
-            "url": job_url,
-            "name": args.name,
-            "job_type": "hpc",
-            "tracked": args.track,
-        }
-        print(json_mod.dumps(output, ensure_ascii=False))
-
-    return 0
+    return _cmd_create_hpc_impl(args)
 
 
 def cmd_batch(args):
-    """批量提交任务"""
-    import json as json_mod
-    import itertools
-
-    display = get_display()
-
-    config_path = Path(args.config)
-    if not config_path.exists():
-        display.print_error(f"配置文件不存在: {config_path}")
-        return 1
-
-    with open(config_path, "r", encoding="utf-8") as f:
-        config = json_mod.load(f)
-
-    defaults = config.get("defaults", {})
-    matrix = config.get("matrix", {})
-    name_template = config.get("name_template", "job-{_index}")
-    command_template = config.get("command_template", "")
-
-    if not command_template:
-        display.print_error("配置文件中缺少 command_template")
-        return 1
-
-    # Generate all combinations from matrix
-    keys = list(matrix.keys())
-    if not keys:
-        display.print_error("配置文件中 matrix 为空")
-        return 1
-
-    values = [matrix[k] if isinstance(matrix[k], list) else [matrix[k]] for k in keys]
-    combinations = list(itertools.product(*values))
-    total = len(combinations)
-
-    display.print(f"\n[bold]批量任务提交[/bold]")
-    display.print(f"  配置文件: {config_path}")
-    display.print(f"  矩阵维度: {' x '.join(f'{k}({len(matrix[k]) if isinstance(matrix[k], list) else 1})' for k in keys)}")
-    display.print(f"  总任务数: {total}")
-    display.print("")
-
-    if args.dry_run:
-        display.print("[bold]Dry run - 预览所有任务:[/bold]\n")
-
-    successful = 0
-    failed = 0
-    failed_tasks = []
-
-    for idx, combo in enumerate(combinations, 1):
-        # Build template variables
-        variables = dict(zip(keys, combo))
-        variables["_index"] = idx
-        for k, v in variables.items():
-            if isinstance(v, str) and "/" in v:
-                import os as os_mod
-                variables[f"{k}_basename"] = os_mod.path.basename(v)
-
-        try:
-            job_name = name_template.format(**variables)
-        except KeyError as e:
-            display.print_warning(f"任务 {idx}: name_template 变量缺失: {e}")
-            job_name = f"batch-job-{idx}"
-
-        try:
-            command = command_template.format(**variables)
-        except KeyError as e:
-            display.print_error(f"任务 {idx}: command_template 变量缺失: {e}")
-            failed += 1
-            failed_tasks.append(f"{idx}: template error {e}")
-            continue
-
-        if args.dry_run:
-            display.print(f"  [{idx}/{total}] {job_name}")
-            display.print(f"    命令: {command[:120]}{'...' if len(command) > 120 else ''}")
-            display.print("")
-            continue
-
-        display.print(f"[bold][{idx}/{total}][/bold] 提交: {job_name}")
-
-        # Build argparse-like namespace for cmd_create
-        create_args = argparse.Namespace(
-            name=job_name,
-            cmd_str=command,
-            workspace=defaults.get("workspace", ""),
-            project=defaults.get("project", ""),
-            compute_group=defaults.get("compute_group", ""),
-            spec=defaults.get("spec", ""),
-            image=defaults.get("image", ""),
-            image_type=defaults.get("image_type", "SOURCE_PRIVATE"),
-            instances=defaults.get("instances", 1),
-            shm=defaults.get("shm", 1200),
-            priority=defaults.get("priority", 10),
-            framework=defaults.get("framework", "pytorch"),
-            no_track=False,
-            dry_run=False,
-            output_json=False,
-        )
-
-        ret = cmd_create(create_args)
-        if ret == 0:
-            successful += 1
-        else:
-            failed += 1
-            failed_tasks.append(f"{idx}: {job_name}")
-            if not args.continue_on_error:
-                display.print_error("任务提交失败，停止批量提交（使用 --continue-on-error 忽略错误）")
-                break
-
-        # Delay between submissions
-        if idx < total and not args.dry_run:
-            time.sleep(args.delay)
-
-    if args.dry_run:
-        display.print(f"[bold]预览完成，共 {total} 个任务[/bold]")
-        return 0
-
-    display.print(f"\n[bold]批量提交完成[/bold]")
-    display.print(f"  总任务数: {total}")
-    display.print(f"  成功: {successful}")
-    display.print(f"  失败: {failed}")
-
-    if failed_tasks:
-        display.print("\n[bold]失败的任务:[/bold]")
-        for task in failed_tasks:
-            display.print(f"  - {task}")
-        return 1
-
-    return 0
+    return _cmd_batch_impl(args)
 
 
 def cmd_login(args):
@@ -2743,16 +1084,16 @@ def main():
     login_parser.add_argument("--workspace", "-w", help="默认工作空间 ID")
     
     # workspace 命令
-    workspace_parser = subparsers.add_parser("workspace", aliases=["ws"], help="查看工作空间内所有运行任务")
-    workspace_parser.add_argument("--workspace", "-w", help="工作空间 ID")
-    workspace_parser.add_argument("--project", "-p", default="扩散", help="按项目名称过滤（默认: 扩散）")
-    workspace_parser.add_argument("--all", "-a", action="store_true", help="显示所有项目（不过滤）")
+    workspace_parser = subparsers.add_parser("workspace", aliases=["ws"], help="查看工作空间内运行任务")
+    workspace_parser.add_argument("--workspace", "-w", help="工作空间 ID 或名称")
+    workspace_parser.add_argument("--project", "-p", help="按项目名称过滤（默认不过滤）")
+    workspace_parser.add_argument("--all", "-a", action="store_true", help="显示所有项目（兼容旧参数，默认已不过滤）")
     workspace_parser.add_argument("--page", type=int, default=1, help="页码")
     workspace_parser.add_argument("--size", type=int, default=100, help="每页数量（默认 100）")
     workspace_parser.add_argument("--sync", "-s", action="store_true", help="同步到本地任务列表")
     
-    # workspaces 命令 - 从历史任务提取资源配置
-    workspaces_parser = subparsers.add_parser("workspaces", aliases=["lsws", "res", "resources"], help="从历史任务提取资源配置（项目、计算组、规格）")
+    # catalog 命令 - 管理工作空间资源目录
+    workspaces_parser = subparsers.add_parser("catalog", aliases=["workspaces", "lsws", "res", "resources"], help="查看和刷新工作空间资源目录（项目、计算组、规格）")
     workspaces_parser.add_argument("--workspace", "-w", help="工作空间 ID 或名称")
     workspaces_parser.add_argument("--export", "-e", action="store_true", help="输出可用于脚本的环境变量格式")
     workspaces_parser.add_argument("--update", "-u", action="store_true", help="强制从 API 更新缓存")
@@ -2783,10 +1124,10 @@ def main():
     create_parser = subparsers.add_parser("create", aliases=["create-job"], help="创建并提交任务到启智平台")
     create_parser.add_argument("--name", "-n", required=True, help="任务名称")
     create_parser.add_argument("--command", "-c", dest="cmd_str", required=True, help="执行命令")
-    create_parser.add_argument("--workspace", "-w", help="工作空间 ID 或名称（从 qzcli res 缓存解析）")
-    create_parser.add_argument("--project", "-p", help="项目 ID 或名称（不指定则自动选择）")
-    create_parser.add_argument("--compute-group", "-g", dest="compute_group", help="计算组 ID 或名称")
-    create_parser.add_argument("--spec", "-s", help="资源规格 ID（不指定则自动选择）")
+    create_parser.add_argument("--workspace", "-w", help="工作空间 ID 或名称（从 qzcli catalog 缓存解析）")
+    create_parser.add_argument("--project", "-p", help="项目 ID 或名称（仅唯一候选时自动选择）")
+    create_parser.add_argument("--compute-group", "-g", dest="compute_group", help="计算组 ID 或名称（仅唯一候选时自动选择）")
+    create_parser.add_argument("--spec", "-s", help="资源规格 ID（仅唯一候选时自动选择）")
     create_parser.add_argument("--image", "-i", help="Docker 镜像")
     create_parser.add_argument("--image-type", dest="image_type", default="SOURCE_PRIVATE", help="镜像类型（默认 SOURCE_PRIVATE）")
     create_parser.add_argument("--instances", type=int, default=1, help="实例数量（默认 1）")
@@ -2801,10 +1142,10 @@ def main():
     create_hpc_parser = subparsers.add_parser("create-hpc", aliases=["create-hpc-job"], help="创建并提交 HPC 任务到启智平台")
     create_hpc_parser.add_argument("--name", "-n", required=True, help="任务名称")
     create_hpc_parser.add_argument("--entrypoint", "--command", "-c", dest="entrypoint", required=True, help="HPC 入口命令")
-    create_hpc_parser.add_argument("--workspace", "-w", help="工作空间 ID 或名称（从 qzcli res 缓存解析）")
-    create_hpc_parser.add_argument("--project", "-p", help="项目 ID 或名称（不指定则自动选择）")
-    create_hpc_parser.add_argument("--compute-group", "-g", dest="compute_group", help="计算组 ID 或名称")
-    create_hpc_parser.add_argument("--spec", "-s", help="资源规格 ID（不指定则自动选择）")
+    create_hpc_parser.add_argument("--workspace", "-w", help="工作空间 ID 或名称（从 qzcli catalog 缓存解析）")
+    create_hpc_parser.add_argument("--project", "-p", help="项目 ID 或名称（仅唯一候选时自动选择）")
+    create_hpc_parser.add_argument("--compute-group", "-g", dest="compute_group", help="计算组 ID 或名称（仅唯一候选时自动选择）")
+    create_hpc_parser.add_argument("--spec", "-s", help="资源规格 ID（仅唯一候选时自动选择）")
     create_hpc_parser.add_argument("--image", "-i", required=True, help="Docker 镜像")
     create_hpc_parser.add_argument("--image-type", dest="image_type", default="SOURCE_PRIVATE", help="镜像类型（默认 SOURCE_PRIVATE）")
     create_hpc_parser.add_argument("--instances", "--instance-count", dest="instances", type=int, default=1, help="实例数量（默认 1）")
@@ -2850,6 +1191,7 @@ def main():
         "login": cmd_login,
         "workspace": cmd_workspace,
         "ws": cmd_workspace,
+        "catalog": cmd_workspaces,
         "workspaces": cmd_workspaces,
         "lsws": cmd_workspaces,
         "resources": cmd_workspaces,

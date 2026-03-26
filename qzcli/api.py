@@ -8,8 +8,10 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from .config import (
     get_api_base_url,
+    get_cookie,
     get_credentials,
     get_token_cache,
+    save_cookie,
     save_token_cache,
     clear_token_cache,
 )
@@ -36,6 +38,114 @@ class QzAPI:
             self._username, self._password = get_credentials()
         
         self._token: Optional[str] = None
+
+    def _resolve_credentials(self) -> tuple[str, str]:
+        """Return credentials from explicit args first, then env/config fallback."""
+        if self._username and self._password:
+            return self._username, self._password
+
+        username, password = get_credentials()
+        if username and password:
+            self._username = username
+            self._password = password
+
+        return self._username or "", self._password or ""
+
+    def ensure_cookie(self, force_refresh: bool = False) -> Dict[str, Any]:
+        """Return a usable browser cookie, refreshing via CAS when needed."""
+        cookie_data = get_cookie() or {}
+        if not force_refresh and cookie_data.get("cookie"):
+            return cookie_data
+
+        username, password = self._resolve_credentials()
+        if not username or not password:
+            raise QzAPIError(
+                "Cookie 不可用，且未配置认证信息；请设置 QZCLI_USERNAME/QZCLI_PASSWORD 或运行 qzcli init"
+            )
+
+        workspace_id = str(cookie_data.get("workspace_id", ""))
+        cookie = self.login_with_cas(username, password)
+        save_cookie(cookie, workspace_id=workspace_id)
+        return get_cookie() or {"cookie": cookie, "workspace_id": workspace_id}
+
+    @staticmethod
+    def _browser_headers(cookie: str, referer: str) -> Dict[str, str]:
+        """构造内部 cookie API 通用请求头。"""
+        return {
+            "accept": "application/json, text/plain, */*",
+            "accept-language": "en-US,en;q=0.9",
+            "cache-control": "no-cache",
+            "content-type": "application/json",
+            "cookie": cookie,
+            "origin": "https://qz.sii.edu.cn",
+            "pragma": "no-cache",
+            "referer": referer,
+            "sec-ch-ua": '"Not(A:Brand";v="8", "Chromium";v="144"',
+            "sec-ch-ua-mobile": "?0",
+            "sec-ch-ua-platform": '"macOS"',
+            "sec-fetch-dest": "empty",
+            "sec-fetch-mode": "cors",
+            "sec-fetch-site": "same-origin",
+            "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36",
+        }
+
+    @staticmethod
+    def _parse_json_response(response: requests.Response, invalid_json_message: str) -> Dict[str, Any]:
+        try:
+            return response.json()
+        except Exception as exc:
+            raise QzAPIError(invalid_json_message) from exc
+
+    @staticmethod
+    def _raise_for_bad_status(response: requests.Response, auth_message: str) -> None:
+        if response.status_code == 401:
+            raise QzAPIError(auth_message, 401)
+        if response.status_code != 200:
+            raise QzAPIError(f"请求失败: HTTP {response.status_code}", response.status_code)
+
+    def _post_json(self, url: str, payload: Dict[str, Any], headers: Dict[str, str], timeout: int) -> requests.Response:
+        try:
+            return requests.post(
+                url,
+                json=payload,
+                headers=headers,
+                timeout=timeout,
+            )
+        except requests.RequestException as exc:
+            raise QzAPIError(f"请求失败: {exc}") from exc
+
+    def _cookie_request(
+        self,
+        endpoint: str,
+        payload: Dict[str, Any],
+        *,
+        cookie: str,
+        referer: str,
+        timeout: int = 60,
+        retry_on_auth_error: bool = True,
+    ) -> Dict[str, Any]:
+        """发送使用浏览器 cookie 的内部 API 请求。"""
+        url = f"{self.base_url}{endpoint}"
+        response = self._post_json(url, payload, self._browser_headers(cookie, referer), timeout)
+        if response.status_code == 401 and retry_on_auth_error:
+            refreshed_cookie = self.ensure_cookie(force_refresh=True).get("cookie", "")
+            if refreshed_cookie:
+                return self._cookie_request(
+                    endpoint,
+                    payload,
+                    cookie=refreshed_cookie,
+                    referer=referer,
+                    timeout=timeout,
+                    retry_on_auth_error=False,
+                )
+        self._raise_for_bad_status(response, "Cookie 已过期或无效，请重新获取")
+        result = self._parse_json_response(response, "响应不是有效的 JSON，请检查 cookie 是否正确")
+        if result.get("code") != 0:
+            raise QzAPIError(
+                f"API 请求失败: {result.get('message', '未知错误')}",
+                result.get("code")
+            )
+        return result.get("data", {})
     
     def _get_token(self, force_refresh: bool = False) -> str:
         """获取 Access Token（带缓存）"""
@@ -50,18 +160,19 @@ class QzAPI:
                 return self._token
         
         # 请求新 token
-        if not self._username or not self._password:
+        username, password = self._resolve_credentials()
+        if not username or not password:
             raise QzAPIError("未配置认证信息，请运行 qzcli init 或设置环境变量 QZCLI_USERNAME/QZCLI_PASSWORD")
         
         url = f"{self.base_url}/auth/token"
-        response = requests.post(
+        response = self._post_json(
             url,
-            json={"username": self._username, "password": self._password},
-            headers={"Content-Type": "application/json"},
-            timeout=30,
+            {"username": username, "password": password},
+            {"Content-Type": "application/json"},
+            30,
         )
-        
-        data = response.json()
+        self._raise_for_bad_status(response, "获取 Token 失败: 认证失效")
+        data = self._parse_json_response(response, "获取 Token 失败: 响应不是有效的 JSON")
         if data.get("code") != 0:
             raise QzAPIError(f"获取 Token 失败: {data.get('message', '未知错误')}", data.get("code"))
         
@@ -81,18 +192,18 @@ class QzAPI:
         """发送 API 请求"""
         token = self._get_token()
         url = f"{self.base_url}{endpoint}"
-        
-        response = requests.post(
+
+        response = self._post_json(
             url,
-            json=data,
-            headers={
+            data,
+            {
                 "Authorization": f"Bearer {token}",
                 "Content-Type": "application/json",
             },
-            timeout=60,
+            60,
         )
-        
-        result = response.json()
+        self._raise_for_bad_status(response, "Token 已过期或无效，请重新认证")
+        result = self._parse_json_response(response, "响应不是有效的 JSON")
         
         # Token 过期时重试
         if result.get("code") == -1 and retry_on_auth_error:
@@ -179,58 +290,17 @@ class QzAPI:
         Returns:
             API 响应数据，包含 task_dimensions 列表
         """
-        url = f"{self.base_url}/api/v1/workspace/list_task_dimension"
-        
         payload = {
             "page_num": page_num,
             "page_size": page_size,
             "filter": {"workspace_id": workspace_id}
         }
-        
-        # 需要完整的浏览器 headers 才能通过认证
-        headers = {
-            "accept": "application/json, text/plain, */*",
-            "accept-language": "en-US,en;q=0.9",
-            "cache-control": "no-cache",
-            "content-type": "application/json",
-            "cookie": cookie,
-            "origin": "https://qz.sii.edu.cn",
-            "pragma": "no-cache",
-            "referer": f"https://qz.sii.edu.cn/jobs/spacesOverview?spaceId={workspace_id}",
-            "sec-ch-ua": '"Not(A:Brand";v="8", "Chromium";v="144"',
-            "sec-ch-ua-mobile": "?0",
-            "sec-ch-ua-platform": '"macOS"',
-            "sec-fetch-dest": "empty",
-            "sec-fetch-mode": "cors",
-            "sec-fetch-site": "same-origin",
-            "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36",
-        }
-        
-        response = requests.post(
-            url,
-            json=payload,
-            headers=headers,
-            timeout=60,
+        data = self._cookie_request(
+            "/api/v1/workspace/list_task_dimension",
+            payload,
+            cookie=cookie,
+            referer=f"https://qz.sii.edu.cn/jobs/spacesOverview?spaceId={workspace_id}",
         )
-        
-        if response.status_code == 401:
-            raise QzAPIError("Cookie 已过期或无效，请重新获取", 401)
-        
-        if response.status_code != 200:
-            raise QzAPIError(f"请求失败: HTTP {response.status_code}", response.status_code)
-        
-        try:
-            result = response.json()
-        except Exception:
-            raise QzAPIError("响应不是有效的 JSON，请检查 cookie 是否正确")
-        
-        if result.get("code") != 0:
-            raise QzAPIError(
-                f"API 请求失败: {result.get('message', '未知错误')}",
-                result.get("code")
-            )
-        
-        data = result.get("data", {})
         
         # 客户端过滤项目
         if project_filter:
@@ -264,9 +334,6 @@ class QzAPI:
         Returns:
             包含 jobs 列表和 total 的字典
         """
-        # 注意：使用 /api/v1/ 而不是 /openapi/v1/，前者需要 cookie 认证
-        url = f"{self.base_url}/api/v1/train_job/list"
-        
         payload = {
             "page_num": page_num,
             "page_size": page_size,
@@ -275,51 +342,12 @@ class QzAPI:
         
         if created_by:
             payload["created_by"] = created_by
-        
-        # 需要完整的浏览器 headers 才能通过认证
-        headers = {
-            "accept": "application/json, text/plain, */*",
-            "accept-language": "en-US,en;q=0.9",
-            "cache-control": "no-cache",
-            "content-type": "application/json",
-            "cookie": cookie,
-            "origin": "https://qz.sii.edu.cn",
-            "pragma": "no-cache",
-            "referer": f"https://qz.sii.edu.cn/jobs/distributedTraining?spaceId={workspace_id}",
-            "sec-ch-ua": '"Not(A:Brand";v="8", "Chromium";v="144"',
-            "sec-ch-ua-mobile": "?0",
-            "sec-ch-ua-platform": '"macOS"',
-            "sec-fetch-dest": "empty",
-            "sec-fetch-mode": "cors",
-            "sec-fetch-site": "same-origin",
-            "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36",
-        }
-        
-        response = requests.post(
-            url,
-            json=payload,
-            headers=headers,
-            timeout=60,
+        return self._cookie_request(
+            "/api/v1/train_job/list",
+            payload,
+            cookie=cookie,
+            referer=f"https://qz.sii.edu.cn/jobs/distributedTraining?spaceId={workspace_id}",
         )
-        
-        if response.status_code == 401:
-            raise QzAPIError("Cookie 已过期或无效，请重新获取", 401)
-        
-        if response.status_code != 200:
-            raise QzAPIError(f"请求失败: HTTP {response.status_code}", response.status_code)
-        
-        try:
-            result = response.json()
-        except Exception:
-            raise QzAPIError("响应不是有效的 JSON，请检查 cookie 是否正确")
-        
-        if result.get("code") != 0:
-            raise QzAPIError(
-                f"API 请求失败: {result.get('message', '未知错误')}",
-                result.get("code")
-            )
-        
-        return result.get("data", {})
     
     def extract_resources_from_jobs(self, jobs: List[Dict[str, Any]]) -> Dict[str, Any]:
         """
@@ -428,8 +456,6 @@ class QzAPI:
         Returns:
             包含 node_dimensions 列表的字典
         """
-        url = f"{self.base_url}/api/v1/cluster_metric/list_node_dimension"
-        
         filter_params = {"workspace_id": workspace_id}
         if logic_compute_group_id:
             filter_params["logic_compute_group_id"] = logic_compute_group_id
@@ -439,51 +465,12 @@ class QzAPI:
             "page_size": page_size,
             "filter": filter_params,
         }
-        
-        # 需要完整的浏览器 headers 才能通过认证
-        headers = {
-            "accept": "application/json, text/plain, */*",
-            "accept-language": "en-US,en;q=0.9",
-            "cache-control": "no-cache",
-            "content-type": "application/json",
-            "cookie": cookie,
-            "origin": "https://qz.sii.edu.cn",
-            "pragma": "no-cache",
-            "referer": f"https://qz.sii.edu.cn/jobs/spacesOverview?spaceId={workspace_id}",
-            "sec-ch-ua": '"Not(A:Brand";v="8", "Chromium";v="144"',
-            "sec-ch-ua-mobile": "?0",
-            "sec-ch-ua-platform": '"macOS"',
-            "sec-fetch-dest": "empty",
-            "sec-fetch-mode": "cors",
-            "sec-fetch-site": "same-origin",
-            "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36",
-        }
-        
-        response = requests.post(
-            url,
-            json=payload,
-            headers=headers,
-            timeout=60,
+        return self._cookie_request(
+            "/api/v1/cluster_metric/list_node_dimension",
+            payload,
+            cookie=cookie,
+            referer=f"https://qz.sii.edu.cn/jobs/spacesOverview?spaceId={workspace_id}",
         )
-        
-        if response.status_code == 401:
-            raise QzAPIError("Cookie 已过期或无效，请重新获取", 401)
-        
-        if response.status_code != 200:
-            raise QzAPIError(f"请求失败: HTTP {response.status_code}", response.status_code)
-        
-        try:
-            result = response.json()
-        except Exception:
-            raise QzAPIError("响应不是有效的 JSON，请检查 cookie 是否正确")
-        
-        if result.get("code") != 0:
-            raise QzAPIError(
-                f"API 请求失败: {result.get('message', '未知错误')}",
-                result.get("code")
-            )
-        
-        return result.get("data", {})
 
     def list_task_dimension(
         self,
@@ -506,8 +493,6 @@ class QzAPI:
         Returns:
             包含 task_dimensions 列表的字典
         """
-        url = f"{self.base_url}/api/v1/cluster_metric/list_task_dimension"
-        
         filter_params = {"workspace_id": workspace_id}
         if project_id:
             filter_params["project_id"] = project_id
@@ -517,50 +502,12 @@ class QzAPI:
             "page_size": page_size,
             "filter": filter_params,
         }
-        
-        headers = {
-            "accept": "application/json, text/plain, */*",
-            "accept-language": "en-US,en;q=0.9",
-            "cache-control": "no-cache",
-            "content-type": "application/json",
-            "cookie": cookie,
-            "origin": "https://qz.sii.edu.cn",
-            "pragma": "no-cache",
-            "referer": f"https://qz.sii.edu.cn/jobs/spacesOverview?spaceId={workspace_id}",
-            "sec-ch-ua": '"Not(A:Brand";v="8", "Chromium";v="144"',
-            "sec-ch-ua-mobile": "?0",
-            "sec-ch-ua-platform": '"macOS"',
-            "sec-fetch-dest": "empty",
-            "sec-fetch-mode": "cors",
-            "sec-fetch-site": "same-origin",
-            "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36",
-        }
-        
-        response = requests.post(
-            url,
-            json=payload,
-            headers=headers,
-            timeout=60,
+        return self._cookie_request(
+            "/api/v1/cluster_metric/list_task_dimension",
+            payload,
+            cookie=cookie,
+            referer=f"https://qz.sii.edu.cn/jobs/spacesOverview?spaceId={workspace_id}",
         )
-        
-        if response.status_code == 401:
-            raise QzAPIError("Cookie 已过期或无效，请重新获取", 401)
-        
-        if response.status_code != 200:
-            raise QzAPIError(f"请求失败: HTTP {response.status_code}", response.status_code)
-        
-        try:
-            result = response.json()
-        except Exception:
-            raise QzAPIError("响应不是有效的 JSON，请检查 cookie 是否正确")
-        
-        if result.get("code") != 0:
-            raise QzAPIError(
-                f"API 请求失败: {result.get('message', '未知错误')}",
-                result.get("code")
-            )
-        
-        return result.get("data", {})
 
     def get_cluster_basic_info(self, workspace_id: str, cookie: str) -> Dict[str, Any]:
         """
@@ -573,55 +520,15 @@ class QzAPI:
         Returns:
             包含 clusters, compute_groups, resource_types 的字典
         """
-        url = f"{self.base_url}/api/v1/cluster_metric/cluster_basic_info"
-        
         payload = {
             "workspace_id": workspace_id
         }
-        
-        headers = {
-            "accept": "application/json, text/plain, */*",
-            "accept-language": "en-US,en;q=0.9",
-            "cache-control": "no-cache",
-            "content-type": "application/json",
-            "cookie": cookie,
-            "origin": "https://qz.sii.edu.cn",
-            "pragma": "no-cache",
-            "referer": f"https://qz.sii.edu.cn/jobs/spacesOverview?spaceId={workspace_id}",
-            "sec-ch-ua": '"Not(A:Brand";v="8", "Chromium";v="144"',
-            "sec-ch-ua-mobile": "?0",
-            "sec-ch-ua-platform": '"macOS"',
-            "sec-fetch-dest": "empty",
-            "sec-fetch-mode": "cors",
-            "sec-fetch-site": "same-origin",
-            "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36",
-        }
-        
-        response = requests.post(
-            url,
-            json=payload,
-            headers=headers,
-            timeout=60,
+        return self._cookie_request(
+            "/api/v1/cluster_metric/cluster_basic_info",
+            payload,
+            cookie=cookie,
+            referer=f"https://qz.sii.edu.cn/jobs/spacesOverview?spaceId={workspace_id}",
         )
-        
-        if response.status_code == 401:
-            raise QzAPIError("Cookie 已过期或无效，请重新获取", 401)
-        
-        if response.status_code != 200:
-            raise QzAPIError(f"请求失败: HTTP {response.status_code}", response.status_code)
-        
-        try:
-            result = response.json()
-        except Exception:
-            raise QzAPIError("响应不是有效的 JSON，请检查 cookie 是否正确")
-        
-        if result.get("code") != 0:
-            raise QzAPIError(
-                f"API 请求失败: {result.get('message', '未知错误')}",
-                result.get("code")
-            )
-        
-        return result.get("data", {})
 
     def list_workspaces(self, cookie: str) -> List[Dict[str, Any]]:
         """
@@ -636,71 +543,48 @@ class QzAPI:
         Returns:
             工作空间列表 [{"id": "ws-xxx", "name": "工作空间名称"}, ...]
         """
-        url = f"{self.base_url}/api/v1/project/list"
-        
-        payload = {
-            "page": 1,
-            "page_size": 100,
-            "filter": {}
-        }
-        
-        headers = {
-            "accept": "application/json, text/plain, */*",
-            "accept-language": "en-US,en;q=0.9",
-            "cache-control": "no-cache",
-            "content-type": "application/json",
-            "cookie": cookie,
-            "origin": "https://qz.sii.edu.cn",
-            "pragma": "no-cache",
-            "referer": "https://qz.sii.edu.cn/operations/projects",
-            "sec-ch-ua": '"Not(A:Brand";v="8", "Chromium";v="144"',
-            "sec-ch-ua-mobile": "?0",
-            "sec-ch-ua-platform": '"macOS"',
-            "sec-fetch-dest": "empty",
-            "sec-fetch-mode": "cors",
-            "sec-fetch-site": "same-origin",
-            "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36",
-        }
-        
-        response = requests.post(
-            url,
-            json=payload,
-            headers=headers,
-            timeout=60,
-        )
-        
-        if response.status_code == 401:
-            raise QzAPIError("Cookie 已过期或无效，请重新获取", 401)
-        
-        if response.status_code != 200:
-            raise QzAPIError(f"请求失败: HTTP {response.status_code}", response.status_code)
-        
-        try:
-            result = response.json()
-        except Exception:
-            raise QzAPIError("响应不是有效的 JSON，请检查 cookie 是否正确")
-        
-        if result.get("code") != 0:
-            raise QzAPIError(
-                f"API 请求失败: {result.get('message', '未知错误')}",
-                result.get("code")
-            )
-        
-        data = result.get("data", {})
-        items = data.get("items", [])
-        
-        # 从项目的 space_list 中提取工作空间（去重）
         workspaces = {}
-        for proj in items:
-            space_list = proj.get("space_list", [])
-            for space in space_list:
-                ws_id = space.get("id", "")
-                ws_name = space.get("name", "")
-                if ws_id and ws_id not in workspaces:
-                    workspaces[ws_id] = {
-                        "id": ws_id,
-                        "name": ws_name,
-                    }
+        page = 1
+        page_size = 100
+
+        while True:
+            payload = {
+                "page": page,
+                "page_size": page_size,
+                "filter": {}
+            }
+            data = self._cookie_request(
+                "/api/v1/project/list",
+                payload,
+                cookie=cookie,
+                referer="https://qz.sii.edu.cn/operations/projects",
+            )
+            items = data.get("items", [])
+
+            for proj in items:
+                space_list = proj.get("space_list", [])
+                for space in space_list:
+                    ws_id = space.get("id", "")
+                    ws_name = space.get("name", "")
+                    if ws_id and ws_id not in workspaces:
+                        workspaces[ws_id] = {
+                            "id": ws_id,
+                            "name": ws_name,
+                        }
+
+            total = data.get("total")
+            try:
+                total_count = int(total) if total is not None else None
+            except (TypeError, ValueError):
+                total_count = None
+
+            if not items:
+                break
+            if total_count is not None and page * page_size >= total_count:
+                break
+            if len(items) < page_size:
+                break
+            page += 1
         
         return list(workspaces.values())
 
