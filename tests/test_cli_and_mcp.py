@@ -1,7 +1,10 @@
 import sys
 import types
+from argparse import Namespace
 
 import qzcli.cli as cli
+import qzcli.create_commands as create_commands
+import qzcli.task_dimensions as task_dimensions
 
 
 def _install_fake_mcp():
@@ -72,3 +75,196 @@ def test_workspace_parser_defaults_to_no_project_filter(monkeypatch):
 
     assert cli.main() == 0
     assert captured == {"project": None, "all": False}
+
+
+def test_tasks_parser_defaults_to_served_dashboard(monkeypatch):
+    captured = {}
+
+    def fake_cmd_task_dimensions(args):
+        captured["workspace"] = args.workspace
+        captured["project"] = args.project
+        captured["page_size"] = args.page_size
+        captured["serve"] = args.serve
+        captured["command"] = args.command
+        return 0
+
+    monkeypatch.setattr(cli, "cmd_task_dimensions", fake_cmd_task_dimensions)
+    monkeypatch.setattr(sys, "argv", ["qzcli", "tasks"])
+
+    assert cli.main() == 0
+    assert captured == {
+        "workspace": None,
+        "project": None,
+        "page_size": 100,
+        "serve": True,
+        "command": "tasks",
+    }
+
+
+def test_blame_alias_can_disable_dashboard(monkeypatch):
+    captured = {}
+
+    def fake_cmd_task_dimensions(args):
+        captured["serve"] = args.serve
+        captured["command"] = args.command
+        return 0
+
+    monkeypatch.setattr(cli, "cmd_task_dimensions", fake_cmd_task_dimensions)
+    monkeypatch.setattr(sys, "argv", ["qzcli", "blame", "--no-serve"])
+
+    assert cli.main() == 0
+    assert captured == {"serve": False, "command": "blame"}
+
+
+def test_pick_workspace_prefers_distributed_training_space_without_cookie():
+    workspace_id, workspace_name = task_dimensions._pick_workspace(
+        requested_workspace="",
+        cookie_workspace_id="",
+        workspace_options=[
+            {"id": "ws-ppu", "name": "CI-PPU"},
+            {"id": "ws-train", "name": "分布式训练空间"},
+            {"id": "ws-ci", "name": "CI-情境智能"},
+        ],
+    )
+
+    assert (workspace_id, workspace_name) == ("ws-train", "分布式训练空间")
+
+
+def test_create_parser_accepts_auto_fault_tolerance_alias(monkeypatch):
+    captured = {}
+
+    def fake_cmd_create(args):
+        captured["auto_fault_tolerance"] = args.auto_fault_tolerance
+        captured["fault_tolerance_max_retry"] = args.fault_tolerance_max_retry
+        captured["command"] = args.command
+        return 0
+
+    monkeypatch.setattr(cli, "cmd_create", fake_cmd_create)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "qzcli",
+            "create",
+            "--name",
+            "test-job",
+            "--command",
+            "echo hi",
+            "--workspace",
+            "ws-1",
+            "--auto_fault_tolerance",
+        ],
+    )
+
+    assert cli.main() == 0
+    assert captured == {
+        "auto_fault_tolerance": True,
+        "fault_tolerance_max_retry": 3,
+        "command": "create",
+    }
+
+
+def test_cmd_create_dry_run_passes_auto_fault_tolerance(monkeypatch, capsys):
+    class _FakeDisplay:
+        def print(self, *args, **kwargs):
+            return None
+
+        def print_error(self, *args, **kwargs):
+            return None
+
+    monkeypatch.setattr(create_commands, "get_display", lambda: _FakeDisplay())
+    monkeypatch.setattr(create_commands, "get_api", lambda: object())
+    monkeypatch.setattr(create_commands, "get_store", lambda: object())
+    monkeypatch.setattr(
+        create_commands,
+        "resolve_create_context",
+        lambda args, display: {
+            "workspace_id": "ws-1",
+            "workspace_display": "空间",
+            "project_id": "proj-1",
+            "project_display": "项目",
+            "compute_group_id": "cg-1",
+            "compute_group_display": "计算组",
+            "spec_id": "spec-1",
+            "spec_display": "规格",
+        },
+    )
+
+    args = Namespace(
+        name="test-job",
+        cmd_str="echo hi",
+        workspace="ws-1",
+        project="proj-1",
+        compute_group="cg-1",
+        spec="spec-1",
+        image="repo/image:latest",
+        image_type="SOURCE_PRIVATE",
+        instances=2,
+        shm=1200,
+        priority=10,
+        framework="pytorch",
+        auto_fault_tolerance=True,
+        fault_tolerance_max_retry=5,
+        no_track=False,
+        dry_run=True,
+        output_json=False,
+    )
+
+    assert create_commands.cmd_create(args) == 0
+    out = capsys.readouterr().out
+
+    assert '"auto_fault_tolerance": true' in out
+    assert '"fault_tolerance_max_retry": 5' in out
+
+
+def test_cmd_create_dry_run_omits_fault_tolerance_retry_when_disabled(monkeypatch, capsys):
+    class _FakeDisplay:
+        def print(self, *args, **kwargs):
+            return None
+
+        def print_error(self, *args, **kwargs):
+            return None
+
+    monkeypatch.setattr(create_commands, "get_display", lambda: _FakeDisplay())
+    monkeypatch.setattr(create_commands, "get_api", lambda: object())
+    monkeypatch.setattr(create_commands, "get_store", lambda: object())
+    monkeypatch.setattr(
+        create_commands,
+        "resolve_create_context",
+        lambda args, display: {
+            "workspace_id": "ws-1",
+            "workspace_display": "空间",
+            "project_id": "proj-1",
+            "project_display": "项目",
+            "compute_group_id": "cg-1",
+            "compute_group_display": "计算组",
+            "spec_id": "spec-1",
+            "spec_display": "规格",
+        },
+    )
+
+    args = Namespace(
+        name="test-job",
+        cmd_str="echo hi",
+        workspace="ws-1",
+        project="proj-1",
+        compute_group="cg-1",
+        spec="spec-1",
+        image="repo/image:latest",
+        image_type="SOURCE_PRIVATE",
+        instances=2,
+        shm=1200,
+        priority=10,
+        framework="pytorch",
+        auto_fault_tolerance=False,
+        fault_tolerance_max_retry=7,
+        no_track=False,
+        dry_run=True,
+        output_json=False,
+    )
+
+    assert create_commands.cmd_create(args) == 0
+    out = capsys.readouterr().out
+
+    assert '"auto_fault_tolerance": false' in out
+    assert '"fault_tolerance_max_retry"' not in out

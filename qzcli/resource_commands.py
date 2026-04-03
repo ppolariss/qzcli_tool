@@ -24,6 +24,7 @@ from .resource_resolution import (
 try:
     from rich.table import Table
     from rich import box
+
     RICH_TABLE_AVAILABLE = True
 except ImportError:
     RICH_TABLE_AVAILABLE = False
@@ -31,7 +32,9 @@ except ImportError:
     box = None  # type: ignore
 
 
-def _cache_workspace_resources(api, workspace_id: str, cookie: str, workspace_name: str = "") -> Dict[str, int]:
+def _cache_workspace_resources(
+    api, workspace_id: str, cookie: str, workspace_name: str = ""
+) -> Dict[str, int]:
     """从 API 拉取并缓存单个工作空间的资源信息。"""
     result = api.list_jobs_with_cookie(workspace_id, cookie, page_size=200)
     jobs = result.get("jobs", [])
@@ -50,12 +53,14 @@ def _cache_workspace_resources(api, workspace_id: str, cookie: str, workspace_na
                 gpu_type = resource_types[0] if resource_types else ""
 
                 if lcg_id:
-                    compute_groups_from_api.append({
-                        "id": lcg_id,
-                        "name": lcg_name,
-                        "gpu_type": brand or gpu_type,
-                        "workspace_id": workspace_id,
-                    })
+                    compute_groups_from_api.append(
+                        {
+                            "id": lcg_id,
+                            "name": lcg_name,
+                            "gpu_type": brand or gpu_type,
+                            "workspace_id": workspace_id,
+                        }
+                    )
 
         if compute_groups_from_api:
             resources["compute_groups"] = compute_groups_from_api
@@ -70,7 +75,15 @@ def _cache_workspace_resources(api, workspace_id: str, cookie: str, workspace_na
 
 
 def _parse_cpu_thresholds(raw_values: Optional[List[str]]) -> List[Dict[str, float]]:
-    default_values = ["40,200", "55,300", "55,500", "100,400", "100,2000", "120,500"]
+    default_values = [
+        "20,100",
+        "40,200",
+        "55,300",
+        "55,500",
+        "100,400",
+        "100,1200",
+        "120,500",
+    ]
     values = raw_values if raw_values else default_values
     thresholds = []
 
@@ -116,7 +129,9 @@ def _node_type_name(node: Dict[str, Any]) -> str:
     )
 
 
-def _analyze_cpu_capacity(nodes: List[Dict[str, Any]], thresholds: List[Dict[str, float]]) -> Dict[str, Any]:
+def _analyze_cpu_capacity(
+    nodes: List[Dict[str, Any]], thresholds: List[Dict[str, float]]
+) -> Dict[str, Any]:
     groups: Dict[str, Dict[str, Any]] = {}
     for node in nodes:
         if str(node.get("status", "")).lower() != "ready":
@@ -190,12 +205,16 @@ def _collect_nodes_for_compute_group(
     return nodes
 
 
-def _print_cpu_capacity_table(display, title: str, analysis: Dict[str, Any], thresholds: List[Dict[str, float]]) -> None:
+def _print_cpu_capacity_table(
+    display, title: str, analysis: Dict[str, Any], thresholds: List[Dict[str, float]]
+) -> None:
     groups = analysis["groups"]
     overall = analysis["overall"]
 
     threshold_labels = [f"{t['cpu']:g},{t['mem']:g}" for t in thresholds]
-    headers = ["节点类型", "Ready", "CPU空闲", "MEM空闲"] + [f">={label}" for label in threshold_labels]
+    headers = ["节点类型", "Ready", "CPU空闲", "MEM空闲"] + [
+        f">={label}" for label in threshold_labels
+    ]
 
     rows = []
     for node_type in sorted(groups.keys()):
@@ -222,7 +241,13 @@ def _print_cpu_capacity_table(display, title: str, analysis: Dict[str, Any], thr
 
     display.print(f"[bold]{title}[/bold]")
     if RICH_TABLE_AVAILABLE and getattr(display, "console", None):
-        table = Table(box=box.MINIMAL, show_header=True, header_style="bold", expand=False, padding=(0, 1))
+        table = Table(
+            box=box.MINIMAL,
+            show_header=True,
+            header_style="bold",
+            expand=False,
+            padding=(0, 1),
+        )
         table.add_column("节点类型", style="cyan", overflow="fold")
         table.add_column("Ready", justify="right")
         table.add_column("CPU空闲", justify="right")
@@ -235,7 +260,12 @@ def _print_cpu_capacity_table(display, title: str, analysis: Dict[str, Any], thr
         display.console.print(table)
     else:
         aligns = ["left", "right", "right", "right"] + ["right"] * len(threshold_labels)
-        table_lines = render_plain_table(headers=headers, rows=rows, aligns=aligns, max_widths=[26, 7, 12, 12] + [9] * len(threshold_labels))
+        table_lines = render_plain_table(
+            headers=headers,
+            rows=rows,
+            aligns=aligns,
+            max_widths=[26, 7, 12, 12] + [9] * len(threshold_labels),
+        )
         for line in table_lines:
             display.print(line)
     display.print("")
@@ -249,7 +279,9 @@ def cmd_workspaces(args):
     if args.list:
         cached = list_cached_workspaces()
         if not cached:
-            display.print("[dim]暂无已缓存的工作空间，使用 qzcli catalog -w <workspace_id> 添加[/dim]")
+            display.print(
+                "[dim]暂无已缓存的工作空间，使用 qzcli catalog -w <workspace_id> 添加[/dim]"
+            )
             return 0
 
         display.print(f"\n[bold]已缓存的工作空间 ({len(cached)} 个)[/bold]\n")
@@ -258,12 +290,17 @@ def cmd_workspaces(args):
             alias = ws.get("alias", "")
             official_name = ws.get("official_name", "")
             import datetime
-            updated = datetime.datetime.fromtimestamp(ws.get("updated_at", 0)).strftime("%Y-%m-%d %H:%M")
+
+            updated = datetime.datetime.fromtimestamp(ws.get("updated_at", 0)).strftime(
+                "%Y-%m-%d %H:%M"
+            )
             display.print(f"  [bold]{name}[/bold]")
             if alias and official_name and alias != official_name:
                 display.print(f"    官方名: {official_name}")
             display.print(f"    ID: [cyan]{ws['id']}[/cyan]")
-            display.print(f"    资源: {ws['project_count']} 项目, {ws['compute_group_count']} 计算组, {ws['spec_count']} 规格")
+            display.print(
+                f"    资源: {ws['project_count']} 项目, {ws['compute_group_count']} 计算组, {ws['spec_count']} 规格"
+            )
             display.print(f"    更新: {updated}")
             display.print("")
 
@@ -276,7 +313,9 @@ def cmd_workspaces(args):
     if hasattr(args, "name") and args.name and not args.update:
         workspace_id = args.workspace
         if not workspace_id:
-            display.print_error("请指定工作空间 ID: qzcli catalog -w <workspace_id> --name <名称>")
+            display.print_error(
+                "请指定工作空间 ID: qzcli catalog -w <workspace_id> --name <名称>"
+            )
             return 1
         set_workspace_name(workspace_id, args.name)
         display.print_success(f"已设置工作空间名称: {args.name}")
@@ -312,13 +351,17 @@ def cmd_workspaces(args):
                     stats = _cache_workspace_resources(api, ws_id, cookie, ws_name)
                     projects_count = stats["projects"]
                     cg_count = stats["compute_groups"]
-                    display.print(f"  ✓ {ws_name or ws_id}: {projects_count} 项目, {cg_count} 计算组")
+                    display.print(
+                        f"  ✓ {ws_name or ws_id}: {projects_count} 项目, {cg_count} 计算组"
+                    )
                 except Exception as e:
                     display.print_warning(f"  ✗ {ws_name or ws_id}: {e}")
 
             display.print("")
             display.print_success("工作空间缓存更新完成！")
-            display.print("[dim]使用 qzcli catalog --list 查看所有已缓存的工作空间[/dim]")
+            display.print(
+                "[dim]使用 qzcli catalog --list 查看所有已缓存的工作空间[/dim]"
+            )
             return 0
 
         except QzAPIError as e:
@@ -334,7 +377,9 @@ def cmd_workspaces(args):
         try:
             workspace_id, resolved_name = resolve_workspace_ref(workspace_input)
             if workspace_input != workspace_id:
-                display.print(f"[dim]匹配到工作空间: {workspace_input} -> {workspace_id} ({resolved_name})[/dim]")
+                display.print(
+                    f"[dim]匹配到工作空间: {workspace_input} -> {workspace_id} ({resolved_name})[/dim]"
+                )
         except ResourceResolutionError as e:
             display.print_error(str(e))
             display.print("[dim]使用 qzcli catalog --list 查看已缓存的工作空间[/dim]")
@@ -350,7 +395,10 @@ def cmd_workspaces(args):
 
     if use_cache:
         import datetime
-        updated = datetime.datetime.fromtimestamp(cached_resources.get("updated_at", 0)).strftime("%Y-%m-%d %H:%M")
+
+        updated = datetime.datetime.fromtimestamp(
+            cached_resources.get("updated_at", 0)
+        ).strftime("%Y-%m-%d %H:%M")
         ws_name = cached_resources.get("name", "")
         title = "资源配置"
         if ws_name:
@@ -378,14 +426,18 @@ def cmd_workspaces(args):
             total = result.get("total", 0)
 
             if not jobs:
-                display.print("[dim]未找到自己的任务，尝试从工作空间任务获取资源信息...[/dim]")
+                display.print(
+                    "[dim]未找到自己的任务，尝试从工作空间任务获取资源信息...[/dim]"
+                )
 
                 projects_found = {}
                 compute_groups_found = {}
                 gpu_types_found = {}
 
                 try:
-                    task_data = api.list_task_dimension(workspace_id, cookie, page_size=200)
+                    task_data = api.list_task_dimension(
+                        workspace_id, cookie, page_size=200
+                    )
                     tasks = task_data.get("task_dimensions", [])
 
                     for task in tasks:
@@ -402,7 +454,9 @@ def cmd_workspaces(args):
                     pass
 
                 try:
-                    node_data = api.list_node_dimension(workspace_id, cookie, page_size=500)
+                    node_data = api.list_node_dimension(
+                        workspace_id, cookie, page_size=500
+                    )
                     nodes = node_data.get("node_dimensions", [])
 
                     for node in nodes:
@@ -447,15 +501,21 @@ def cmd_workspaces(args):
                         display.print(f"    [cyan]{proj['id']}[/cyan]")
 
                 if compute_groups_found:
-                    display.print(f"\n[bold]计算组 ({len(compute_groups_found)} 个)[/bold]")
+                    display.print(
+                        f"\n[bold]计算组 ({len(compute_groups_found)} 个)[/bold]"
+                    )
                     for cg in compute_groups_found.values():
                         display.print(f"  - {cg['name']} [{cg['gpu_type']}]")
                         display.print(f"    [cyan]{cg['id']}[/cyan]")
 
                 if gpu_types_found:
-                    display.print(f"\n[bold]可用 GPU 类型 ({len(gpu_types_found)} 种)[/bold]")
+                    display.print(
+                        f"\n[bold]可用 GPU 类型 ({len(gpu_types_found)} 种)[/bold]"
+                    )
                     for gt in gpu_types_found.values():
-                        display.print(f"  - {gt['type']} ({gt['display']}, {gt['memory_gb']}GB)")
+                        display.print(
+                            f"  - {gt['type']} ({gt['display']}, {gt['memory_gb']}GB)"
+                        )
 
                 if not projects_found and not compute_groups_found:
                     display.print("[dim]未发现项目或计算组信息[/dim]")
@@ -463,11 +523,15 @@ def cmd_workspaces(args):
                 return 0
 
             resources = api.extract_resources_from_jobs(jobs)
-            ws_name = pending_name or (cached_resources.get("name", "") if cached_resources else "")
+            ws_name = pending_name or (
+                cached_resources.get("name", "") if cached_resources else ""
+            )
             save_resources(workspace_id, resources, ws_name)
             display.print_success("资源配置已保存到本地缓存")
 
-            display.print(f"\n[bold]资源配置（从 {len(jobs)}/{total} 个任务中提取）[/bold]")
+            display.print(
+                f"\n[bold]资源配置（从 {len(jobs)}/{total} 个任务中提取）[/bold]"
+            )
             display.print(f"[dim]工作空间: {workspace_id}[/dim]\n")
 
             projects = resources.get("projects", [])
@@ -476,7 +540,9 @@ def cmd_workspaces(args):
 
         except QzAPIError as e:
             if "401" in str(e) or "过期" in str(e):
-                display.print_error("Cookie 已过期，请重新设置: qzcli cookie -f <cookie_file>")
+                display.print_error(
+                    "Cookie 已过期，请重新设置: qzcli cookie -f <cookie_file>"
+                )
             else:
                 display.print_error(f"获取失败: {e}")
             return 1
@@ -506,7 +572,9 @@ def cmd_workspaces(args):
             gpu_count = spec.get("gpu_count", 0)
             cpu_count = spec.get("cpu_count", 0)
             mem_gb = spec.get("memory_gb", 0)
-            display.print(f"  - {gpu_count}x {gpu_type} + {cpu_count}核CPU + {mem_gb}GB内存")
+            display.print(
+                f"  - {gpu_count}x {gpu_type} + {cpu_count}核CPU + {mem_gb}GB内存"
+            )
             display.print(f"    [cyan]{spec['id']}[/cyan]")
         display.print("")
 
@@ -521,7 +589,9 @@ def cmd_workspaces(args):
                 display.print(f'LOGIC_COMPUTE_GROUP_ID="{group["id"]}"')
         if specs:
             for spec in specs:
-                display.print(f'# {spec.get("gpu_count", 0)}x {spec.get("gpu_type", "")}')
+                display.print(
+                    f'# {spec.get("gpu_count", 0)}x {spec.get("gpu_type", "")}'
+                )
                 display.print(f'SPEC_ID="{spec["id"]}"')
 
     return 0
@@ -556,7 +626,9 @@ def cmd_avail(args):
             workspace_id, resolved_name = resolve_workspace_ref(workspace_input)
             workspace_ids = [workspace_id]
             if workspace_input != workspace_id:
-                display.print(f"[dim]匹配到工作空间: {workspace_input} -> {workspace_id} ({resolved_name})[/dim]")
+                display.print(
+                    f"[dim]匹配到工作空间: {workspace_input} -> {workspace_id} ({resolved_name})[/dim]"
+                )
         except ResourceResolutionError as e:
             display.print_error(str(e))
             display.print("[dim]使用 qzcli catalog --list 查看已缓存的工作空间[/dim]")
@@ -604,7 +676,9 @@ def cmd_avail(args):
                     continue
             else:
                 try:
-                    group_id, _ = resolve_cached_resource_ref(workspace_id, "compute_groups", group_filter)
+                    group_id, _ = resolve_cached_resource_ref(
+                        workspace_id, "compute_groups", group_filter
+                    )
                 except ResourceResolutionError as e:
                     display.print_warning(f"{ws_name}: {e}")
                     continue
@@ -616,7 +690,9 @@ def cmd_avail(args):
         if not compute_groups:
             continue
 
-        display.print(f"[dim]正在查询 {ws_name} 的 {len(compute_groups)} 个计算组...[/dim]")
+        display.print(
+            f"[dim]正在查询 {ws_name} 的 {len(compute_groups)} 个计算组...[/dim]"
+        )
 
         if args.cpu:
             workspace_nodes = []
@@ -659,7 +735,9 @@ def cmd_avail(args):
                 tasks = []
                 page_num = 1
                 while True:
-                    task_data = api.list_task_dimension(workspace_id, cookie, page_num=page_num, page_size=200)
+                    task_data = api.list_task_dimension(
+                        workspace_id, cookie, page_num=page_num, page_size=200
+                    )
                     page_tasks = task_data.get("task_dimensions", [])
                     tasks.extend(page_tasks)
                     if len(tasks) >= task_data.get("total", 0) or not page_tasks:
@@ -671,9 +749,13 @@ def cmd_avail(args):
                     if priority <= low_priority_threshold:
                         gpu_total = task.get("gpu", {}).get("total", 0)
                         nodes_occupied = task.get("nodes_occupied", {}).get("nodes", [])
-                        gpu_per_node = gpu_total // len(nodes_occupied) if nodes_occupied else 0
+                        gpu_per_node = (
+                            gpu_total // len(nodes_occupied) if nodes_occupied else 0
+                        )
                         for node_name in nodes_occupied:
-                            node_low_priority_gpu[node_name] += gpu_per_node if len(nodes_occupied) > 1 else gpu_total
+                            node_low_priority_gpu[node_name] += (
+                                gpu_per_node if len(nodes_occupied) > 1 else gpu_total
+                            )
             except QzAPIError:
                 pass
 
@@ -683,7 +765,9 @@ def cmd_avail(args):
                 gpu_type = lcg_info.get("gpu_type", "")
 
                 try:
-                    data = api.list_node_dimension(workspace_id, cookie, lcg_id, page_size=1000)
+                    data = api.list_node_dimension(
+                        workspace_id, cookie, lcg_id, page_size=1000
+                    )
                     nodes = data.get("node_dimensions", [])
                     total_nodes = len(nodes)
 
@@ -704,7 +788,7 @@ def cmd_avail(args):
                         if gpu_total == 0:
                             continue
 
-                        is_schedulable = (node_status == "Ready" and not cordon_type)
+                        is_schedulable = node_status == "Ready" and not cordon_type
                         gpu_free = max(0, gpu_total - gpu_used)
                         total_gpus += gpu_total
 
@@ -712,44 +796,54 @@ def cmd_avail(args):
                             total_free_gpus += gpu_free
 
                             if gpu_free > 0:
-                                gpu_free_distribution[gpu_free] = gpu_free_distribution.get(gpu_free, 0) + 1
+                                gpu_free_distribution[gpu_free] = (
+                                    gpu_free_distribution.get(gpu_free, 0) + 1
+                                )
 
                             if gpu_used == 0 and gpu_total > 0:
-                                free_nodes.append({
-                                    "name": node_name,
-                                    "gpu_total": gpu_total,
-                                })
+                                free_nodes.append(
+                                    {
+                                        "name": node_name,
+                                        "gpu_total": gpu_total,
+                                    }
+                                )
 
                             low_priority_gpu = node_low_priority_gpu.get(node_name, 0)
                             if low_priority_gpu >= gpu_total and gpu_used > 0:
-                                low_priority_free_nodes.append({
-                                    "name": node_name,
-                                    "low_priority_gpu": low_priority_gpu,
-                                    "gpu_total": gpu_total,
-                                })
+                                low_priority_free_nodes.append(
+                                    {
+                                        "name": node_name,
+                                        "low_priority_gpu": low_priority_gpu,
+                                        "gpu_total": gpu_total,
+                                    }
+                                )
 
-                    all_results.append({
-                        "workspace_id": workspace_id,
-                        "workspace_name": ws_name,
-                        "id": lcg_id,
-                        "name": lcg_name,
-                        "gpu_type": gpu_type,
-                        "total_nodes": total_nodes,
-                        "free_nodes": len(free_nodes),
-                        "free_node_list": free_nodes,
-                        "low_priority_free_nodes": len(low_priority_free_nodes),
-                        "low_priority_free_node_list": low_priority_free_nodes,
-                        "total_gpus": total_gpus,
-                        "total_free_gpus": total_free_gpus,
-                        "gpu_free_distribution": gpu_free_distribution,
-                        "specs": specs,
-                    })
+                    all_results.append(
+                        {
+                            "workspace_id": workspace_id,
+                            "workspace_name": ws_name,
+                            "id": lcg_id,
+                            "name": lcg_name,
+                            "gpu_type": gpu_type,
+                            "total_nodes": total_nodes,
+                            "free_nodes": len(free_nodes),
+                            "free_node_list": free_nodes,
+                            "low_priority_free_nodes": len(low_priority_free_nodes),
+                            "low_priority_free_node_list": low_priority_free_nodes,
+                            "total_gpus": total_gpus,
+                            "total_free_gpus": total_free_gpus,
+                            "gpu_free_distribution": gpu_free_distribution,
+                            "specs": specs,
+                        }
+                    )
                 except QzAPIError as e:
                     display.print_warning(f"查询 {lcg_name} 失败: {e}")
                     continue
         except QzAPIError as e:
             if "401" in str(e) or "过期" in str(e):
-                display.print_error("Cookie 已过期，请重新设置: qzcli cookie -f <cookie_file>")
+                display.print_error(
+                    "Cookie 已过期，请重新设置: qzcli cookie -f <cookie_file>"
+                )
                 return 1
             display.print_warning(f"查询 {ws_name} 失败: {e}")
             continue
@@ -762,7 +856,9 @@ def cmd_avail(args):
         display.print("\n[bold]CPU/MEM 空闲资源汇总[/bold]\n")
         for entry in cpu_workspace_results:
             ws_name = entry["workspace_name"] or entry["workspace_id"]
-            _print_cpu_capacity_table(display, f"工作空间: {ws_name}", entry["analysis"], cpu_thresholds)
+            _print_cpu_capacity_table(
+                display, f"工作空间: {ws_name}", entry["analysis"], cpu_thresholds
+            )
 
         if len(cpu_workspace_results) > 1:
             merged_overall = {
@@ -795,24 +891,43 @@ def cmd_avail(args):
 
     if required_nodes:
         if args.low_priority:
-            all_results.sort(key=lambda x: (x["free_nodes"] + x.get("low_priority_free_nodes", 0), x["free_nodes"]), reverse=True)
-            available = [r for r in all_results if r["free_nodes"] + r.get("low_priority_free_nodes", 0) >= required_nodes]
+            all_results.sort(
+                key=lambda x: (
+                    x["free_nodes"] + x.get("low_priority_free_nodes", 0),
+                    x["free_nodes"],
+                ),
+                reverse=True,
+            )
+            available = [
+                r
+                for r in all_results
+                if r["free_nodes"] + r.get("low_priority_free_nodes", 0)
+                >= required_nodes
+            ]
         else:
             all_results.sort(key=lambda x: x["free_nodes"], reverse=True)
             available = [r for r in all_results if r["free_nodes"] >= required_nodes]
 
         if not available:
             if args.low_priority:
-                display.print(f"[red]没有计算组有 >= {required_nodes} 个可用节点（空闲+低优空余）[/red]\n")
+                display.print(
+                    f"[red]没有计算组有 >= {required_nodes} 个可用节点（空闲+低优空余）[/red]\n"
+                )
             else:
-                display.print(f"[red]没有计算组有 >= {required_nodes} 个空闲节点[/red]\n")
+                display.print(
+                    f"[red]没有计算组有 >= {required_nodes} 个空闲节点[/red]\n"
+                )
             display.print("当前各计算组节点情况：")
             for r in all_results:
                 if args.low_priority:
                     lp_free = r.get("low_priority_free_nodes", 0)
-                    display.print(f"  [{r['workspace_name']}] {r['name']}: {r['free_nodes']} 空节点 + {lp_free} 低优空余 [{r['gpu_type']}]")
+                    display.print(
+                        f"  [{r['workspace_name']}] {r['name']}: {r['free_nodes']} 空节点 + {lp_free} 低优空余 [{r['gpu_type']}]"
+                    )
                 else:
-                    display.print(f"  [{r['workspace_name']}] {r['name']}: {r['free_nodes']} 空节点 [{r['gpu_type']}]")
+                    display.print(
+                        f"  [{r['workspace_name']}] {r['name']}: {r['free_nodes']} 空节点 [{r['gpu_type']}]"
+                    )
             return 1
 
         display.print(f"需要 {required_nodes} 个节点，以下计算组可用：\n")
@@ -821,27 +936,39 @@ def cmd_avail(args):
             if args.low_priority:
                 lp_free = r.get("low_priority_free_nodes", 0)
                 total_avail = r["free_nodes"] + lp_free
-                display.print(f"[green]✓[/green] [{r['workspace_name']}] [bold]{r['name']}[/bold]  {r['free_nodes']} 空节点 + {lp_free} 低优空余 = {total_avail} 可用 [{r['gpu_type']}]")
+                display.print(
+                    f"[green]✓[/green] [{r['workspace_name']}] [bold]{r['name']}[/bold]  {r['free_nodes']} 空节点 + {lp_free} 低优空余 = {total_avail} 可用 [{r['gpu_type']}]"
+                )
             else:
-                display.print(f"[green]✓[/green] [{r['workspace_name']}] [bold]{r['name']}[/bold]  {r['free_nodes']} 空节点 [{r['gpu_type']}]")
+                display.print(
+                    f"[green]✓[/green] [{r['workspace_name']}] [bold]{r['name']}[/bold]  {r['free_nodes']} 空节点 [{r['gpu_type']}]"
+                )
             display.print(f"  [cyan]{r['id']}[/cyan]")
             if args.verbose and r.get("free_node_list"):
                 node_names = [n["name"] for n in r["free_node_list"]]
                 display.print(f"  [dim]空闲节点: {', '.join(node_names)}[/dim]")
-            if args.verbose and args.low_priority and r.get("low_priority_free_node_list"):
+            if (
+                args.verbose
+                and args.low_priority
+                and r.get("low_priority_free_node_list")
+            ):
                 lp_node_names = [n["name"] for n in r["low_priority_free_node_list"]]
                 display.print(f"  [dim]低优空余: {', '.join(lp_node_names)}[/dim]")
 
         if args.export:
             display.print("")
             best = available[0]
-            display.print(f"# 推荐: [{best['workspace_name']}] {best['name']} ({best['free_nodes']} 空节点)")
+            display.print(
+                f"# 推荐: [{best['workspace_name']}] {best['name']} ({best['free_nodes']} 空节点)"
+            )
             display.print(f'WORKSPACE_ID="{best["workspace_id"]}"')
             display.print(f'LOGIC_COMPUTE_GROUP_ID="{best["id"]}"')
             specs = best.get("specs", {})
             if specs:
                 spec = list(specs.values())[0]
-                display.print(f'SPEC_ID="{spec["id"]}"  # {spec.get("gpu_count", 0)}x {spec.get("gpu_type", "")}')
+                display.print(
+                    f'SPEC_ID="{spec["id"]}"  # {spec.get("gpu_count", 0)}x {spec.get("gpu_type", "")}'
+                )
     else:
         if args.low_priority:
             sorted_results = sorted(
@@ -920,9 +1047,19 @@ def cmd_avail(args):
                 total_gpu = r.get("total_gpus", 0)
                 total_free_gpu = r.get("total_free_gpus", 0)
 
-                free_nodes_text = f"[green]{free_nodes}[/green]" if free_nodes > 0 else "[dim]0[/dim]"
-                low_priority_text = f"[yellow]{low_priority_free}[/yellow]" if low_priority_free > 0 else "[dim]0[/dim]"
-                total_available_text = f"[green]{total_available}[/green]" if total_available > 0 else "[dim]0[/dim]"
+                free_nodes_text = (
+                    f"[green]{free_nodes}[/green]" if free_nodes > 0 else "[dim]0[/dim]"
+                )
+                low_priority_text = (
+                    f"[yellow]{low_priority_free}[/yellow]"
+                    if low_priority_free > 0
+                    else "[dim]0[/dim]"
+                )
+                total_available_text = (
+                    f"[green]{total_available}[/green]"
+                    if total_available > 0
+                    else "[dim]0[/dim]"
+                )
 
                 used_gpu = max(0, total_gpu - total_free_gpu)
                 gpu_util_text = format_percent(used_gpu, total_gpu)
@@ -969,7 +1106,9 @@ def cmd_avail(args):
                 ]
                 if args.low_priority:
                     low_priority_free = r.get("low_priority_free_nodes", 0)
-                    row.extend([low_priority_free, r.get("free_nodes", 0) + low_priority_free])
+                    row.extend(
+                        [low_priority_free, r.get("free_nodes", 0) + low_priority_free]
+                    )
                 row.extend(
                     [
                         r.get("total_nodes", 0),
@@ -1017,11 +1156,17 @@ def cmd_avail(args):
                     has_detail = True
                 if r.get("free_node_list"):
                     node_names = [n["name"] for n in r["free_node_list"]]
-                    display.print(f"  [dim]{prefix} 全空节点: {', '.join(node_names)}[/dim]")
+                    display.print(
+                        f"  [dim]{prefix} 全空节点: {', '.join(node_names)}[/dim]"
+                    )
                     has_detail = True
                 if args.low_priority and r.get("low_priority_free_node_list"):
-                    lp_node_names = [n["name"] for n in r["low_priority_free_node_list"]]
-                    display.print(f"  [dim]{prefix} 低优空余: {', '.join(lp_node_names)}[/dim]")
+                    lp_node_names = [
+                        n["name"] for n in r["low_priority_free_node_list"]
+                    ]
+                    display.print(
+                        f"  [dim]{prefix} 低优空余: {', '.join(lp_node_names)}[/dim]"
+                    )
                     has_detail = True
             if not has_detail:
                 display.print("  [dim]暂无可展示的详细分布[/dim]")
@@ -1031,7 +1176,9 @@ def cmd_avail(args):
             display.print("[bold]导出格式:[/bold]")
             for r in sorted(all_results, key=lambda x: x["free_nodes"], reverse=True):
                 if r["free_nodes"] > 0:
-                    display.print(f"# [{r['workspace_name']}] {r['name']} ({r['free_nodes']} 空节点)")
+                    display.print(
+                        f"# [{r['workspace_name']}] {r['name']} ({r['free_nodes']} 空节点)"
+                    )
                     display.print(f'WORKSPACE_ID="{r["workspace_id"]}"')
                     display.print(f'LOGIC_COMPUTE_GROUP_ID="{r["id"]}"')
 

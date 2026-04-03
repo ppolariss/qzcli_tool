@@ -250,6 +250,19 @@ class QzAPI:
             return True
         except QzAPIError:
             return False
+
+    def stop_job_result(self, job_id: str) -> Dict[str, Any]:
+        """停止任务并返回详细结果"""
+        try:
+            self._request("/openapi/v1/train_job/stop", {"job_id": job_id})
+            return {"job_id": job_id, "stopped": True, "error": "", "code": 0}
+        except QzAPIError as exc:
+            return {
+                "job_id": job_id,
+                "stopped": False,
+                "error": str(exc) or "stop_failed",
+                "code": exc.code,
+            }
     
     def create_job(self, config: Dict[str, Any]) -> Dict[str, Any]:
         """创建任务"""

@@ -240,6 +240,7 @@ qzcli avail -n 4 -e
 | 命令 | 别名 | 说明 |
 |------|------|------|
 | `list` | `ls` | 列出任务 |
+| `tasks` | `jobs`, `blame` | 查询 `cluster_metric/list_task_dimension`，默认启动本地前端 |
 
 ```bash
 # Cookie 模式（从 API 获取）
@@ -252,6 +253,12 @@ qzcli ls -c -w CI -n 50     # 显示 50 条
 qzcli ls                    # 默认列表
 qzcli ls -r                 # 运行中
 qzcli ls --no-refresh       # 不刷新状态
+
+# Task dimension 模式（工作空间全量任务视角）
+qzcli tasks                                # 默认启动本地前端；不传 -w 时可在网页里切换本地缓存的工作空间/分区
+qzcli tasks -w ws-xxx                      # 指定默认工作空间
+qzcli jobs -w ws-xxx --project CI-长视频理解  # 项目过滤
+qzcli blame -w ws-xxx --no-serve            # 只在 CLI 输出并按用户做 blame 汇总
 ```
 
 ### 创建任务
@@ -271,6 +278,8 @@ qzcli create \
   --project "扩散" \
   --compute-group "3号机房-2" \
   --instances 4 \
+  --auto-fault-tolerance \
+  --fault-tolerance-max-retry 3 \
   --priority 10
 
 # 使用 ID
@@ -320,6 +329,8 @@ qzcli create-hpc \
 | `--shm` | | 1200 | 共享内存 GiB |
 | `--priority` | | 10 | 优先级 1-10 |
 | `--framework` | | pytorch | 框架类型 |
+| `--auto-fault-tolerance` | | 关闭 | 启用自动容错 |
+| `--fault-tolerance-max-retry` | | 3 | 自动容错最大重试次数，仅在启用自动容错时生效 |
 | `--no-track` | | | 不自动追踪 |
 | `--dry-run` | | | 只预览不提交 |
 | `--json` | | | JSON 输出 |

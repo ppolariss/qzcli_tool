@@ -67,7 +67,7 @@ def cmd_create(args):
         "framework": args.framework,
         "command": args.cmd_str,
         "task_priority": args.priority,
-        "auto_fault_tolerance": False,
+        "auto_fault_tolerance": args.auto_fault_tolerance,
         "framework_config": [{
             "spec_id": ctx["spec_id"],
             "image": args.image,
@@ -76,6 +76,8 @@ def cmd_create(args):
             "shm_gi": args.shm,
         }],
     }
+    if args.auto_fault_tolerance:
+        payload["fault_tolerance_max_retry"] = args.fault_tolerance_max_retry
 
     if args.dry_run:
         import json as json_mod
@@ -93,6 +95,9 @@ def cmd_create(args):
     display.print(f"  实例数: {args.instances}")
     display.print(f"  共享内存: {args.shm} GiB")
     display.print(f"  优先级: {args.priority}")
+    display.print(f"  自动容错: {'开启' if args.auto_fault_tolerance else '关闭'}")
+    if args.auto_fault_tolerance:
+        display.print(f"  自动容错最大重试次数: {args.fault_tolerance_max_retry}")
     display.print(f"  命令: {args.cmd_str[:120]}{'...' if len(args.cmd_str) > 120 else ''}")
     display.print("")
 
@@ -344,6 +349,8 @@ def cmd_batch(args):
             shm=defaults.get("shm", 1200),
             priority=defaults.get("priority", 10),
             framework=defaults.get("framework", "pytorch"),
+            auto_fault_tolerance=defaults.get("auto_fault_tolerance", False),
+            fault_tolerance_max_retry=defaults.get("fault_tolerance_max_retry", 3),
             no_track=False,
             dry_run=False,
             output_json=False,

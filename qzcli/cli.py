@@ -30,6 +30,7 @@ from .resource_commands import (
     cmd_workspaces as _cmd_workspaces_impl,
 )
 from .resource_resolution import ResourceResolutionError, resolve_workspace_ref
+from .task_dimensions import cmd_task_dimensions as _cmd_task_dimensions_impl
 
 
 def cmd_init(args):
@@ -506,6 +507,11 @@ def cmd_clear(args):
     store.clear()
     display.print_success(f"已清空 {count} 个任务记录")
     return 0
+
+
+def cmd_task_dimensions(args):
+    """查询 cluster_metric task dimensions。"""
+    return _cmd_task_dimensions_impl(args)
 
 
 def cmd_cookie(args):
@@ -1119,7 +1125,21 @@ def main():
     usage_parser.add_argument("--by-project", "-p", action="store_true", help="按项目统计 GPU 使用")
     usage_parser.add_argument("--by-type", "-t", action="store_true", help="按任务类型统计（训练/建模/部署）")
     usage_parser.add_argument("--by-priority", "-r", action="store_true", help="按优先级统计")
-    
+
+    # tasks 命令 - 直接查看 cluster_metric 任务维度，可启动本地前端
+    task_dims_parser = subparsers.add_parser(
+        "tasks",
+        aliases=["jobs", "blame"],
+        help="查看 /api/v1/cluster_metric/list_task_dimension 并启动本地前端",
+    )
+    task_dims_parser.add_argument("--workspace", "-w", help="工作空间 ID 或名称")
+    task_dims_parser.add_argument("--project", "-p", help="项目 ID 或名称")
+    task_dims_parser.add_argument("--page-size", type=int, default=100, help="后端分页大小（默认 100）")
+    task_dims_parser.add_argument("--serve", dest="serve", action="store_true", default=True, help="启动本地前端（默认开启）")
+    task_dims_parser.add_argument("--no-serve", dest="serve", action="store_false", help="只输出命令行表格，不启动前端")
+    task_dims_parser.add_argument("--host", default="127.0.0.1", help="前端监听地址（默认 127.0.0.1）")
+    task_dims_parser.add_argument("--port", type=int, default=8765, help="前端监听端口（默认 8765）")
+
     # create 命令 - 创建任务
     create_parser = subparsers.add_parser("create", aliases=["create-job"], help="创建并提交任务到启智平台")
     create_parser.add_argument("--name", "-n", required=True, help="任务名称")
@@ -1134,6 +1154,21 @@ def main():
     create_parser.add_argument("--shm", type=int, default=1200, help="共享内存 GiB（默认 1200）")
     create_parser.add_argument("--priority", type=int, default=10, help="任务优先级 1-10（默认 10）")
     create_parser.add_argument("--framework", default="pytorch", help="框架类型（默认 pytorch）")
+    create_parser.add_argument(
+        "--auto-fault-tolerance",
+        "--auto_fault_tolerance",
+        dest="auto_fault_tolerance",
+        action="store_true",
+        help="启用自动容错",
+    )
+    create_parser.add_argument(
+        "--fault-tolerance-max-retry",
+        "--fault_tolerance_max_retry",
+        dest="fault_tolerance_max_retry",
+        type=int,
+        default=3,
+        help="自动容错最大重试次数（默认 3，仅在启用自动容错时生效）",
+    )
     create_parser.add_argument("--no-track", action="store_true", help="不自动追踪任务")
     create_parser.add_argument("--dry-run", action="store_true", help="只显示 payload 不提交")
     create_parser.add_argument("--json", dest="output_json", action="store_true", help="输出 JSON 格式（供脚本集成）")
@@ -1199,6 +1234,9 @@ def main():
         "avail": cmd_avail,
         "av": cmd_avail,
         "usage": cmd_usage,
+        "tasks": cmd_task_dimensions,
+        "jobs": cmd_task_dimensions,
+        "blame": cmd_task_dimensions,
         "create": cmd_create,
         "create-job": cmd_create,
         "create-hpc": cmd_create_hpc,
