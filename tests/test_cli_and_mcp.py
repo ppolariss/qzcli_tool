@@ -268,3 +268,90 @@ def test_cmd_create_dry_run_omits_fault_tolerance_retry_when_disabled(monkeypatc
 
     assert '"auto_fault_tolerance": false' in out
     assert '"fault_tolerance_max_retry"' not in out
+
+
+def test_create_hpc_parser_defaults_ttl_after_finish_seconds(monkeypatch):
+    captured = {}
+
+    def fake_cmd_create_hpc(args):
+        captured["ttl_after_finish_seconds"] = args.ttl_after_finish_seconds
+        captured["command"] = args.command
+        return 0
+
+    monkeypatch.setattr(cli, "cmd_create_hpc", fake_cmd_create_hpc)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "qzcli",
+            "create-hpc",
+            "--name",
+            "test-hpc",
+            "--entrypoint",
+            "hostname",
+            "--workspace",
+            "ws-1",
+            "--image",
+            "repo/hpc:latest",
+            "--memory-per-cpu",
+            "4Gi",
+        ],
+    )
+
+    assert cli.main() == 0
+    assert captured == {
+        "ttl_after_finish_seconds": 600,
+        "command": "create-hpc",
+    }
+
+
+def test_cmd_create_hpc_dry_run_passes_ttl_after_finish_seconds(monkeypatch, capsys):
+    class _FakeDisplay:
+        def print(self, *args, **kwargs):
+            return None
+
+        def print_error(self, *args, **kwargs):
+            return None
+
+    monkeypatch.setattr(create_commands, "get_display", lambda: _FakeDisplay())
+    monkeypatch.setattr(create_commands, "get_api", lambda: object())
+    monkeypatch.setattr(create_commands, "get_store", lambda: object())
+    monkeypatch.setattr(
+        create_commands,
+        "resolve_create_context",
+        lambda args, display: {
+            "workspace_id": "ws-1",
+            "workspace_display": "空间",
+            "project_id": "proj-1",
+            "project_display": "项目",
+            "compute_group_id": "cg-1",
+            "compute_group_display": "计算组",
+            "spec_id": "spec-1",
+            "spec_display": "规格",
+        },
+    )
+
+    args = Namespace(
+        name="test-hpc",
+        entrypoint="hostname",
+        workspace="ws-1",
+        project="proj-1",
+        compute_group="cg-1",
+        spec="spec-1",
+        image="repo/hpc:latest",
+        image_type="SOURCE_PRIVATE",
+        instances=2,
+        number_of_tasks=16,
+        cpus_per_task=8,
+        memory_per_cpu="8Gi",
+        ttl_after_finish_seconds=900,
+        enable_hyper_threading=False,
+        track=False,
+        dry_run=True,
+        output_json=False,
+    )
+
+    assert create_commands.cmd_create_hpc(args) == 0
+    out = capsys.readouterr().out
+
+    assert '"ttl_after_finish_seconds": 900' in out

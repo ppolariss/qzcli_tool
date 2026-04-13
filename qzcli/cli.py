@@ -1187,6 +1187,7 @@ def main():
     create_hpc_parser.add_argument("--number-of-tasks", type=int, default=1, help="任务总数（默认 1）")
     create_hpc_parser.add_argument("--cpus-per-task", type=int, default=1, help="每个任务的 CPU 数（默认 1）")
     create_hpc_parser.add_argument("--memory-per-cpu", required=True, help="每个 CPU 的内存，例如 8Gi")
+    create_hpc_parser.add_argument("--ttl-after-finish-seconds", type=int, default=600, help="任务完成后保留秒数（默认 600）")
     create_hpc_parser.add_argument("--enable-hyper-threading", action="store_true", dest="enable_hyper_threading", help="启用超线程")
     create_hpc_parser.add_argument("--disable-hyper-threading", action="store_false", dest="enable_hyper_threading", help="禁用超线程")
     create_hpc_parser.set_defaults(enable_hyper_threading=False)

@@ -175,6 +175,7 @@ def cmd_create_hpc(args):
         "number_of_tasks": args.number_of_tasks,
         "cpus_per_task": args.cpus_per_task,
         "memory_per_cpu": args.memory_per_cpu,
+        "ttl_after_finish_seconds": args.ttl_after_finish_seconds,
         "enable_hyper_threading": args.enable_hyper_threading,
     }
 
@@ -195,6 +196,7 @@ def cmd_create_hpc(args):
     display.print(f"  任务数: {args.number_of_tasks}")
     display.print(f"  每任务 CPU: {args.cpus_per_task}")
     display.print(f"  每 CPU 内存: {args.memory_per_cpu}")
+    display.print(f"  完成后保留秒数: {args.ttl_after_finish_seconds}")
     display.print(f"  超线程: {'开启' if args.enable_hyper_threading else '关闭'}")
     display.print(f"  入口命令: {args.entrypoint[:120]}{'...' if len(args.entrypoint) > 120 else ''}")
     display.print("")
@@ -237,6 +239,7 @@ def cmd_create_hpc(args):
                 "number_of_tasks": args.number_of_tasks,
                 "cpus_per_task": args.cpus_per_task,
                 "memory_per_cpu": args.memory_per_cpu,
+                "ttl_after_finish_seconds": args.ttl_after_finish_seconds,
                 "enable_hyper_threading": args.enable_hyper_threading,
             },
         )

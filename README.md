@@ -352,7 +352,8 @@ qzcli create-hpc \
   --instances 2 \
   --number-of-tasks 16 \
   --cpus-per-task 8 \
-  --memory-per-cpu 8Gi
+  --memory-per-cpu 8Gi \
+  --ttl-after-finish-seconds 600
 
 # 预览 payload 不提交
 qzcli create-hpc --name test-hpc --entrypoint "hostname" --workspace "分布式训练" --image repo/hpc:latest --memory-per-cpu 4Gi --dry-run
@@ -380,6 +381,7 @@ qzcli create-hpc --name test-hpc --entrypoint "hostname" --workspace "分布式�
 | `--number-of-tasks` | | 1 | 任务总数 |
 | `--cpus-per-task` | | 1 | 每个任务的 CPU 数 |
 | `--memory-per-cpu` | | (必填) | 每个 CPU 的内存，如 `8Gi` |
+| `--ttl-after-finish-seconds` | | 600 | 任务完成后保留秒数 |
 | `--enable-hyper-threading` | | 关闭 | 启用超线程 |
 | `--track` | | | 写入本地任务记录 |
 | `--dry-run` | | | 只预览不提交 |
