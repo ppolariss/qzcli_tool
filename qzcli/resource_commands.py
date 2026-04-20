@@ -78,7 +78,7 @@ def _parse_cpu_thresholds(raw_values: Optional[List[str]]) -> List[Dict[str, flo
     default_values = [
         "20,100",
         "40,200",
-        "55,300",
+        "50,300",
         "55,500",
         "100,400",
         "100,1200",
