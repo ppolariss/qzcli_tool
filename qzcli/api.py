@@ -447,6 +447,32 @@ class QzAPI:
         """
         result = self._request("/openapi/v1/specs/list", {"logic_compute_group_id": compute_group_id})
         return result.get("data", {}).get("specs", [])
+
+    def list_resource_spec_prices(
+        self,
+        workspace_id: str,
+        logic_compute_group_id: str,
+        cookie: str,
+        schedule_config_type: str = "SCHEDULE_CONFIG_TYPE_HPC",
+    ) -> List[Dict[str, Any]]:
+        """
+        获取指定逻辑计算组下可用的资源规格价格信息。
+
+        这是创建页使用的内部 cookie API；返回项中的 quota_id 可作为创建任务
+        payload 里的 spec_id 使用。
+        """
+        payload = {
+            "workspace_id": workspace_id,
+            "logic_compute_group_id": logic_compute_group_id,
+            "schedule_config_type": schedule_config_type,
+        }
+        data = self._cookie_request(
+            "/api/v1/resource_prices/logic_compute_groups/",
+            payload,
+            cookie=cookie,
+            referer=f"https://qz.sii.edu.cn/jobs/create?spaceId={workspace_id}",
+        )
+        return data.get("lcg_resource_spec_prices", [])
     
     def list_node_dimension(
         self,

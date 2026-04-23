@@ -4,6 +4,7 @@ from argparse import Namespace
 
 import qzcli.cli as cli
 import qzcli.create_commands as create_commands
+import qzcli.resource_commands as resource_commands
 import qzcli.task_dimensions as task_dimensions
 
 
@@ -303,6 +304,102 @@ def test_create_hpc_parser_defaults_ttl_after_finish_seconds(monkeypatch):
         "ttl_after_finish_seconds": 600,
         "command": "create-hpc",
     }
+
+
+def test_specs_parser_accepts_schedule_config_type(monkeypatch):
+    captured = {}
+
+    def fake_cmd_specs(args):
+        captured["workspace"] = args.workspace
+        captured["group"] = args.group
+        captured["all_workspaces"] = args.all_workspaces
+        captured["schedule_config_type"] = args.schedule_config_type
+        captured["summary"] = args.summary
+        captured["output_json"] = args.output_json
+        captured["command"] = args.command
+        return 0
+
+    monkeypatch.setattr(cli, "cmd_specs", fake_cmd_specs)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "qzcli",
+            "specs",
+            "--workspace",
+            "ws-1",
+            "--group",
+            "lcg-1",
+            "--schedule-config-type",
+            "SCHEDULE_CONFIG_TYPE_HPC",
+            "--summary",
+            "--json",
+        ],
+    )
+
+    assert cli.main() == 0
+    assert captured == {
+        "workspace": "ws-1",
+        "group": "lcg-1",
+        "all_workspaces": False,
+        "schedule_config_type": "SCHEDULE_CONFIG_TYPE_HPC",
+        "summary": True,
+        "output_json": True,
+        "command": "specs",
+    }
+
+
+def test_thresholds_from_resource_specs_dedupes_and_sorts():
+    specs = [
+        {"quota_id": "b", "cpu_count": 55, "memory_size_gib": 500},
+        {"quota_id": "a", "cpu_count": "20", "memory_size_gib": "100"},
+        {"quota_id": "dup", "cpu_count": 55, "memory_size_gib": 500},
+        {"quota_id": "bad-cpu", "cpu_count": "", "memory_size_gib": 100},
+        {"quota_id": "bad-mem", "cpu_count": 40, "memory_size_gib": None},
+    ]
+
+    assert resource_commands._thresholds_from_resource_specs(specs) == [
+        {"cpu": 20.0, "mem": 100.0},
+        {"cpu": 55.0, "mem": 500.0},
+    ]
+
+
+def test_collect_dynamic_cpu_thresholds_reads_one_group():
+    class _FakeAPI:
+        def __init__(self):
+            self.calls = []
+
+        def list_resource_spec_prices(
+            self, workspace_id, group_id, cookie, schedule_config_type
+        ):
+            self.calls.append((workspace_id, group_id, cookie, schedule_config_type))
+            return [
+                {"quota_id": "spec-1", "cpu_count": 40, "memory_size_gib": 200},
+                {"quota_id": "spec-2", "cpu_count": 20, "memory_size_gib": 100},
+            ]
+
+    class _FakeDisplay:
+        def print_warning(self, *args, **kwargs):
+            return None
+
+    api = _FakeAPI()
+    thresholds = resource_commands._collect_dynamic_cpu_thresholds_for_group(
+        api,
+        "cookie=value",
+        "ws-1",
+        "lcg-1",
+        "空间",
+        "分区",
+        _FakeDisplay(),
+    )
+
+    assert api.calls == [
+        ("ws-1", "lcg-1", "cookie=value", "SCHEDULE_CONFIG_TYPE_HPC")
+    ]
+    assert thresholds == [
+        {"cpu": 20.0, "mem": 100.0},
+        {"cpu": 40.0, "mem": 200.0},
+    ]
 
 
 def test_cmd_create_hpc_dry_run_passes_ttl_after_finish_seconds(monkeypatch, capsys):

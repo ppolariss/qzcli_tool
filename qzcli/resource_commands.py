@@ -75,19 +75,9 @@ def _cache_workspace_resources(
 
 
 def _parse_cpu_thresholds(raw_values: Optional[List[str]]) -> List[Dict[str, float]]:
-    default_values = [
-        "20,100",
-        "40,200",
-        "50,300",
-        "55,500",
-        "100,400",
-        "100,1200",
-        "120,500",
-    ]
-    values = raw_values if raw_values else default_values
     thresholds = []
 
-    for raw in values:
+    for raw in raw_values or []:
         text = str(raw).strip()
         if "," not in text:
             raise ValueError(f"无效阈值 '{text}'，格式应为 cpu,mem")
@@ -99,7 +89,61 @@ def _parse_cpu_thresholds(raw_values: Optional[List[str]]) -> List[Dict[str, flo
             raise ValueError(f"无效阈值 '{text}'，cpu/mem 必须是数字") from exc
         thresholds.append({"cpu": cpu, "mem": mem})
 
-    return thresholds
+    return _dedupe_cpu_thresholds(thresholds)
+
+
+def _float_or_none(value: Any) -> Optional[float]:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _dedupe_cpu_thresholds(thresholds: List[Dict[str, float]]) -> List[Dict[str, float]]:
+    deduped = {}
+    for threshold in thresholds:
+        cpu = _float_or_none(threshold.get("cpu"))
+        mem = _float_or_none(threshold.get("mem"))
+        if cpu is None or mem is None or cpu <= 0 or mem <= 0:
+            continue
+        deduped[(cpu, mem)] = {"cpu": cpu, "mem": mem}
+
+    return [deduped[key] for key in sorted(deduped.keys())]
+
+
+def _thresholds_from_resource_specs(specs: List[Dict[str, Any]]) -> List[Dict[str, float]]:
+    thresholds = []
+    for spec in specs:
+        cpu = _float_or_none(spec.get("cpu_count"))
+        mem = _float_or_none(spec.get("memory_size_gib", spec.get("memory_gb")))
+        if cpu is None or mem is None:
+            continue
+        thresholds.append({"cpu": cpu, "mem": mem})
+
+    return _dedupe_cpu_thresholds(thresholds)
+
+
+def _collect_dynamic_cpu_thresholds_for_group(
+    api,
+    cookie: str,
+    workspace_id: str,
+    group_id: str,
+    workspace_name: str,
+    group_name: str,
+    display,
+) -> List[Dict[str, float]]:
+    try:
+        specs = api.list_resource_spec_prices(
+            workspace_id,
+            group_id,
+            cookie,
+            schedule_config_type="SCHEDULE_CONFIG_TYPE_HPC",
+        )
+    except QzAPIError as e:
+        display.print_warning(f"{workspace_name} / {group_name}: 读取资源规格失败: {e}")
+        return []
+
+    return _thresholds_from_resource_specs(specs)
 
 
 def _resource_free_value(resource: Dict[str, Any]) -> float:
@@ -601,6 +645,238 @@ def cmd_resources(args):
     return cmd_workspaces(args)
 
 
+def _resource_spec_id(spec: Dict[str, Any]) -> str:
+    return (
+        str(spec.get("quota_id") or "")
+        or str(spec.get("id") or "")
+        or str(spec.get("spec_id") or "")
+    )
+
+
+def _resource_spec_gpu_type(spec: Dict[str, Any]) -> str:
+    gpu_info = spec.get("gpu_info") or {}
+    return (
+        gpu_info.get("gpu_product_simple")
+        or gpu_info.get("gpu_type_display")
+        or gpu_info.get("gpu_type")
+        or spec.get("gpu_type")
+        or ""
+    )
+
+
+def _format_resource_spec_line(spec: Dict[str, Any]) -> str:
+    spec_id = _resource_spec_id(spec) or "-"
+    cpu_count = spec.get("cpu_count", "-")
+    memory_size = spec.get("memory_size_gib", spec.get("memory_gb", "-"))
+    gpu_count = spec.get("gpu_count", 0)
+    gpu_type = _resource_spec_gpu_type(spec)
+    gpu_text = f"{gpu_count} GPU"
+    if gpu_type:
+        gpu_text += f" {gpu_type}"
+    return f"CPU={cpu_count}, MEM={memory_size}GiB, {gpu_text}, spec_id={spec_id}"
+
+
+def _workspace_refs_for_specs(workspace_input: str, all_workspaces: bool) -> List[Dict[str, Any]]:
+    if all_workspaces or not workspace_input:
+        all_resources = load_all_resources()
+        return [
+            {
+                "id": workspace_id,
+                "name": workspace_data.get("name", "") or workspace_id,
+                "resources": workspace_data,
+            }
+            for workspace_id, workspace_data in all_resources.items()
+        ]
+
+    workspace_id, workspace_name = resolve_workspace_ref(workspace_input)
+    return [
+        {
+            "id": workspace_id,
+            "name": workspace_name or workspace_id,
+            "resources": get_workspace_resources(workspace_id) or {},
+        }
+    ]
+
+
+def _compute_group_refs_for_specs(
+    workspace_id: str, ws_resources: Dict[str, Any], group_input: str
+) -> List[Dict[str, str]]:
+    compute_groups = ws_resources.get("compute_groups") or {}
+
+    if group_input:
+        if group_input.startswith("lcg-"):
+            group = compute_groups.get(group_input, {})
+            return [
+                {
+                    "id": group_input,
+                    "name": group.get("name", group_input),
+                    "gpu_type": group.get("gpu_type", ""),
+                }
+            ]
+
+        group_id, group_name = resolve_cached_resource_ref(
+            workspace_id, "compute_groups", group_input
+        )
+        group = compute_groups.get(group_id, {})
+        return [
+            {
+                "id": group_id,
+                "name": group_name or group.get("name", group_id),
+                "gpu_type": group.get("gpu_type", ""),
+            }
+        ]
+
+    return [
+        {
+            "id": group_id,
+            "name": group.get("name", group_id),
+            "gpu_type": group.get("gpu_type", ""),
+        }
+        for group_id, group in compute_groups.items()
+    ]
+
+
+def cmd_specs(args):
+    """查询分区下可用的资源规格。"""
+    display = get_display()
+    api = get_api()
+
+    try:
+        cookie_data = api.ensure_cookie()
+    except QzAPIError as e:
+        display.print_error(str(e))
+        return 1
+
+    cookie = cookie_data["cookie"]
+
+    try:
+        workspace_refs = _workspace_refs_for_specs(
+            args.workspace or "", args.all_workspaces
+        )
+    except ResourceResolutionError as e:
+        display.print_error(str(e))
+        display.print("[dim]使用 qzcli catalog --list 查看已缓存的工作空间[/dim]")
+        return 1
+
+    if not workspace_refs:
+        display.print_error("没有已缓存的工作空间")
+        display.print("[dim]请先运行: qzcli catalog -u[/dim]")
+        return 1
+
+    results = []
+    failures = []
+
+    for workspace_ref in workspace_refs:
+        workspace_id = workspace_ref["id"]
+        workspace_name = workspace_ref.get("name", workspace_id)
+        ws_resources = workspace_ref.get("resources") or {}
+
+        try:
+            group_refs = _compute_group_refs_for_specs(
+                workspace_id, ws_resources, args.group or ""
+            )
+        except ResourceResolutionError as e:
+            failures.append(
+                {
+                    "workspace_id": workspace_id,
+                    "workspace_name": workspace_name,
+                    "error": str(e),
+                }
+            )
+            continue
+
+        if not group_refs:
+            failures.append(
+                {
+                    "workspace_id": workspace_id,
+                    "workspace_name": workspace_name,
+                    "error": "未缓存计算组，无法批量查询分区规格",
+                }
+            )
+            continue
+
+        for group_ref in group_refs:
+            group_id = group_ref["id"]
+            try:
+                specs = api.list_resource_spec_prices(
+                    workspace_id,
+                    group_id,
+                    cookie,
+                    schedule_config_type=args.schedule_config_type,
+                )
+            except QzAPIError as e:
+                failures.append(
+                    {
+                        "workspace_id": workspace_id,
+                        "workspace_name": workspace_name,
+                        "group_id": group_id,
+                        "group_name": group_ref.get("name", group_id),
+                        "error": str(e),
+                    }
+                )
+                continue
+
+            results.append(
+                {
+                    "workspace_id": workspace_id,
+                    "workspace_name": workspace_name,
+                    "group_id": group_id,
+                    "group_name": group_ref.get("name", group_id),
+                    "gpu_type": group_ref.get("gpu_type", ""),
+                    "schedule_config_type": args.schedule_config_type,
+                    "spec_count": len(specs),
+                    "specs": specs,
+                }
+            )
+
+    if args.output_json:
+        import json
+
+        print(
+            json.dumps(
+                {
+                    "schedule_config_type": args.schedule_config_type,
+                    "result_count": len(results),
+                    "failure_count": len(failures),
+                    "results": results,
+                    "failures": failures,
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 0 if results else 1
+
+    display.print(
+        f"\n[bold]分区资源规格[/bold] [dim]({args.schedule_config_type})[/dim]\n"
+    )
+
+    for item in results:
+        gpu_type = item.get("gpu_type") or "-"
+        display.print(
+            f"[bold]{item['workspace_name']}[/bold] / {item['group_name']} "
+            f"[dim]({item['group_id']}, {gpu_type})[/dim]: {item['spec_count']} 规格"
+        )
+        if not args.summary:
+            for spec in item["specs"]:
+                display.print(f"  - {_format_resource_spec_line(spec)}")
+        display.print("")
+
+    if failures:
+        display.print("[yellow]查询失败或缺少缓存的分区:[/yellow]")
+        for failure in failures:
+            group_text = ""
+            if failure.get("group_id"):
+                group_text = f" / {failure.get('group_name') or failure['group_id']}"
+            display.print(
+                f"  - {failure.get('workspace_name') or failure.get('workspace_id')}{group_text}: {failure['error']}"
+            )
+
+    if not results:
+        return 1
+    return 0
+
+
 def cmd_avail(args):
     """查询计算组空余节点，帮助决定任务应该提交到哪里"""
     display = get_display()
@@ -648,13 +924,19 @@ def cmd_avail(args):
     if args.cpu and required_nodes:
         display.print_warning("--cpu 模式下忽略 --nodes")
 
-    cpu_thresholds: List[Dict[str, float]] = []
+    manual_cpu_thresholds: List[Dict[str, float]] = []
     if args.cpu:
         try:
-            cpu_thresholds = _parse_cpu_thresholds(args.cpu_th)
+            if args.cpu_th:
+                manual_cpu_thresholds = _parse_cpu_thresholds(args.cpu_th)
         except ValueError as e:
             display.print_error(str(e))
             return 1
+        if manual_cpu_thresholds:
+            labels = ", ".join(
+                f"{t['cpu']:g},{t['mem']:g}" for t in manual_cpu_thresholds
+            )
+            display.print(f"[dim]CPU/MEM 手动阈值: {labels}[/dim]")
 
     from collections import defaultdict
 
@@ -695,34 +977,58 @@ def cmd_avail(args):
         )
 
         if args.cpu:
-            workspace_nodes = []
-            for lcg_id in compute_groups.keys():
-                try:
-                    workspace_nodes.extend(
-                        _collect_nodes_for_compute_group(
-                            api,
-                            workspace_id,
-                            cookie,
-                            logic_compute_group_id=lcg_id,
-                            page_size=max(1, args.cpu_page_size),
+            for lcg_id, lcg_info in compute_groups.items():
+                lcg_name = lcg_info.get("name", lcg_id)
+                cpu_thresholds = manual_cpu_thresholds
+                if not args.cpu_th:
+                    cpu_thresholds = _collect_dynamic_cpu_thresholds_for_group(
+                        api,
+                        cookie,
+                        workspace_id,
+                        lcg_id,
+                        ws_name,
+                        lcg_name,
+                        display,
+                    )
+                    if cpu_thresholds:
+                        labels = ", ".join(
+                            f"{t['cpu']:g},{t['mem']:g}" for t in cpu_thresholds
                         )
+                        display.print(
+                            f"[dim]{ws_name} / {lcg_name} CPU/MEM 规格阈值: {labels}[/dim]"
+                        )
+                    else:
+                        display.print_warning(
+                            f"{ws_name} / {lcg_name}: 未从分区规格接口读取到 CPU/MEM 规格，将只显示总体 CPU/MEM 空闲量"
+                        )
+
+                try:
+                    group_nodes = _collect_nodes_for_compute_group(
+                        api,
+                        workspace_id,
+                        cookie,
+                        logic_compute_group_id=lcg_id,
+                        page_size=max(1, args.cpu_page_size),
                     )
                 except QzAPIError as e:
-                    display.print_warning(f"查询 {ws_name} 的计算组 {lcg_id} 失败: {e}")
+                    display.print_warning(f"查询 {ws_name} / {lcg_name} 失败: {e}")
                     continue
 
-            if not workspace_nodes:
-                display.print_warning(f"{ws_name} 未获取到节点数据")
-                continue
+                if not group_nodes:
+                    display.print_warning(f"{ws_name} / {lcg_name} 未获取到节点数据")
+                    continue
 
-            analysis = _analyze_cpu_capacity(workspace_nodes, cpu_thresholds)
-            cpu_workspace_results.append(
-                {
-                    "workspace_id": workspace_id,
-                    "workspace_name": ws_name,
-                    "analysis": analysis,
-                }
-            )
+                analysis = _analyze_cpu_capacity(group_nodes, cpu_thresholds)
+                cpu_workspace_results.append(
+                    {
+                        "workspace_id": workspace_id,
+                        "workspace_name": ws_name,
+                        "group_id": lcg_id,
+                        "group_name": lcg_name,
+                        "thresholds": cpu_thresholds,
+                        "analysis": analysis,
+                    }
+                )
             continue
 
         node_low_priority_gpu = defaultdict(int)
@@ -856,16 +1162,29 @@ def cmd_avail(args):
         display.print("\n[bold]CPU/MEM 空闲资源汇总[/bold]\n")
         for entry in cpu_workspace_results:
             ws_name = entry["workspace_name"] or entry["workspace_id"]
+            group_name = entry.get("group_name") or entry.get("group_id")
             _print_cpu_capacity_table(
-                display, f"工作空间: {ws_name}", entry["analysis"], cpu_thresholds
+                display,
+                f"工作空间: {ws_name} / 分区: {group_name}",
+                entry["analysis"],
+                entry["thresholds"],
             )
 
-        if len(cpu_workspace_results) > 1:
+        threshold_keys = [
+            tuple((t["cpu"], t["mem"]) for t in entry["thresholds"])
+            for entry in cpu_workspace_results
+        ]
+        if (
+            len(cpu_workspace_results) > 1
+            and threshold_keys
+            and all(key == threshold_keys[0] for key in threshold_keys)
+        ):
+            shared_thresholds = cpu_workspace_results[0]["thresholds"]
             merged_overall = {
                 "ready": 0,
                 "cpu_free": 0.0,
                 "mem_free": 0.0,
-                "above": [0] * len(cpu_thresholds),
+                "above": [0] * len(shared_thresholds),
             }
             for entry in cpu_workspace_results:
                 overall = entry["analysis"]["overall"]
@@ -877,9 +1196,9 @@ def cmd_avail(args):
                 ]
             _print_cpu_capacity_table(
                 display,
-                "总计（所有工作空间）",
+                "总计（同规格阈值）",
                 {"groups": {}, "overall": merged_overall},
-                cpu_thresholds,
+                shared_thresholds,
             )
         return 0
 

@@ -27,6 +27,7 @@ from .resource_commands import (
     _cache_workspace_resources,
     cmd_avail as _cmd_avail_impl,
     cmd_resources as _cmd_resources_impl,
+    cmd_specs as _cmd_specs_impl,
     cmd_workspaces as _cmd_workspaces_impl,
 )
 from .resource_resolution import ResourceResolutionError, resolve_workspace_ref
@@ -595,6 +596,11 @@ def cmd_avail(args):
     return _cmd_avail_impl(args)
 
 
+def cmd_specs(args):
+    """查询分区下可用资源规格"""
+    return _cmd_specs_impl(args)
+
+
 def cmd_usage(args):
     """统计工作空间的 GPU 使用分布"""
     display = get_display()
@@ -1115,8 +1121,21 @@ def main():
     avail_parser.add_argument("--verbose", "-v", action="store_true", help="显示空闲节点名称列表")
     avail_parser.add_argument("--lp", "--low-priority", action="store_true", dest="low_priority", help="计算低优任务占用节点（较慢）")
     avail_parser.add_argument("--cpu", action="store_true", help="按节点类型统计 CPU/MEM 空闲资源")
-    avail_parser.add_argument("--cpu-th", action="append", help="CPU/MEM 阈值，格式 cpu,mem；可重复")
+    avail_parser.add_argument("--cpu-th", action="append", help="CPU/MEM 阈值，格式 cpu,mem；可重复；不指定时动态读取分区规格")
     avail_parser.add_argument("--cpu-page-size", type=int, default=200, help="CPU 统计模式节点分页大小（默认 200）")
+
+    # specs 命令 - 查询分区资源规格
+    specs_parser = subparsers.add_parser("specs", aliases=["spec"], help="查询分区下可用资源规格")
+    specs_parser.add_argument("--workspace", "-w", help="工作空间 ID 或名称；不指定则查询所有已缓存工作空间")
+    specs_parser.add_argument("--group", "-g", help="计算组/分区 ID 或名称；不指定则查询工作空间内所有缓存分区")
+    specs_parser.add_argument("--all-workspaces", "-a", action="store_true", help="查询所有已缓存工作空间")
+    specs_parser.add_argument(
+        "--schedule-config-type",
+        default="SCHEDULE_CONFIG_TYPE_HPC",
+        help="调度配置类型（默认 SCHEDULE_CONFIG_TYPE_HPC）",
+    )
+    specs_parser.add_argument("--summary", action="store_true", help="只显示每个分区的规格数量")
+    specs_parser.add_argument("--json", dest="output_json", action="store_true", help="输出 JSON 格式")
     
     # usage 命令
     usage_parser = subparsers.add_parser("usage", help="统计工作空间的 GPU 使用分布")
@@ -1234,6 +1253,8 @@ def main():
         "res": cmd_workspaces,
         "avail": cmd_avail,
         "av": cmd_avail,
+        "specs": cmd_specs,
+        "spec": cmd_specs,
         "usage": cmd_usage,
         "tasks": cmd_task_dimensions,
         "jobs": cmd_task_dimensions,

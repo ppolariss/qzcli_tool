@@ -92,6 +92,59 @@ def test_list_workspaces_uses_shared_cookie_request(monkeypatch):
     assert captured["timeout"] == 60
 
 
+def test_list_resource_spec_prices_uses_resource_prices_endpoint(monkeypatch):
+    captured = {}
+
+    def fake_post(url, json, headers, timeout):
+        captured["url"] = url
+        captured["json"] = json
+        captured["headers"] = headers
+        captured["timeout"] = timeout
+        return _FakeResponse(
+            payload={
+                "code": 0,
+                "data": {
+                    "lcg_resource_spec_prices": [
+                        {
+                            "quota_id": "quota-1",
+                            "cpu_count": 20,
+                            "memory_size_gib": 100,
+                            "gpu_count": 0,
+                        }
+                    ]
+                },
+            }
+        )
+
+    monkeypatch.setattr("requests.post", fake_post)
+
+    api = QzAPI(username="u", password="p")
+    specs = api.list_resource_spec_prices(
+        "ws-1",
+        "lcg-1",
+        "cookie=value",
+        schedule_config_type="SCHEDULE_CONFIG_TYPE_HPC",
+    )
+
+    assert specs == [
+        {
+            "quota_id": "quota-1",
+            "cpu_count": 20,
+            "memory_size_gib": 100,
+            "gpu_count": 0,
+        }
+    ]
+    assert captured["url"].endswith("/api/v1/resource_prices/logic_compute_groups/")
+    assert captured["json"] == {
+        "workspace_id": "ws-1",
+        "logic_compute_group_id": "lcg-1",
+        "schedule_config_type": "SCHEDULE_CONFIG_TYPE_HPC",
+    }
+    assert captured["headers"]["cookie"] == "cookie=value"
+    assert captured["headers"]["referer"] == "https://qz.sii.edu.cn/jobs/create?spaceId=ws-1"
+    assert captured["timeout"] == 60
+
+
 def test_list_workspaces_paginates_all_pages(monkeypatch):
     calls = []
 
