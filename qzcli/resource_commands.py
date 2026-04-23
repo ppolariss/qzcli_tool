@@ -32,6 +32,48 @@ except ImportError:
     box = None  # type: ignore
 
 
+DEFAULT_CPU_WORKSPACE_IDS = {
+    "ws-6e6ba362-e98e-45b2-9c5a-311998e93d65",
+    "ws-f9be64cb-9b66-40fb-8172-488abed619bc",
+    "ws-1177d2a5-aef0-40d3-8777-fed9af13affc",
+}
+
+DEFAULT_CPU_WORKSPACE_NAMES = (
+    "CPU资源空间",
+    "高性能计算",
+    "CPU临时测试空间",
+)
+
+
+def _default_cpu_workspace_rank(workspace_id: str, workspace_data: Dict[str, Any]) -> Optional[int]:
+    if workspace_id in DEFAULT_CPU_WORKSPACE_IDS:
+        id_order = {
+            "ws-6e6ba362-e98e-45b2-9c5a-311998e93d65": 0,
+            "ws-f9be64cb-9b66-40fb-8172-488abed619bc": 1,
+            "ws-1177d2a5-aef0-40d3-8777-fed9af13affc": 2,
+        }
+        return id_order.get(workspace_id, len(DEFAULT_CPU_WORKSPACE_NAMES))
+
+    names = {
+        str(workspace_data.get("name", "") or ""),
+        str(workspace_data.get("official_name", "") or ""),
+        str(workspace_data.get("alias", "") or ""),
+    }
+    for idx, name in enumerate(DEFAULT_CPU_WORKSPACE_NAMES):
+        if name in names:
+            return idx
+    return None
+
+
+def _default_cpu_workspace_ids(all_resources: Dict[str, Any]) -> List[str]:
+    ranked = []
+    for workspace_id, workspace_data in all_resources.items():
+        rank = _default_cpu_workspace_rank(workspace_id, workspace_data)
+        if rank is not None:
+            ranked.append((rank, workspace_id))
+    return [workspace_id for _, workspace_id in sorted(ranked)]
+
+
 def _cache_workspace_resources(
     api, workspace_id: str, cookie: str, workspace_name: str = ""
 ) -> Dict[str, int]:
@@ -896,7 +938,16 @@ def cmd_avail(args):
             display.print_error("没有已缓存的工作空间")
             display.print("[dim]请先运行: qzcli catalog -w <workspace_id> -u[/dim]")
             return 1
-        workspace_ids = list(all_resources.keys())
+        if args.cpu:
+            workspace_ids = _default_cpu_workspace_ids(all_resources)
+            if not workspace_ids:
+                display.print_error(
+                    "未命中默认 CPU/MEM 工作空间: CPU资源空间、高性能计算、CPU临时测试空间"
+                )
+                display.print("[dim]可使用 qzcli avail --cpu -w <workspace> 指定其他工作空间[/dim]")
+                return 1
+        else:
+            workspace_ids = list(all_resources.keys())
     else:
         try:
             workspace_id, resolved_name = resolve_workspace_ref(workspace_input)

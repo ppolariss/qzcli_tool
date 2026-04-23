@@ -402,6 +402,80 @@ def test_collect_dynamic_cpu_thresholds_reads_one_group():
     ]
 
 
+def test_default_cpu_workspace_ids_filters_to_known_spaces():
+    resources = {
+        "ws-other": {"name": "CI-情境智能"},
+        "ws-1177d2a5-aef0-40d3-8777-fed9af13affc": {"name": "CPU临时测试空间"},
+        "ws-f9be64cb-9b66-40fb-8172-488abed619bc": {"name": "高性能计算"},
+        "ws-6e6ba362-e98e-45b2-9c5a-311998e93d65": {"name": "CPU资源空间"},
+    }
+
+    assert resource_commands._default_cpu_workspace_ids(resources) == [
+        "ws-6e6ba362-e98e-45b2-9c5a-311998e93d65",
+        "ws-f9be64cb-9b66-40fb-8172-488abed619bc",
+        "ws-1177d2a5-aef0-40d3-8777-fed9af13affc",
+    ]
+
+
+def test_mcp_list_resource_specs_lists_workspace_groups(monkeypatch):
+    class _FakeAPI:
+        def __init__(self):
+            self.calls = []
+
+        def list_resource_spec_prices(
+            self, workspace_id, group_id, cookie, schedule_config_type
+        ):
+            self.calls.append((workspace_id, group_id, cookie, schedule_config_type))
+            return [
+                {
+                    "quota_id": "quota-1",
+                    "cpu_count": 20,
+                    "memory_size_gib": 100,
+                    "gpu_count": 0,
+                    "total_price_per_hour": 0,
+                }
+            ]
+
+    fake_api = _FakeAPI()
+    monkeypatch.setattr(mcp_server, "_require_cookie", lambda: ("cookie=value", {}))
+    monkeypatch.setattr(
+        mcp_server,
+        "_resolve_workspace_refs",
+        lambda *args, **kwargs: [{"id": "ws-1", "name": "空间"}],
+    )
+    monkeypatch.setattr(
+        mcp_server,
+        "get_workspace_resources",
+        lambda workspace_id: {
+            "name": "空间",
+            "compute_groups": {
+                "lcg-1": {"id": "lcg-1", "name": "分区", "gpu_type": "CPU"}
+            },
+        },
+    )
+    monkeypatch.setattr(mcp_server, "get_api", lambda: fake_api)
+
+    result = mcp_server.qz_list_resource_specs("空间")
+
+    assert fake_api.calls == [
+        ("ws-1", "lcg-1", "cookie=value", "SCHEDULE_CONFIG_TYPE_HPC")
+    ]
+    assert result["ok"] is True
+    assert result["data"]["result_count"] == 1
+    specs = result["data"]["results"][0]["specs"]
+    assert specs == [
+        {
+            "spec_id": "quota-1",
+            "quota_id": "quota-1",
+            "cpu_count": 20,
+            "memory_size_gib": 100,
+            "gpu_count": 0,
+            "gpu_type": "",
+            "total_price_per_hour": 0,
+        }
+    ]
+
+
 def test_cmd_create_hpc_dry_run_passes_ttl_after_finish_seconds(monkeypatch, capsys):
     class _FakeDisplay:
         def print(self, *args, **kwargs):

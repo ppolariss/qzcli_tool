@@ -430,6 +430,24 @@ def _availability_result(
     }
 
 
+def _normalized_resource_spec_price(spec: dict[str, Any]) -> dict[str, Any]:
+    gpu_info = spec.get("gpu_info") or {}
+    return {
+        "spec_id": spec.get("quota_id") or spec.get("id") or spec.get("spec_id") or "",
+        "quota_id": spec.get("quota_id", ""),
+        "cpu_count": spec.get("cpu_count", 0),
+        "memory_size_gib": spec.get("memory_size_gib", spec.get("memory_gb", 0)),
+        "gpu_count": spec.get("gpu_count", 0),
+        "gpu_type": (
+            gpu_info.get("gpu_product_simple")
+            or gpu_info.get("gpu_type_display")
+            or gpu_info.get("gpu_type")
+            or spec.get("gpu_type", "")
+        ),
+        "total_price_per_hour": spec.get("total_price_per_hour", 0),
+    }
+
+
 @server.tool(description="通过 CAS 登录启智平台并保存 cookie。")
 def qz_auth_login(username: str, password: str, workspace_id: str = "") -> dict[str, Any]:
     api = get_api()
@@ -540,6 +558,105 @@ def qz_refresh_resources(workspace: str = "", all_workspaces: bool = False) -> d
             "results": results,
         },
         message="资源刷新完成。",
+        warnings=warnings,
+    )
+
+
+@server.tool(description="列出一个工作空间下各分区可用的资源规格（quota_id/spec_id、CPU、内存、GPU）。")
+def qz_list_resource_specs(
+    workspace: str,
+    group: str = "",
+    schedule_config_type: str = "SCHEDULE_CONFIG_TYPE_HPC",
+    refresh_if_missing: bool = True,
+) -> dict[str, Any]:
+    if not workspace:
+        raise RuntimeError("请指定 workspace。")
+
+    cookie, _ = _require_cookie()
+    workspace_ref = _resolve_workspace_refs(workspace, allow_default=False)[0]
+    workspace_id = workspace_ref["id"]
+    workspace_name = workspace_ref.get("name", "") or workspace_id
+
+    cached_resources = get_workspace_resources(workspace_id)
+    warnings = []
+    if not cached_resources and refresh_if_missing:
+        refreshed = _refresh_workspace_resources(workspace_id, workspace_name, cookie)
+        cached_resources = get_workspace_resources(workspace_id)
+        warnings.append(f"{workspace_name}: 未命中缓存，已自动刷新资源。")
+        if refreshed.get("cluster_info_warning"):
+            warnings.append(
+                f"{workspace_name}: cluster_basic_info 失败，结果可能缺少部分计算组。"
+            )
+
+    if not cached_resources:
+        return _result(
+            {
+                "filters": {
+                    "workspace": workspace,
+                    "group": group,
+                    "schedule_config_type": schedule_config_type,
+                },
+                "result_count": 0,
+                "results": [],
+            },
+            message="未命中工作空间资源缓存。",
+            warnings=warnings,
+        )
+
+    compute_groups = dict(cached_resources.get("compute_groups") or {})
+    if group:
+        if group.startswith("lcg-"):
+            group_info = compute_groups.get(group, {"id": group, "name": group})
+            compute_groups = {group: group_info}
+        else:
+            try:
+                group_id, _ = resolve_cached_resource_ref(
+                    workspace_id, "compute_groups", group
+                )
+            except ResourceResolutionError as exc:
+                raise RuntimeError(str(exc)) from exc
+            group_info = compute_groups.get(group_id, {"id": group_id, "name": group_id})
+            compute_groups = {group_id: group_info}
+
+    api = get_api()
+    results = []
+    for group_id, group_info in compute_groups.items():
+        group_name = group_info.get("name", group_id)
+        try:
+            specs = api.list_resource_spec_prices(
+                workspace_id,
+                group_id,
+                cookie,
+                schedule_config_type=schedule_config_type,
+            )
+        except QzAPIError as exc:
+            warnings.append(f"{workspace_name} / {group_name}: {exc}")
+            continue
+
+        results.append(
+            {
+                "workspace_id": workspace_id,
+                "workspace_name": cached_resources.get("name", workspace_name) or workspace_name,
+                "compute_group_id": group_id,
+                "compute_group_name": group_name,
+                "gpu_type": group_info.get("gpu_type", ""),
+                "schedule_config_type": schedule_config_type,
+                "spec_count": len(specs),
+                "specs": [_normalized_resource_spec_price(spec) for spec in specs],
+            }
+        )
+
+    return _result(
+        {
+            "filters": {
+                "workspace": workspace,
+                "group": group,
+                "schedule_config_type": schedule_config_type,
+            },
+            "result_count": len(results),
+            "results": results,
+        },
+        message="资源规格查询完成。",
         warnings=warnings,
     )
 
