@@ -219,10 +219,26 @@ class QzAPI:
         
         return result
     
-    def get_job_detail(self, job_id: str) -> Dict[str, Any]:
-        """查询任务详情"""
+    @staticmethod
+    def is_hpc_job_id(job_id: str) -> bool:
+        """Return whether a job id belongs to the HPC job API family."""
+        return str(job_id).startswith("hpc-job-")
+
+    def get_train_job_detail(self, job_id: str) -> Dict[str, Any]:
+        """查询训练任务详情"""
         result = self._request("/openapi/v1/train_job/detail", {"job_id": job_id})
         return result.get("data", {})
+
+    def get_hpc_job_detail(self, job_id: str) -> Dict[str, Any]:
+        """查询 HPC 任务详情"""
+        result = self._request("/openapi/v1/hpc_jobs/detail", {"job_id": job_id})
+        return result.get("data", {})
+
+    def get_job_detail(self, job_id: str) -> Dict[str, Any]:
+        """查询任务详情，按 job id 自动选择训练或 HPC 接口。"""
+        if self.is_hpc_job_id(job_id):
+            return self.get_hpc_job_detail(job_id)
+        return self.get_train_job_detail(job_id)
     
     def get_jobs_detail(self, job_ids: List[str], max_workers: int = 5) -> Dict[str, Dict[str, Any]]:
         """批量查询任务详情（并发）"""
@@ -243,10 +259,37 @@ class QzAPI:
         
         return results
     
-    def stop_job(self, job_id: str) -> bool:
-        """停止任务"""
+    def stop_train_job(self, job_id: str) -> Dict[str, Any]:
+        """停止训练任务"""
+        result = self._request("/openapi/v1/train_job/stop", {"job_id": job_id})
+        return result.get("data", result)
+
+    def stop_hpc_job(self, job_id: str) -> Dict[str, Any]:
+        """停止 HPC 任务"""
         try:
-            self._request("/openapi/v1/train_job/stop", {"job_id": job_id})
+            result = self._request("/openapi/v1/hpc_jobs/stop", {"job_id": job_id})
+            return result.get("data", result)
+        except QzAPIError as exc:
+            try:
+                detail = self.get_hpc_job_detail(job_id)
+            except QzAPIError:
+                raise exc
+            status = str(detail.get("status", "")).upper()
+            if status in {"STOPPED", "FAILED", "SUCCEEDED", "SUCCESS", "COMPLETED", "FINISHED"}:
+                return {
+                    "job_id": job_id,
+                    "already_terminal": True,
+                    "status": detail.get("status", ""),
+                }
+            raise exc
+
+    def stop_job(self, job_id: str) -> bool:
+        """停止任务，按 job id 自动选择训练或 HPC 接口。"""
+        try:
+            if self.is_hpc_job_id(job_id):
+                self.stop_hpc_job(job_id)
+            else:
+                self.stop_train_job(job_id)
             return True
         except QzAPIError:
             return False
@@ -254,8 +297,11 @@ class QzAPI:
     def stop_job_result(self, job_id: str) -> Dict[str, Any]:
         """停止任务并返回详细结果"""
         try:
-            self._request("/openapi/v1/train_job/stop", {"job_id": job_id})
-            return {"job_id": job_id, "stopped": True, "error": "", "code": 0}
+            if self.is_hpc_job_id(job_id):
+                data = self.stop_hpc_job(job_id)
+            else:
+                data = self.stop_train_job(job_id)
+            return {"job_id": job_id, "stopped": True, "error": "", "code": 0, "data": data}
         except QzAPIError as exc:
             return {
                 "job_id": job_id,

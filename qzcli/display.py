@@ -28,6 +28,7 @@ STATUS_STYLES = {
     "job_running": ("bold cyan", "●"),
     "job_pending": ("bold blue", "◌"),
     "job_queued": ("bold blue", "◌"),
+    "job_queuing": ("bold blue", "◌"),
     "unknown": ("dim", "?"),
 }
 
@@ -39,6 +40,7 @@ STATUS_NAMES = {
     "job_running": "运行中",
     "job_pending": "等待中",
     "job_queued": "排队中",
+    "job_queuing": "排队中",
     "unknown": "未知",
 }
 

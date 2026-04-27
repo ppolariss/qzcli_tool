@@ -1210,7 +1210,7 @@ def main():
     create_hpc_parser.add_argument("--enable-hyper-threading", action="store_true", dest="enable_hyper_threading", help="启用超线程")
     create_hpc_parser.add_argument("--disable-hyper-threading", action="store_false", dest="enable_hyper_threading", help="禁用超线程")
     create_hpc_parser.set_defaults(enable_hyper_threading=False)
-    create_hpc_parser.add_argument("--track", action="store_true", help="写入本地追踪（当前状态刷新未单独适配 HPC 任务）")
+    create_hpc_parser.add_argument("--track", action="store_true", help="写入本地追踪")
     create_hpc_parser.add_argument("--dry-run", action="store_true", help="只显示 payload 不提交")
     create_hpc_parser.add_argument("--json", dest="output_json", action="store_true", help="输出 JSON 格式（供脚本集成）")
 

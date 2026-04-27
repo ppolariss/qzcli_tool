@@ -244,7 +244,7 @@ def cmd_create_hpc(args):
             },
         )
         store.add(job)
-        display.print("  [dim]已写入本地追踪；当前状态刷新接口未单独适配 HPC 任务[/dim]")
+        display.print("  [dim]已写入本地追踪[/dim]")
     else:
         display.print("  [dim]默认未加入本地追踪；如需记录到本地请加 --track[/dim]")
 

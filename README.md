@@ -387,7 +387,7 @@ qzcli create-hpc --name test-hpc --entrypoint "hostname" --workspace "分布式�
 | `--dry-run` | | | 只预览不提交 |
 | `--json` | | | JSON 输出 |
 
-> **提示**: `create-hpc` 默认不自动追踪到本地，因为当前 `qzcli` 的状态刷新接口只适配了 `train_job/*`，HPC 任务如需本地记录请显式加 `--track`。
+> **提示**: `create-hpc` 默认不自动追踪到本地；HPC 任务如需写入本地记录请显式加 `--track`。
 
 ### 批量提交任务
 

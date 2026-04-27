@@ -3,6 +3,7 @@ import pytest
 import qzcli.config as config
 from qzcli.api import QzAPI, QzAPIError
 from qzcli.resource_resolution import ResourceResolutionError, resolve_workspace_ref
+from qzcli.store import JobRecord
 
 
 @pytest.fixture()
@@ -143,6 +144,112 @@ def test_list_resource_spec_prices_uses_resource_prices_endpoint(monkeypatch):
     assert captured["headers"]["cookie"] == "cookie=value"
     assert captured["headers"]["referer"] == "https://qz.sii.edu.cn/jobs/create?spaceId=ws-1"
     assert captured["timeout"] == 60
+
+
+def test_job_detail_routes_hpc_job_ids_to_hpc_endpoint(monkeypatch):
+    captured = {}
+
+    def fake_post(url, json, headers, timeout):
+        captured["url"] = url
+        captured["json"] = json
+        return _FakeResponse(payload={"code": 0, "data": {"job_id": "hpc-job-1"}})
+
+    monkeypatch.setattr("requests.post", fake_post)
+    monkeypatch.setattr(QzAPI, "_get_token", lambda self: "token")
+
+    api = QzAPI(username="u", password="p")
+    assert api.get_job_detail("hpc-job-1") == {"job_id": "hpc-job-1"}
+    assert captured["url"].endswith("/openapi/v1/hpc_jobs/detail")
+    assert captured["json"] == {"job_id": "hpc-job-1"}
+
+
+def test_job_detail_keeps_train_jobs_on_train_endpoint(monkeypatch):
+    captured = {}
+
+    def fake_post(url, json, headers, timeout):
+        captured["url"] = url
+        captured["json"] = json
+        return _FakeResponse(payload={"code": 0, "data": {"job_id": "job-1"}})
+
+    monkeypatch.setattr("requests.post", fake_post)
+    monkeypatch.setattr(QzAPI, "_get_token", lambda self: "token")
+
+    api = QzAPI(username="u", password="p")
+    assert api.get_job_detail("job-1") == {"job_id": "job-1"}
+    assert captured["url"].endswith("/openapi/v1/train_job/detail")
+    assert captured["json"] == {"job_id": "job-1"}
+
+
+def test_stop_routes_hpc_job_ids_to_hpc_endpoint(monkeypatch):
+    captured = {}
+
+    def fake_post(url, json, headers, timeout):
+        captured["url"] = url
+        captured["json"] = json
+        return _FakeResponse(payload={"code": 0, "data": {"job_id": "hpc-job-1", "sub_code": 0}})
+
+    monkeypatch.setattr("requests.post", fake_post)
+    monkeypatch.setattr(QzAPI, "_get_token", lambda self: "token")
+
+    api = QzAPI(username="u", password="p")
+    result = api.stop_job_result("hpc-job-1")
+
+    assert result["stopped"] is True
+    assert result["data"] == {"job_id": "hpc-job-1", "sub_code": 0}
+    assert captured["url"].endswith("/openapi/v1/hpc_jobs/stop")
+    assert captured["json"] == {"job_id": "hpc-job-1"}
+
+
+def test_stop_hpc_job_treats_terminal_detail_as_success(monkeypatch):
+    calls = []
+
+    def fake_post(url, json, headers, timeout):
+        calls.append(url)
+        if url.endswith("/openapi/v1/hpc_jobs/stop"):
+            return _FakeResponse(status_code=500)
+        if url.endswith("/openapi/v1/hpc_jobs/detail"):
+            return _FakeResponse(payload={"code": 0, "data": {"job_id": "hpc-job-1", "status": "STOPPED"}})
+        raise AssertionError(url)
+
+    monkeypatch.setattr("requests.post", fake_post)
+    monkeypatch.setattr(QzAPI, "_get_token", lambda self: "token")
+
+    api = QzAPI(username="u", password="p")
+    result = api.stop_job_result("hpc-job-1")
+
+    assert result["stopped"] is True
+    assert result["data"] == {
+        "job_id": "hpc-job-1",
+        "already_terminal": True,
+        "status": "STOPPED",
+    }
+    assert calls[0].endswith("/openapi/v1/hpc_jobs/stop")
+    assert calls[1].endswith("/openapi/v1/hpc_jobs/detail")
+
+
+def test_hpc_api_response_is_normalized_for_local_store():
+    job = JobRecord.from_api_response(
+        {
+            "job_id": "hpc-job-1",
+            "job_name": "hpc-test",
+            "status": "QUEUEING",
+            "workspace_id": "ws-1",
+            "project_id": "project-1",
+            "project_name": "项目",
+            "logic_compute_group_name": "HPC 分区",
+            "created_at": "2026-04-27 16:49:50",
+            "sbatch_script": {"entrypoint": "hostname", "number_of_tasks": 1},
+            "slurm_cluster_spec": {"instance_count": 1},
+            "resource_spec_price": {"gpu_count": 0, "gpu_info": {"gpu_type_display": "CPU"}},
+        }
+    )
+
+    assert job.name == "hpc-test"
+    assert job.status == "job_queuing"
+    assert job.created_at == "2026-04-27T16:49:50"
+    assert job.command == "hostname"
+    assert job.instance_count == 1
+    assert job.gpu_type == "CPU"
 
 
 def test_list_workspaces_paginates_all_pages(monkeypatch):

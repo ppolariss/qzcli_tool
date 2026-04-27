@@ -56,10 +56,42 @@ class JobRecord:
         def parse_timestamp(ts: str) -> str:
             if not ts:
                 return ""
+            if isinstance(ts, str):
+                value = ts.strip()
+                if not value:
+                    return ""
+                try:
+                    return datetime.fromisoformat(value).isoformat()
+                except ValueError:
+                    pass
+                try:
+                    return datetime.strptime(value, "%Y-%m-%d %H:%M:%S").isoformat()
+                except ValueError:
+                    pass
             try:
                 return datetime.fromtimestamp(int(ts) / 1000).isoformat()
             except (ValueError, TypeError):
                 return ""
+
+        def normalize_status(status: str) -> str:
+            status_str = str(status or "unknown")
+            status_key = status_str.upper()
+            aliases = {
+                "RUNNING": "job_running",
+                "PENDING": "job_pending",
+                "QUEUEING": "job_queuing",
+                "QUEUING": "job_queuing",
+                "QUEUED": "job_queuing",
+                "STOPPED": "job_stopped",
+                "TERMINATED": "job_stopped",
+                "FAILED": "job_failed",
+                "FAIL": "job_failed",
+                "SUCCEEDED": "job_succeeded",
+                "SUCCESS": "job_succeeded",
+                "COMPLETED": "job_succeeded",
+                "FINISHED": "job_succeeded",
+            }
+            return aliases.get(status_key, status_str)
         
         # 提取 framework_config 中的信息
         framework_config = data.get("framework_config", [{}])
@@ -75,6 +107,15 @@ class JobRecord:
             spec_info = fc.get("instance_spec_price_info", {})
             gpu_info = spec_info.get("gpu_info", {})
             gpu_type = gpu_info.get("gpu_product_simple", "")  # 如 "H200"
+
+        if data.get("resource_spec_price") and (not gpu_count or not gpu_type):
+            spec_info = data.get("resource_spec_price", {})
+            gpu_count = gpu_count or spec_info.get("gpu_count", 0) or 0
+            gpu_info = spec_info.get("gpu_info", {})
+            gpu_type = gpu_type or gpu_info.get("gpu_product_simple") or gpu_info.get("gpu_type_display", "")
+
+        if not instance_count and data.get("slurm_cluster_spec"):
+            instance_count = data.get("slurm_cluster_spec", {}).get("instance_count", 0) or 0
         
         # 提取计算组名称和项目名称
         compute_group_name = data.get("logic_compute_group_name", "")
@@ -89,15 +130,15 @@ class JobRecord:
         
         return cls(
             job_id=job_id,
-            name=data.get("name", ""),
-            status=data.get("status", "unknown"),
+            name=data.get("name") or data.get("job_name", ""),
+            status=normalize_status(data.get("status", "unknown")),
             workspace_id=workspace_id,
             project_id=data.get("project_id", ""),
             created_at=parse_timestamp(data.get("created_at", "")),
             updated_at=datetime.now().isoformat(),
             finished_at=parse_timestamp(data.get("finished_at", "")),
             source=source,
-            command=data.get("command", ""),
+            command=data.get("command") or data.get("sbatch_script", {}).get("entrypoint", ""),
             url=url,
             running_time_ms=data.get("running_time_ms", ""),
             priority_level=data.get("priority_level", ""),
