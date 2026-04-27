@@ -46,13 +46,14 @@ DEFAULT_CPU_WORKSPACE_NAMES = (
 
 
 def _default_cpu_workspace_rank(workspace_id: str, workspace_data: Dict[str, Any]) -> Optional[int]:
+    base_offset = len(DEFAULT_CPU_WORKSPACE_NAMES)
     if workspace_id in DEFAULT_CPU_WORKSPACE_IDS:
         id_order = {
             "ws-6e6ba362-e98e-45b2-9c5a-311998e93d65": 0,
             "ws-f9be64cb-9b66-40fb-8172-488abed619bc": 1,
             "ws-1177d2a5-aef0-40d3-8777-fed9af13affc": 2,
         }
-        return id_order.get(workspace_id, len(DEFAULT_CPU_WORKSPACE_NAMES))
+        return id_order.get(workspace_id, base_offset)
 
     names = {
         str(workspace_data.get("name", "") or ""),
@@ -62,6 +63,13 @@ def _default_cpu_workspace_rank(workspace_id: str, workspace_data: Dict[str, Any
     for idx, name in enumerate(DEFAULT_CPU_WORKSPACE_NAMES):
         if name in names:
             return idx
+
+    compute_groups = workspace_data.get("compute_groups", {})
+    group_values = compute_groups.values() if isinstance(compute_groups, dict) else compute_groups
+    for group in group_values or []:
+        gpu_type = str(group.get("gpu_type", "") or "").strip().upper()
+        if gpu_type == "CPU":
+            return base_offset
     return None
 
 
@@ -74,46 +82,80 @@ def _default_cpu_workspace_ids(all_resources: Dict[str, Any]) -> List[str]:
     return [workspace_id for _, workspace_id in sorted(ranked)]
 
 
+def _is_cpu_compute_group(group: Dict[str, Any]) -> bool:
+    gpu_type = str(group.get("gpu_type", "") or "").strip().upper()
+    if gpu_type == "CPU":
+        return True
+    name = str(group.get("name", "") or "")
+    return "CPU" in name or "HPC" in name or "高性能计算" in name
+
+
+def _filter_default_cpu_compute_groups(
+    workspace_id: str,
+    compute_groups: Dict[str, Any],
+) -> Dict[str, Any]:
+    if workspace_id in DEFAULT_CPU_WORKSPACE_IDS:
+        return {
+            group_id: group
+            for group_id, group in compute_groups.items()
+            if _is_cpu_compute_group(group)
+        }
+    return {
+        group_id: group
+        for group_id, group in compute_groups.items()
+        if str(group.get("gpu_type", "") or "").strip().upper() == "CPU"
+    }
+
+
 def _cache_workspace_resources(
     api, workspace_id: str, cookie: str, workspace_name: str = ""
 ) -> Dict[str, int]:
     """从 API 拉取并缓存单个工作空间的资源信息。"""
+    existing_resources = get_workspace_resources(workspace_id) or {}
     result = api.list_jobs_with_cookie(workspace_id, cookie, page_size=200)
     jobs = result.get("jobs", [])
     resources = api.extract_resources_from_jobs(jobs)
 
     try:
-        cluster_info = api.get_cluster_basic_info(workspace_id, cookie)
-        compute_groups_from_api = []
-
-        for cg in cluster_info.get("compute_groups", []):
-            for lcg in cg.get("logic_compute_groups", []):
-                lcg_id = lcg.get("logic_compute_group_id", "")
-                lcg_name = lcg.get("logic_compute_group_name", "")
-                brand = lcg.get("brand", "")
-                resource_types = lcg.get("resource_types", [])
-                gpu_type = resource_types[0] if resource_types else ""
-
-                if lcg_id:
-                    compute_groups_from_api.append(
-                        {
-                            "id": lcg_id,
-                            "name": lcg_name,
-                            "gpu_type": brand or gpu_type,
-                            "workspace_id": workspace_id,
-                        }
-                    )
-
-        if compute_groups_from_api:
-            resources["compute_groups"] = compute_groups_from_api
+        _merge_cluster_compute_groups(api, workspace_id, cookie, resources)
     except Exception:
         pass
+
+    if not resources.get("compute_groups") and existing_resources.get("compute_groups"):
+        resources["compute_groups"] = list(existing_resources["compute_groups"].values())
+    if not resources.get("specs") and existing_resources.get("specs"):
+        resources["specs"] = list(existing_resources["specs"].values())
 
     save_resources(workspace_id, resources, workspace_name)
     return {
         "projects": len(resources.get("projects", [])),
         "compute_groups": len(resources.get("compute_groups", [])),
     }
+
+
+def _merge_cluster_compute_groups(api, workspace_id: str, cookie: str, resources: Dict[str, Any]) -> None:
+    """Merge live cluster compute groups into a resource snapshot."""
+    cluster_info = api.get_cluster_basic_info(workspace_id, cookie)
+    by_id = {
+        group.get("id"): dict(group)
+        for group in resources.get("compute_groups", [])
+        if group.get("id")
+    }
+    for cg in cluster_info.get("compute_groups", []):
+        for lcg in cg.get("logic_compute_groups", []):
+            lcg_id = lcg.get("logic_compute_group_id", "")
+            if not lcg_id:
+                continue
+            resource_types = lcg.get("resource_types", [])
+            gpu_type = lcg.get("brand", "") or (resource_types[0] if resource_types else "")
+            by_id[lcg_id] = {
+                "id": lcg_id,
+                "name": lcg.get("logic_compute_group_name", ""),
+                "gpu_type": gpu_type,
+                "workspace_id": workspace_id,
+            }
+    if by_id:
+        resources["compute_groups"] = list(by_id.values())
 
 
 def _parse_cpu_thresholds(raw_values: Optional[List[str]]) -> List[Dict[str, float]]:
@@ -516,113 +558,36 @@ def cmd_workspaces(args):
                     "[dim]未找到自己的任务，尝试从工作空间任务获取资源信息...[/dim]"
                 )
 
-                projects_found = {}
-                compute_groups_found = {}
-                gpu_types_found = {}
+                stats = _cache_workspace_resources(api, workspace_id, cookie, pending_name or "")
+                cached_after_refresh = get_workspace_resources(workspace_id) or {}
+                projects = list(cached_after_refresh.get("projects", {}).values())
+                compute_groups = list(cached_after_refresh.get("compute_groups", {}).values())
+                specs = list(cached_after_refresh.get("specs", {}).values())
 
-                try:
-                    task_data = api.list_task_dimension(
-                        workspace_id, cookie, page_size=200
-                    )
-                    tasks = task_data.get("task_dimensions", [])
-
-                    for task in tasks:
-                        proj = task.get("project", {})
-                        proj_id = proj.get("id", "")
-                        proj_name = proj.get("name", "")
-                        if proj_id and proj_id not in projects_found:
-                            projects_found[proj_id] = {
-                                "id": proj_id,
-                                "name": proj_name,
-                                "workspace_id": workspace_id,
-                            }
-                except QzAPIError:
-                    pass
-
-                try:
-                    node_data = api.list_node_dimension(
-                        workspace_id, cookie, page_size=500
-                    )
-                    nodes = node_data.get("node_dimensions", [])
-
-                    for node in nodes:
-                        lcg_info = node.get("logic_compute_group", {})
-                        lcg_id = lcg_info.get("id", "")
-                        lcg_name = lcg_info.get("name", "")
-                        if lcg_id and lcg_id not in compute_groups_found:
-                            gpu_info = node.get("gpu_info", {})
-                            gpu_type = gpu_info.get("gpu_product_simple", "")
-                            compute_groups_found[lcg_id] = {
-                                "id": lcg_id,
-                                "name": lcg_name,
-                                "gpu_type": gpu_type,
-                                "workspace_id": workspace_id,
-                            }
-
-                        gpu_info = node.get("gpu_info", {})
-                        gpu_type = gpu_info.get("gpu_product_simple", "")
-                        if gpu_type and gpu_type not in gpu_types_found:
-                            gpu_types_found[gpu_type] = {
-                                "type": gpu_type,
-                                "display": gpu_info.get("gpu_type_display", ""),
-                                "memory_gb": gpu_info.get("gpu_memory_size_gb", 0),
-                            }
-                except QzAPIError:
-                    pass
-
-                resources = {
-                    "projects": list(projects_found.values()),
-                    "compute_groups": list(compute_groups_found.values()),
-                    "specs": [],
-                }
-
-                ws_name = pending_name or ""
-                save_resources(workspace_id, resources, ws_name)
                 display.print_success("已添加工作空间到缓存")
+                display.print(
+                    f"[dim]项目: {stats['projects']} 个, 计算组: {stats['compute_groups']} 个[/dim]"
+                )
+            else:
+                resources = api.extract_resources_from_jobs(jobs)
+                try:
+                    _merge_cluster_compute_groups(api, workspace_id, cookie, resources)
+                except Exception:
+                    pass
+                ws_name = pending_name or (
+                    cached_resources.get("name", "") if cached_resources else ""
+                )
+                save_resources(workspace_id, resources, ws_name)
+                display.print_success("资源配置已保存到本地缓存")
 
-                if projects_found:
-                    display.print(f"\n[bold]项目 ({len(projects_found)} 个)[/bold]")
-                    for proj in projects_found.values():
-                        display.print(f"  - {proj['name']}")
-                        display.print(f"    [cyan]{proj['id']}[/cyan]")
+                display.print(
+                    f"\n[bold]资源配置（从 {len(jobs)}/{total} 个任务中提取）[/bold]"
+                )
+                display.print(f"[dim]工作空间: {workspace_id}[/dim]\n")
 
-                if compute_groups_found:
-                    display.print(
-                        f"\n[bold]计算组 ({len(compute_groups_found)} 个)[/bold]"
-                    )
-                    for cg in compute_groups_found.values():
-                        display.print(f"  - {cg['name']} [{cg['gpu_type']}]")
-                        display.print(f"    [cyan]{cg['id']}[/cyan]")
-
-                if gpu_types_found:
-                    display.print(
-                        f"\n[bold]可用 GPU 类型 ({len(gpu_types_found)} 种)[/bold]"
-                    )
-                    for gt in gpu_types_found.values():
-                        display.print(
-                            f"  - {gt['type']} ({gt['display']}, {gt['memory_gb']}GB)"
-                        )
-
-                if not projects_found and not compute_groups_found:
-                    display.print("[dim]未发现项目或计算组信息[/dim]")
-
-                return 0
-
-            resources = api.extract_resources_from_jobs(jobs)
-            ws_name = pending_name or (
-                cached_resources.get("name", "") if cached_resources else ""
-            )
-            save_resources(workspace_id, resources, ws_name)
-            display.print_success("资源配置已保存到本地缓存")
-
-            display.print(
-                f"\n[bold]资源配置（从 {len(jobs)}/{total} 个任务中提取）[/bold]"
-            )
-            display.print(f"[dim]工作空间: {workspace_id}[/dim]\n")
-
-            projects = resources.get("projects", [])
-            compute_groups = resources.get("compute_groups", [])
-            specs = resources.get("specs", [])
+                projects = resources.get("projects", [])
+                compute_groups = resources.get("compute_groups", [])
+                specs = resources.get("specs", [])
 
         except QzAPIError as e:
             if "401" in str(e) or "过期" in str(e):
@@ -1019,6 +984,8 @@ def cmd_avail(args):
                     compute_groups = {group_id: compute_groups[group_id]}
                 else:
                     continue
+        elif args.cpu:
+            compute_groups = _filter_default_cpu_compute_groups(workspace_id, compute_groups)
 
         if not compute_groups:
             continue
