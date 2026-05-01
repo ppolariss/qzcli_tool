@@ -2,6 +2,8 @@
 
 一个类似 kubectl/docker 风格的 CLI 工具，用于管理启智平台任务。
 
+完整命令、别名和参数说明见 [COMMANDS.md](COMMANDS.md)。
+
 ## 特性
 
 - **一键登录**: `qzcli login` 通过 CAS 认证自动获取 cookie，无需手动复制
@@ -240,7 +242,9 @@ qzcli avail -n 4 -e
 | 命令 | 别名 | 说明 |
 |------|------|------|
 | `list` | `ls` | 列出任务 |
-| `tasks` | `jobs`, `blame` | 查询 `cluster_metric/list_task_dimension`，默认启动本地前端 |
+| `hpc-jobs` | `hpc-list` | 查询 `hpc_jobs/list`，用于 HPC 单视图历史/运行状态排查；排队任务统一用 `user-jobs` |
+| `user-jobs` | `user-tasks` | 按 created_by 同时查询分布式训练和 HPC 两个任务视图；查看排队任务只能用这个统一入口 |
+| `tasks` | `jobs`, `blame` | 查询 `cluster_metric/list_task_dimension`，默认启动本地前端；只用于当前资源占用视图 |
 
 ```bash
 # Cookie 模式（从 API 获取）
@@ -248,6 +252,17 @@ qzcli ls -c -w CI           # 指定工作空间
 qzcli ls -c --all-ws        # 所有工作空间
 qzcli ls -c -w CI -r        # 只看运行中
 qzcli ls -c -w CI -n 50     # 显示 50 条
+
+# HPC 任务历史（当前用户视角的单视图排查，不作为排队任务口径）
+qzcli hpc-jobs -w CPU资源空间 -s RUNNING
+qzcli hpc-jobs -w CPU资源空间 --created-by user-xxx -s RUNNING
+
+# 某个用户的完整任务视图，也是查看排队任务的唯一入口：
+# 不传 -w 时遍历所有可访问工作空间，每个工作空间同时查
+# /api/v1/train_job/list 和 /api/v1/hpc_jobs/list
+qzcli user-jobs --created-by user-xxx --queued
+qzcli user-jobs --created-by user-xxx --running --json
+qzcli user-jobs --created-by user-xxx -w CPU资源空间 --kind train
 
 # 本地模式（从本地存储）
 qzcli ls                    # 默认列表
@@ -260,6 +275,12 @@ qzcli tasks -w ws-xxx                      # 指定默认工作空间
 qzcli jobs -w ws-xxx --project CI-长视频理解  # 项目过滤
 qzcli blame -w ws-xxx --no-serve            # 只在 CLI 输出并按用户做 blame 汇总
 ```
+
+`hpc-jobs` 使用 `/api/v1/hpc_jobs/list`，是 HPC 任务页的单视图历史接口；`user-jobs`
+会同时查询 `/api/v1/train_job/list` 和 `/api/v1/hpc_jobs/list`，适合按 created_by 查看某个用户
+在所有分区/工作空间下的完整任务。查看排队任务必须使用 `user-jobs --created-by ... --queued`，
+不能用 `tasks/jobs/blame` 或 `cluster_metric/list_task_dimension` 判断排队队列；后者只表示
+工作空间当前资源占用视图。
 
 ### 创建任务
 

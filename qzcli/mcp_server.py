@@ -25,6 +25,11 @@ from .resource_resolution import (
     resolve_workspace_ref,
 )
 from .store import JobRecord, get_store
+from .user_jobs import (
+    job_summary as _user_job_summary,
+    list_user_jobs as _list_user_jobs,
+    summarize_user_jobs as _summarize_user_jobs,
+)
 
 
 TYPE_NAMES = {
@@ -239,6 +244,27 @@ def _normalize_status(status: Any) -> dict[str, Any]:
     }
 
 
+def _created_by_summary(job_data: dict[str, Any]) -> dict[str, str]:
+    created_by = job_data.get("created_by") or {}
+    if isinstance(created_by, dict):
+        return {
+            "created_by_id": str(created_by.get("id", "") or ""),
+            "created_by_name": str(created_by.get("name", "") or ""),
+            "created_by_name_en": str(created_by.get("name_en", "") or ""),
+        }
+    if created_by:
+        return {
+            "created_by_id": str(created_by),
+            "created_by_name": "",
+            "created_by_name_en": "",
+        }
+    return {
+        "created_by_id": "",
+        "created_by_name": "",
+        "created_by_name_en": "",
+    }
+
+
 def _job_summary_from_api(job_data: dict[str, Any]) -> dict[str, Any]:
     job = JobRecord.from_api_response(job_data)
     status_info = _normalize_status(job_data.get("status", job.status))
@@ -258,6 +284,7 @@ def _job_summary_from_api(job_data: dict[str, Any]) -> dict[str, Any]:
         "created_at": job.created_at,
         "finished_at": job.finished_at,
         "url": job.url,
+        **_created_by_summary(job_data),
         **status_info,
         "raw": job_data,
     }
@@ -845,6 +872,167 @@ def qz_list_jobs(
         },
         message="任务列表查询完成。",
         warnings=warnings,
+    )
+
+
+@server.tool(
+    description=(
+        "列出 HPC 任务，使用 /api/v1/hpc_jobs/list。"
+        "这是当前用户 HPC 任务历史视图，可用 created_by/status 过滤，"
+        "能看到 QUEUEING/RUNNING 等不一定出现在 task dimension 里的状态。"
+    )
+)
+def qz_list_hpc_jobs(
+    workspace: str = "",
+    all_workspaces: bool = False,
+    created_by: str = "",
+    status: str = "",
+    running_only: bool = False,
+    limit: int = 20,
+) -> dict[str, Any]:
+    cookie, _ = _require_cookie()
+    workspace_refs = _resolve_workspace_refs(workspace or None, all_workspaces=all_workspaces)
+    api = get_api()
+
+    status_filters: list[str] = []
+    if status:
+        status_filters = [status.upper()]
+    elif running_only:
+        status_filters = ["QUEUEING", "RUNNING", "PENDING", "CREATING"]
+
+    jobs = []
+    warnings = []
+    raw_total = 0
+
+    for workspace_ref in workspace_refs:
+        workspace_id = workspace_ref["id"]
+        workspace_name = workspace_ref.get("name", "")
+        try:
+            if status_filters:
+                for status_filter in status_filters:
+                    payload = api.list_hpc_jobs_with_cookie(
+                        workspace_id,
+                        cookie,
+                        page_size=limit,
+                        created_by=created_by or None,
+                        status=status_filter,
+                    )
+                    raw_total += int(payload.get("total", 0) or 0)
+                    for job_data in payload.get("jobs", []):
+                        summary = _job_summary_from_api(job_data)
+                        summary["workspace_name"] = workspace_name
+                        jobs.append(summary)
+            else:
+                payload = api.list_hpc_jobs_with_cookie(
+                    workspace_id,
+                    cookie,
+                    page_size=limit,
+                    created_by=created_by or None,
+                )
+                raw_total += int(payload.get("total", 0) or 0)
+                for job_data in payload.get("jobs", []):
+                    summary = _job_summary_from_api(job_data)
+                    summary["workspace_name"] = workspace_name
+                    jobs.append(summary)
+        except Exception as exc:
+            warnings.append(f"{workspace_name or workspace_id}: {exc}")
+
+    jobs.sort(key=lambda item: item.get("created_at") or "", reverse=True)
+    jobs = jobs[:limit]
+
+    status_counts: dict[str, int] = defaultdict(int)
+    status_family_counts: dict[str, int] = defaultdict(int)
+    for job in jobs:
+        status_counts[job["status_raw"]] += 1
+        status_family_counts[job["status_family"]] += 1
+
+    return _result(
+        {
+            "endpoint": "/api/v1/hpc_jobs/list",
+            "workspace_count": len(workspace_refs),
+            "raw_total": raw_total,
+            "job_count": len(jobs),
+            "created_by": created_by,
+            "status_filters": status_filters,
+            "status_counts": dict(sorted(status_counts.items(), key=lambda item: (-item[1], item[0]))),
+            "status_family_counts": dict(sorted(status_family_counts.items(), key=lambda item: (-item[1], item[0]))),
+            "jobs": jobs,
+        },
+        message="HPC 任务列表查询完成。",
+        warnings=warnings,
+    )
+
+
+@server.tool(
+    description=(
+        "按 created_by 查询一个用户的完整任务视图。"
+        "会在每个工作空间同时查询 /api/v1/train_job/list（分布式训练）"
+        "和 /api/v1/hpc_jobs/list（HPC），适合回答某人的所有排队/运行任务。"
+    )
+)
+def qz_list_user_jobs(
+    created_by: str,
+    workspace: str = "",
+    all_workspaces: bool = True,
+    kind: str = "all",
+    status: str = "",
+    queued_only: bool = False,
+    running_only: bool = False,
+    limit: int = 50,
+    page_size: int = 100,
+    max_pages: int = 5,
+) -> dict[str, Any]:
+    if not created_by:
+        raise RuntimeError("created_by 不能为空。")
+    if queued_only and running_only:
+        raise RuntimeError("queued_only 和 running_only 不能同时为 true。")
+
+    include_train = kind in {"all", "train", "distributed_training"}
+    include_hpc = kind in {"all", "hpc"}
+    if not include_train and not include_hpc:
+        raise RuntimeError("kind 只能是 all、train/distributed_training 或 hpc。")
+
+    cookie, _ = _require_cookie()
+    workspace_refs = _resolve_workspace_refs(workspace or None, all_workspaces=all_workspaces)
+    api = get_api()
+    result = _list_user_jobs(
+        api,
+        cookie,
+        workspace_refs,
+        created_by=created_by,
+        include_train=include_train,
+        include_hpc=include_hpc,
+        status=status or "",
+        queued_only=queued_only,
+        running_only=running_only,
+        page_size=page_size,
+        max_pages=max_pages,
+    )
+    jobs = result["jobs"]
+    matched = len(jobs)
+    jobs = jobs[:limit]
+    counts = _summarize_user_jobs(result["jobs"])
+
+    return _result(
+        {
+            "created_by": created_by,
+            "workspace_count": len(workspace_refs),
+            "kind": kind,
+            "filters": {
+                "status": status,
+                "queued_only": queued_only,
+                "running_only": running_only,
+                "page_size": page_size,
+                "max_pages": max_pages,
+            },
+            "raw_totals": result["raw_totals"],
+            "matched": matched,
+            "job_count": len(jobs),
+            **counts,
+            "jobs": [_user_job_summary(job) for job in jobs],
+        },
+        message="用户任务查询完成。",
+        warnings=result["warnings"],
     )
 
 

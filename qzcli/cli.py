@@ -6,6 +6,7 @@ qzcli - 启智平台任务管理 CLI
 import sys
 import time
 import argparse
+import json
 from pathlib import Path
 
 from . import __version__
@@ -16,7 +17,7 @@ from .config import (
 )
 from .api import get_api, QzAPIError
 from .store import get_store, JobRecord
-from .display import get_display, format_duration, format_time_ago
+from .display import get_display, format_duration, format_time_ago, get_status_display, truncate_string
 from .create_commands import (
     cmd_batch as _cmd_batch_impl,
     cmd_create as _cmd_create_impl,
@@ -32,6 +33,7 @@ from .resource_commands import (
 )
 from .resource_resolution import ResourceResolutionError, resolve_workspace_ref
 from .task_dimensions import cmd_task_dimensions as _cmd_task_dimensions_impl
+from .user_jobs import job_summary, list_user_jobs, summarize_user_jobs
 
 
 def cmd_init(args):
@@ -281,6 +283,323 @@ def cmd_list(args):
         display.print_jobs_wide(jobs)
     else:
         display.print_jobs_table(jobs, show_command=args.verbose, show_url=args.url)
+    return 0
+
+
+def _hpc_job_from_api_response(job_data, workspace_name: str = "") -> JobRecord:
+    job = JobRecord.from_api_response(job_data, source="api_hpc_cookie")
+    metadata = dict(job.metadata or {})
+    created_by = job_data.get("created_by") or {}
+    if isinstance(created_by, dict):
+        metadata["created_by_id"] = created_by.get("id", "")
+        metadata["created_by_name"] = created_by.get("name", "")
+        metadata["created_by_name_en"] = created_by.get("name_en", "")
+    elif created_by:
+        metadata["created_by_id"] = str(created_by)
+    if workspace_name:
+        metadata["workspace_name"] = workspace_name
+    job.metadata = metadata
+    return job
+
+
+def cmd_hpc_jobs(args):
+    """查看 /api/v1/hpc_jobs/list 任务列表。"""
+    display = get_display()
+    api = get_api()
+
+    try:
+        cookie_data = api.ensure_cookie()
+    except QzAPIError as e:
+        display.print_error(str(e))
+        return 1
+
+    cookie = cookie_data["cookie"]
+    workspace_input = args.workspace
+    if workspace_input:
+        try:
+            workspace_id, ws_name = resolve_workspace_ref(workspace_input)
+        except ResourceResolutionError as e:
+            display.print_error(str(e))
+            display.print("[dim]使用 qzcli catalog --list 查看已缓存的工作空间[/dim]")
+            return 1
+    else:
+        workspace_id = cookie_data.get("workspace_id", "")
+        if not workspace_id:
+            display.print_error("请指定工作空间: qzcli hpc-jobs -w <名称或ID>")
+            return 1
+        ws_resources = get_workspace_resources(workspace_id)
+        ws_name = ws_resources.get("name", "") if ws_resources else ""
+
+    status_filters = []
+    if args.queued:
+        status_filters = ["QUEUEING"]
+    elif args.running and not args.status:
+        status_filters = ["QUEUEING", "RUNNING", "PENDING", "CREATING"]
+    elif args.status:
+        status_filters = [args.status.upper()]
+
+    jobs_data = []
+    total = 0
+    status_errors = []
+
+    try:
+        if status_filters:
+            for status in status_filters:
+                try:
+                    result = api.list_hpc_jobs_with_cookie(
+                        workspace_id,
+                        cookie,
+                        page_num=args.page,
+                        page_size=args.limit,
+                        created_by=args.created_by,
+                        status=status,
+                    )
+                except QzAPIError as e:
+                    status_errors.append(f"{status}: {e}")
+                    continue
+                total += int(result.get("total", 0) or 0)
+                jobs_data.extend(result.get("jobs", []))
+        else:
+            if not args.output_json:
+                display.print("[dim]正在从 HPC API 获取任务列表...[/dim]")
+            result = api.list_hpc_jobs_with_cookie(
+                workspace_id,
+                cookie,
+                page_num=args.page,
+                page_size=args.limit,
+                created_by=args.created_by,
+            )
+            total = int(result.get("total", 0) or 0)
+            jobs_data = result.get("jobs", [])
+    except QzAPIError as e:
+        if "401" in str(e) or "过期" in str(e):
+            display.print_error("Cookie 已过期，请重新设置: qzcli login")
+        else:
+            display.print_error(f"获取 HPC 任务失败: {e}")
+        return 1
+
+    if status_errors and not jobs_data:
+        display.print_error("状态过滤查询失败: " + "; ".join(status_errors))
+        return 1
+    for error in status_errors:
+        display.print_warning(f"状态过滤查询失败，已跳过: {error}")
+
+    jobs_data.sort(key=lambda item: item.get("created_at") or "", reverse=True)
+    jobs_data = jobs_data[:args.limit]
+
+    if args.output_json:
+        import json
+        from collections import Counter
+
+        status_counts = Counter(str(job.get("status", "") or "") for job in jobs_data)
+        print(json.dumps({
+            "endpoint": "/api/v1/hpc_jobs/list",
+            "workspace_id": workspace_id,
+            "workspace_name": ws_name,
+            "created_by": args.created_by or "",
+            "status_filters": status_filters,
+            "page": args.page,
+            "limit": args.limit,
+            "total": total,
+            "count": len(jobs_data),
+            "status_counts": dict(status_counts),
+            "jobs": jobs_data,
+        }, ensure_ascii=False, indent=2))
+        return 0
+
+    if not jobs_data:
+        display.print("[dim]暂无符合条件的 HPC 任务[/dim]")
+        return 0
+
+    jobs = [_hpc_job_from_api_response(job_data, ws_name) for job_data in jobs_data]
+    title = f"HPC 任务列表 · {ws_name or workspace_id} (显示 {len(jobs)}/{total})"
+    if args.created_by:
+        title += f" · created_by={args.created_by}"
+    if status_filters:
+        title += f" · status={','.join(status_filters)}"
+
+    if args.wide and not args.compact:
+        display.print_jobs_wide(jobs, title=title)
+    else:
+        display.print_jobs_table(jobs, title=title, show_command=args.verbose, show_url=args.url)
+    return 0
+
+
+def _resolve_user_job_workspace_refs(api, cookie: str, workspace_input: str = ""):
+    """Resolve workspaces for user-jobs. No workspace means all remotely visible spaces."""
+    if workspace_input:
+        try:
+            workspace_id, workspace_name = resolve_workspace_ref(workspace_input)
+            return [{"id": workspace_id, "name": workspace_name}]
+        except ResourceResolutionError:
+            if workspace_input.startswith("ws-"):
+                ws_resources = get_workspace_resources(workspace_input)
+                return [{"id": workspace_input, "name": (ws_resources or {}).get("name", "")}]
+            raise
+
+    try:
+        workspaces = api.list_workspaces(cookie)
+    except QzAPIError:
+        workspaces = []
+
+    if workspaces:
+        return [
+            {"id": str(ws.get("id", "") or ""), "name": str(ws.get("name", "") or "")}
+            for ws in workspaces
+            if ws.get("id")
+        ]
+
+    all_resources = load_all_resources()
+    return [
+        {"id": workspace_id, "name": str(data.get("name", "") or data.get("official_name", "") or "")}
+        for workspace_id, data in all_resources.items()
+    ]
+
+
+def _print_user_jobs(jobs, *, title: str) -> None:
+    display = get_display()
+    if not jobs:
+        display.print("[dim]暂无符合条件的任务[/dim]")
+        return
+
+    if display.console:
+        from rich import box
+        from rich.table import Table
+        from rich.text import Text
+
+        table = Table(
+            title=title,
+            box=box.SIMPLE,
+            show_header=True,
+            header_style="bold",
+            title_style="bold",
+            expand=False,
+            padding=(0, 1),
+        )
+        table.add_column("View", no_wrap=True)
+        table.add_column("Workspace")
+        table.add_column("Status", justify="center")
+        table.add_column("Created", justify="right")
+        table.add_column("Job ID", style="cyan", no_wrap=True)
+        table.add_column("Name")
+
+        for job in jobs:
+            raw_status = str((job.metadata or {}).get("status_raw", job.status))
+            style, icon, status_name = get_status_display(job.status)
+            status_text = Text(f"{icon} {raw_status or status_name}", style=style)
+            job_view = str((job.metadata or {}).get("job_view", ""))
+            workspace_name = str((job.metadata or {}).get("workspace_name", "") or job.workspace_id)
+            short_job_id = job.job_id[:22] + "..." if len(job.job_id) > 25 else job.job_id
+            table.add_row(
+                "HPC" if job_view == "hpc" else "TRAIN",
+                truncate_string(workspace_name, 18),
+                status_text,
+                format_time_ago(job.created_at),
+                short_job_id,
+                truncate_string(job.name or "-", 42),
+            )
+        display.console.print(table)
+    else:
+        print(title)
+        for job in jobs:
+            job_view = str((job.metadata or {}).get("job_view", ""))
+            workspace_name = str((job.metadata or {}).get("workspace_name", "") or job.workspace_id)
+            raw_status = str((job.metadata or {}).get("status_raw", job.status))
+            print(
+                f"{job_view:<22} {workspace_name:<20} {raw_status:<12} "
+                f"{job.created_at:<20} {job.job_id} {job.name or '-'}"
+            )
+
+
+def cmd_user_jobs(args):
+    """按 created_by 同时查询分布式训练与 HPC 任务。"""
+    display = get_display()
+    api = get_api()
+
+    if not args.created_by:
+        display.print_error("请指定创建者用户 ID: qzcli user-jobs --created-by user-xxx")
+        return 1
+    if args.queued and args.running:
+        display.print_error("--queued 和 --running 不能同时使用")
+        return 1
+
+    try:
+        cookie_data = api.ensure_cookie()
+    except QzAPIError as e:
+        display.print_error(str(e))
+        return 1
+
+    cookie = cookie_data["cookie"]
+    try:
+        workspace_refs = _resolve_user_job_workspace_refs(api, cookie, args.workspace or "")
+    except ResourceResolutionError as e:
+        display.print_error(str(e))
+        display.print("[dim]使用 qzcli catalog --list 查看已缓存的工作空间[/dim]")
+        return 1
+
+    if not workspace_refs:
+        display.print_error("没有可查询的工作空间；请先运行 qzcli catalog -u 或检查 cookie")
+        return 1
+
+    include_train = args.kind in ("all", "train")
+    include_hpc = args.kind in ("all", "hpc")
+
+    if not args.output_json:
+        view_label = {"all": "分布式训练+HPC", "train": "分布式训练", "hpc": "HPC"}[args.kind]
+        display.print(f"[dim]正在查询 {len(workspace_refs)} 个工作空间的 {view_label} 任务...[/dim]")
+
+    result = list_user_jobs(
+        api,
+        cookie,
+        workspace_refs,
+        created_by=args.created_by,
+        include_train=include_train,
+        include_hpc=include_hpc,
+        status=args.status or "",
+        queued_only=args.queued,
+        running_only=args.running,
+        page_size=args.page_size,
+        max_pages=args.max_pages,
+    )
+    jobs = result["jobs"]
+    total_matched = len(jobs)
+    jobs = jobs[:args.limit]
+    counts = summarize_user_jobs(result["jobs"])
+
+    if args.output_json:
+        print(json.dumps({
+            "created_by": args.created_by,
+            "workspace_count": len(workspace_refs),
+            "kind": args.kind,
+            "filters": {
+                "status": args.status or "",
+                "queued": args.queued,
+                "running": args.running,
+                "page_size": args.page_size,
+                "max_pages": args.max_pages,
+            },
+            "raw_totals": result["raw_totals"],
+            "matched": total_matched,
+            "count": len(jobs),
+            **counts,
+            "warnings": result["warnings"],
+            "jobs": [job_summary(job) for job in jobs],
+        }, ensure_ascii=False, indent=2))
+        return 0
+
+    for warning in result["warnings"]:
+        display.print_warning(warning)
+
+    title = f"用户任务 · created_by={args.created_by} (显示 {len(jobs)}/{total_matched})"
+    if args.workspace:
+        title += f" · workspace={args.workspace}"
+    if args.status:
+        title += f" · status={args.status.upper()}"
+    if args.queued:
+        title += " · queued"
+    if args.running:
+        title += " · running"
+    _print_user_jobs(jobs, title=title)
     return 0
 
 
@@ -1039,6 +1358,47 @@ def main():
     list_parser.add_argument("--cookie", "-c", action="store_true", help="使用 cookie 从 API 获取任务（无需本地 store）")
     list_parser.add_argument("--workspace", "-w", help="工作空间（名称或 ID，cookie 模式）")
     list_parser.add_argument("--all-ws", action="store_true", help="查询所有已缓存的工作空间（cookie 模式）")
+
+    # hpc-jobs 命令
+    hpc_jobs_parser = subparsers.add_parser(
+        "hpc-jobs",
+        aliases=["hpc-list"],
+        help="查看 /api/v1/hpc_jobs/list（当前用户 HPC 任务，含排队/运行中）",
+    )
+    hpc_jobs_parser.add_argument("--workspace", "-w", help="工作空间 ID 或名称")
+    hpc_jobs_parser.add_argument("--created-by", help="创建者用户 ID（平台 created_by 过滤）")
+    hpc_jobs_parser.add_argument("--status", "-s", help="按原始状态过滤，如 QUEUEING/RUNNING/SUCCEEDED")
+    hpc_jobs_parser.add_argument("--queued", "-q", action="store_true", help="只显示 QUEUEING 任务")
+    hpc_jobs_parser.add_argument("--running", "-r", action="store_true", help="显示 QUEUEING/RUNNING/PENDING/CREATING")
+    hpc_jobs_parser.add_argument("--page", type=int, default=1, help="页码")
+    hpc_jobs_parser.add_argument("--limit", "-n", type=int, default=20, help="显示数量限制")
+    hpc_jobs_parser.add_argument("--verbose", "-v", action="store_true", help="显示详细信息")
+    hpc_jobs_parser.add_argument("--url", "-u", action="store_true", default=True, help="显示任务链接（默认开启）")
+    hpc_jobs_parser.add_argument("--wide", action="store_true", default=True, help="宽格式显示（默认开启）")
+    hpc_jobs_parser.add_argument("--compact", action="store_true", help="紧凑表格格式（关闭宽格式）")
+    hpc_jobs_parser.add_argument("--json", dest="output_json", action="store_true", help="输出 JSON 格式")
+
+    # user-jobs 命令
+    user_jobs_parser = subparsers.add_parser(
+        "user-jobs",
+        aliases=["user-tasks"],
+        help="按 created_by 同时查询分布式训练和 HPC 任务；不指定 -w 时查询所有可访问工作空间",
+    )
+    user_jobs_parser.add_argument("--created-by", required=True, help="创建者用户 ID（平台 created_by 过滤）")
+    user_jobs_parser.add_argument("--workspace", "-w", help="工作空间 ID 或名称；不指定则查询所有可访问工作空间")
+    user_jobs_parser.add_argument(
+        "--kind",
+        choices=["all", "train", "hpc"],
+        default="all",
+        help="查询任务视图：all=分布式训练+HPC，train=仅 train_job/list，hpc=仅 hpc_jobs/list",
+    )
+    user_jobs_parser.add_argument("--status", "-s", help="按原始状态过滤，如 QUEUEING/RUNNING/CREATING")
+    user_jobs_parser.add_argument("--queued", "-q", action="store_true", help="只显示排队/创建中的任务")
+    user_jobs_parser.add_argument("--running", "-r", action="store_true", help="显示运行中/排队/创建中的任务")
+    user_jobs_parser.add_argument("--limit", "-n", type=int, default=50, help="显示数量限制")
+    user_jobs_parser.add_argument("--page-size", type=int, default=100, help="每页数量（默认 100）")
+    user_jobs_parser.add_argument("--max-pages", type=int, default=5, help="每个工作空间每个接口最多翻页数；0 表示不限制")
+    user_jobs_parser.add_argument("--json", dest="output_json", action="store_true", help="输出 JSON 格式")
     
     # status 命令
     status_parser = subparsers.add_parser("status", aliases=["st"], help="查看任务状态")
@@ -1232,6 +1592,10 @@ def main():
         "init": cmd_init,
         "list": cmd_list,
         "ls": cmd_list,
+        "hpc-jobs": cmd_hpc_jobs,
+        "hpc-list": cmd_hpc_jobs,
+        "user-jobs": cmd_user_jobs,
+        "user-tasks": cmd_user_jobs,
         "status": cmd_status,
         "st": cmd_status,
         "stop": cmd_stop,

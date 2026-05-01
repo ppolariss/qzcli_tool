@@ -79,6 +79,7 @@ class JobRecord:
             aliases = {
                 "RUNNING": "job_running",
                 "PENDING": "job_pending",
+                "CREATING": "job_pending",
                 "QUEUEING": "job_queuing",
                 "QUEUING": "job_queuing",
                 "QUEUED": "job_queuing",

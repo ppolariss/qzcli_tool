@@ -379,6 +379,7 @@ class QzAPI:
         page_num: int = 1,
         page_size: int = 100,
         created_by: Optional[str] = None,
+        status: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         使用 cookie 获取任务列表（内部 API）
@@ -389,6 +390,7 @@ class QzAPI:
             page_num: 页码
             page_size: 每页数量
             created_by: 创建者用户 ID（可选，不传则获取所有）
+            status: 原始状态过滤，例如 job_queuing、job_running
             
         Returns:
             包含 jobs 列表和 total 的字典
@@ -401,11 +403,58 @@ class QzAPI:
         
         if created_by:
             payload["created_by"] = created_by
+        if status:
+            payload["status"] = status
         return self._cookie_request(
             "/api/v1/train_job/list",
             payload,
             cookie=cookie,
             referer=f"https://qz.sii.edu.cn/jobs/distributedTraining?spaceId={workspace_id}",
+        )
+
+    def list_hpc_jobs_with_cookie(
+        self,
+        workspace_id: str,
+        cookie: str,
+        page_num: int = 1,
+        page_size: int = 100,
+        created_by: Optional[str] = None,
+        status: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        使用 cookie 获取 HPC 任务列表（内部 API）。
+
+        这个接口对应平台 HPC 任务页，适合查看当前用户的 HPC 任务历史，
+        包括 QUEUEING/RUNNING 等不一定出现在 task dimension 资源视图里的状态。
+        created_by 与 status 是平台支持的顶层过滤字段。
+
+        Args:
+            workspace_id: 工作空间 ID
+            cookie: 浏览器 cookie 字符串
+            page_num: 页码
+            page_size: 每页数量
+            created_by: 创建者用户 ID（可选）
+            status: 原始状态过滤，例如 QUEUEING、RUNNING、SUCCEEDED
+
+        Returns:
+            包含 jobs 列表和 total 的字典
+        """
+        payload = {
+            "page_num": page_num,
+            "page_size": page_size,
+            "workspace_id": workspace_id,
+        }
+
+        if created_by:
+            payload["created_by"] = created_by
+        if status:
+            payload["status"] = status
+
+        return self._cookie_request(
+            "/api/v1/hpc_jobs/list",
+            payload,
+            cookie=cookie,
+            referer=f"https://qz.sii.edu.cn/jobs/hpc?spaceId={workspace_id}",
         )
     
     def extract_resources_from_jobs(self, jobs: List[Dict[str, Any]]) -> Dict[str, Any]:

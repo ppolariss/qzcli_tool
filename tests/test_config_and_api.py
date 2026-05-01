@@ -146,6 +146,94 @@ def test_list_resource_spec_prices_uses_resource_prices_endpoint(monkeypatch):
     assert captured["timeout"] == 60
 
 
+def test_list_hpc_jobs_with_cookie_uses_hpc_jobs_endpoint(monkeypatch):
+    captured = {}
+
+    def fake_post(url, json, headers, timeout):
+        captured["url"] = url
+        captured["json"] = json
+        captured["headers"] = headers
+        captured["timeout"] = timeout
+        return _FakeResponse(
+            payload={
+                "code": 0,
+                "data": {
+                    "jobs": [{"job_id": "hpc-job-1", "status": "QUEUEING"}],
+                    "total": 1,
+                },
+            }
+        )
+
+    monkeypatch.setattr("requests.post", fake_post)
+
+    api = QzAPI(username="u", password="p")
+    result = api.list_hpc_jobs_with_cookie(
+        "ws-1",
+        "cookie=value",
+        page_num=2,
+        page_size=10,
+        created_by="user-1",
+        status="QUEUEING",
+    )
+
+    assert result == {"jobs": [{"job_id": "hpc-job-1", "status": "QUEUEING"}], "total": 1}
+    assert captured["url"].endswith("/api/v1/hpc_jobs/list")
+    assert captured["json"] == {
+        "page_num": 2,
+        "page_size": 10,
+        "workspace_id": "ws-1",
+        "created_by": "user-1",
+        "status": "QUEUEING",
+    }
+    assert captured["headers"]["cookie"] == "cookie=value"
+    assert captured["headers"]["referer"] == "https://qz.sii.edu.cn/jobs/hpc?spaceId=ws-1"
+    assert captured["timeout"] == 60
+
+
+def test_list_jobs_with_cookie_accepts_status_filter(monkeypatch):
+    captured = {}
+
+    def fake_post(url, json, headers, timeout):
+        captured["url"] = url
+        captured["json"] = json
+        captured["headers"] = headers
+        captured["timeout"] = timeout
+        return _FakeResponse(
+            payload={
+                "code": 0,
+                "data": {
+                    "jobs": [{"job_id": "job-1", "status": "job_queuing"}],
+                    "total": 1,
+                },
+            }
+        )
+
+    monkeypatch.setattr("requests.post", fake_post)
+
+    api = QzAPI(username="u", password="p")
+    result = api.list_jobs_with_cookie(
+        "ws-1",
+        "cookie=value",
+        page_num=2,
+        page_size=10,
+        created_by="user-1",
+        status="job_queuing",
+    )
+
+    assert result == {"jobs": [{"job_id": "job-1", "status": "job_queuing"}], "total": 1}
+    assert captured["url"].endswith("/api/v1/train_job/list")
+    assert captured["json"] == {
+        "page_num": 2,
+        "page_size": 10,
+        "workspace_id": "ws-1",
+        "created_by": "user-1",
+        "status": "job_queuing",
+    }
+    assert captured["headers"]["cookie"] == "cookie=value"
+    assert captured["headers"]["referer"] == "https://qz.sii.edu.cn/jobs/distributedTraining?spaceId=ws-1"
+    assert captured["timeout"] == 60
+
+
 def test_job_detail_routes_hpc_job_ids_to_hpc_endpoint(monkeypatch):
     captured = {}
 

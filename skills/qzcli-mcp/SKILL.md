@@ -19,8 +19,10 @@ description: Use the qzcli MCP tools to query 启智平台 workspaces, resources
 1. 如果还没有认证，先用 `qz_auth_login` 或 `qz_set_cookie`
 2. 如果 workspace / 计算组缓存可能过期，先用 `qz_refresh_resources`
 3. 查询资源推荐时，优先用 `qz_get_availability`
-4. 查询任务时，优先用 `qz_list_jobs` / `qz_get_job_detail`
-5. 如果状态看起来异常或出现未知枚举，调用 `qz_inspect_status_catalog`
+4. 查询普通训练任务时，用 `qz_list_jobs` / `qz_get_job_detail`
+5. 查询 HPC 任务历史、排队任务或用户自己的 CPU/HPC 任务时，用 `qz_list_hpc_jobs`
+6. 查询某个用户的所有任务时，用 `qz_list_user_jobs`，它会逐工作空间同时查 `/api/v1/train_job/list` 和 `/api/v1/hpc_jobs/list`
+7. 如果状态看起来异常或出现未知枚举，调用 `qz_inspect_status_catalog`
 
 ## 状态处理规则
 
@@ -32,7 +34,9 @@ description: Use the qzcli MCP tools to query 启智平台 workspaces, resources
 ## 推荐模式
 
 - 看整体资源：`qz_list_workspaces` -> `qz_refresh_resources` -> `qz_get_availability`
-- 看任务：`qz_list_jobs`，必要时再对单条调用 `qz_get_job_detail`
+- 看训练任务：`qz_list_jobs`，必要时再对单条调用 `qz_get_job_detail`
+- 看 HPC 排队/运行任务：`qz_list_hpc_jobs`，重点看 `status_raw` 和 `created_by_id`
+- 看某个用户所有任务：`qz_list_user_jobs(created_by=..., all_workspaces=true)`，不要只查单一任务视图
 - 排查漂移：`qz_inspect_status_catalog`，重点关注 `unknown_statuses`
 
 ## 输出建议

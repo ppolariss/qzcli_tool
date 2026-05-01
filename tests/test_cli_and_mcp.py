@@ -117,6 +117,301 @@ def test_blame_alias_can_disable_dashboard(monkeypatch):
     assert captured == {"serve": False, "command": "blame"}
 
 
+def test_hpc_jobs_parser_accepts_created_by_and_status(monkeypatch):
+    captured = {}
+
+    def fake_cmd_hpc_jobs(args):
+        captured["workspace"] = args.workspace
+        captured["created_by"] = args.created_by
+        captured["status"] = args.status
+        captured["queued"] = args.queued
+        captured["limit"] = args.limit
+        captured["command"] = args.command
+        return 0
+
+    monkeypatch.setattr(cli, "cmd_hpc_jobs", fake_cmd_hpc_jobs)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "qzcli",
+            "hpc-jobs",
+            "-w",
+            "CPU资源空间",
+            "--created-by",
+            "user-1",
+            "-s",
+            "QUEUEING",
+            "-n",
+            "50",
+        ],
+    )
+
+    assert cli.main() == 0
+    assert captured == {
+        "workspace": "CPU资源空间",
+        "created_by": "user-1",
+        "status": "QUEUEING",
+        "queued": False,
+        "limit": 50,
+        "command": "hpc-jobs",
+    }
+
+
+def test_user_jobs_parser_accepts_created_by_and_filters(monkeypatch):
+    captured = {}
+
+    def fake_cmd_user_jobs(args):
+        captured["created_by"] = args.created_by
+        captured["workspace"] = args.workspace
+        captured["kind"] = args.kind
+        captured["queued"] = args.queued
+        captured["limit"] = args.limit
+        captured["command"] = args.command
+        return 0
+
+    monkeypatch.setattr(cli, "cmd_user_jobs", fake_cmd_user_jobs)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "qzcli",
+            "user-jobs",
+            "--created-by",
+            "user-1",
+            "--workspace",
+            "CPU资源空间",
+            "--kind",
+            "all",
+            "--queued",
+            "-n",
+            "100",
+        ],
+    )
+
+    assert cli.main() == 0
+    assert captured == {
+        "created_by": "user-1",
+        "workspace": "CPU资源空间",
+        "kind": "all",
+        "queued": True,
+        "limit": 100,
+        "command": "user-jobs",
+    }
+
+
+def test_mcp_list_hpc_jobs_uses_hpc_api(monkeypatch):
+    calls = []
+
+    class _FakeAPI:
+        def list_hpc_jobs_with_cookie(
+            self,
+            workspace_id,
+            cookie,
+            page_size=100,
+            created_by=None,
+            status=None,
+            **kwargs,
+        ):
+            calls.append(
+                {
+                    "workspace_id": workspace_id,
+                    "cookie": cookie,
+                    "page_size": page_size,
+                    "created_by": created_by,
+                    "status": status,
+                }
+            )
+            return {
+                "total": 1,
+                "jobs": [
+                    {
+                        "job_id": "hpc-job-1",
+                        "job_name": "hpc-test",
+                        "status": "QUEUEING",
+                        "workspace_id": workspace_id,
+                        "created_by": {"id": "user-1", "name": "张三"},
+                    }
+                ],
+            }
+
+    monkeypatch.setattr(mcp_server, "_require_cookie", lambda: ("cookie=value", {}))
+    monkeypatch.setattr(
+        mcp_server,
+        "_resolve_workspace_refs",
+        lambda workspace, all_workspaces=False: [{"id": "ws-1", "name": "CPU资源空间"}],
+    )
+    monkeypatch.setattr(mcp_server, "get_api", lambda: _FakeAPI())
+
+    result = mcp_server.qz_list_hpc_jobs(
+        workspace="CPU资源空间",
+        created_by="user-1",
+        status="QUEUEING",
+        limit=10,
+    )
+
+    assert calls == [
+        {
+            "workspace_id": "ws-1",
+            "cookie": "cookie=value",
+            "page_size": 10,
+            "created_by": "user-1",
+            "status": "QUEUEING",
+        }
+    ]
+    assert result["ok"] is True
+    assert result["data"]["endpoint"] == "/api/v1/hpc_jobs/list"
+    assert result["data"]["raw_total"] == 1
+    assert result["data"]["jobs"][0]["created_by_id"] == "user-1"
+    assert result["data"]["jobs"][0]["status_raw"] == "QUEUEING"
+    assert result["data"]["jobs"][0]["status_family"] == "waiting"
+
+
+def test_mcp_list_user_jobs_queries_train_and_hpc(monkeypatch):
+    calls = []
+
+    class _FakeAPI:
+        def list_jobs_with_cookie(
+            self,
+            workspace_id,
+            cookie,
+            page_num=1,
+            page_size=100,
+            created_by=None,
+            status=None,
+        ):
+            calls.append(
+                {
+                    "endpoint": "train",
+                    "workspace_id": workspace_id,
+                    "cookie": cookie,
+                    "page_num": page_num,
+                    "page_size": page_size,
+                    "created_by": created_by,
+                    "status": status,
+                }
+            )
+            if status != "job_queuing":
+                return {"total": 0, "jobs": []}
+            return {
+                "total": 1,
+                "jobs": [
+                    {
+                        "job_id": "job-1",
+                        "job_name": "train-test",
+                        "status": "QUEUEING",
+                        "workspace_id": workspace_id,
+                        "created_by": {"id": "user-1", "name": "张三"},
+                    }
+                ],
+            }
+
+        def list_hpc_jobs_with_cookie(
+            self,
+            workspace_id,
+            cookie,
+            page_num=1,
+            page_size=100,
+            created_by=None,
+            status=None,
+        ):
+            calls.append(
+                {
+                    "endpoint": "hpc",
+                    "workspace_id": workspace_id,
+                    "cookie": cookie,
+                    "page_num": page_num,
+                    "page_size": page_size,
+                    "created_by": created_by,
+                    "status": status,
+                }
+            )
+            if status == "QUEUEING":
+                return {
+                    "total": 1,
+                    "jobs": [
+                        {
+                            "job_id": "hpc-job-1",
+                            "job_name": "hpc-test",
+                            "status": "QUEUEING",
+                            "workspace_id": workspace_id,
+                            "created_by": {"id": "user-1", "name": "张三"},
+                        }
+                    ],
+                }
+            return {"total": 0, "jobs": []}
+
+    monkeypatch.setattr(mcp_server, "_require_cookie", lambda: ("cookie=value", {}))
+    monkeypatch.setattr(
+        mcp_server,
+        "_resolve_workspace_refs",
+        lambda workspace, all_workspaces=False: [{"id": "ws-1", "name": "CPU资源空间"}],
+    )
+    monkeypatch.setattr(mcp_server, "get_api", lambda: _FakeAPI())
+
+    result = mcp_server.qz_list_user_jobs(
+        created_by="user-1",
+        all_workspaces=True,
+        queued_only=True,
+        limit=10,
+    )
+
+    assert calls == [
+        {
+            "endpoint": "train",
+            "workspace_id": "ws-1",
+            "cookie": "cookie=value",
+            "page_num": 1,
+            "page_size": 100,
+            "created_by": "user-1",
+            "status": "job_queuing",
+        },
+        {
+            "endpoint": "train",
+            "workspace_id": "ws-1",
+            "cookie": "cookie=value",
+            "page_num": 1,
+            "page_size": 100,
+            "created_by": "user-1",
+            "status": "job_pending",
+        },
+        {
+            "endpoint": "train",
+            "workspace_id": "ws-1",
+            "cookie": "cookie=value",
+            "page_num": 1,
+            "page_size": 100,
+            "created_by": "user-1",
+            "status": "CREATING",
+        },
+        {
+            "endpoint": "hpc",
+            "workspace_id": "ws-1",
+            "cookie": "cookie=value",
+            "page_num": 1,
+            "page_size": 100,
+            "created_by": "user-1",
+            "status": "QUEUEING",
+        },
+        {
+            "endpoint": "hpc",
+            "workspace_id": "ws-1",
+            "cookie": "cookie=value",
+            "page_num": 1,
+            "page_size": 100,
+            "created_by": "user-1",
+            "status": "CREATING",
+        },
+    ]
+    assert result["ok"] is True
+    assert result["data"]["matched"] == 2
+    assert result["data"]["view_counts"] == {"distributed_training": 1, "hpc": 1}
+    assert {job["endpoint"] for job in result["data"]["jobs"]} == {
+        "/api/v1/train_job/list",
+        "/api/v1/hpc_jobs/list",
+    }
+
+
 def test_pick_workspace_prefers_distributed_training_space_without_cookie():
     workspace_id, workspace_name = task_dimensions._pick_workspace(
         requested_workspace="",
