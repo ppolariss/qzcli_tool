@@ -137,6 +137,36 @@ class Display:
         else:
             print(f"✓ {message}")
     
+    def print_logs(self, entries: List[Dict[str, Any]], raw: bool = False, json_mode: bool = False):
+        """打印 v2 GetJobLog 返回的条目列表。
+
+        - json_mode: 每条 dump 一行 JSON
+        - raw:      只打 message
+        - 默认:     ``[time worker-N] message``，pod_name 取末段并染色
+        """
+        if json_mode:
+            import json as _json
+            for e in entries:
+                print(_json.dumps(e, ensure_ascii=False))
+            return
+
+        for e in entries:
+            msg = e.get("message", "")
+            if raw:
+                print(msg)
+                continue
+            t = e.get("timestamp_str") or e.get("time", "")
+            pod = e.get("pod_name", "")
+            short_pod = pod.rsplit("-", 1)[-1] if pod else "?"
+            if self.console:
+                self.console.print(
+                    f"[dim]{t}[/dim] [cyan]{short_pod}[/cyan] {msg}",
+                    highlight=False,
+                    soft_wrap=True,
+                )
+            else:
+                print(f"{t} {short_pod} {msg}")
+
     def print_warning(self, message: str):
         """打印警告"""
         if self.console:

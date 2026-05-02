@@ -7,14 +7,29 @@ from typing import Any, Dict, List, Optional
 
 import requests
 
+from . import __version__
 from .config import (
     clear_token_cache,
     get_api_base_url,
     get_credentials,
+    get_cookie,
     get_token_cache,
     save_token_cache,
 )
 from .crypto import encrypt_password
+
+
+# /api/v2/* requires this header — without it APISIX gateway redirects to
+# Keycloak login (returning HTML) even when the Bearer token is valid.
+V2_CLIENT_SOURCE = f"qzcli/{__version__}"
+
+# Match the browser-style headers that /api/v1/ cookie endpoints use. The
+# platform's /api/v2/ surface piggybacks on the same CAS session cookie that
+# `qzcli login` saves.
+V2_BROWSER_UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"
+)
 
 
 class QzAPIError(Exception):
@@ -127,10 +142,135 @@ class QzAPI:
 
         return result
 
+    def _request_v2(
+        self,
+        service: str,
+        action: str,
+        body: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """POST 到 /api/v2/{service}?Action={action}。
+
+        与 /openapi/v1 不同：
+          - 响应不带 {code:0, data:...} 信封，直接返回业务字段
+          - APISIX 网关要求 ``x-inspire-client-source`` 头，否则 302 到 Keycloak
+          - 认证走 cookie（同 /api/v1/）：Bearer 在这条路径下不被接受
+        """
+        cookie_data = get_cookie()
+        cookie = cookie_data.get("cookie") if cookie_data else None
+        if not cookie:
+            raise QzAPIError(
+                "v2 API 需要 cookie 认证，但本地没有有效 cookie。"
+                "请先运行 `qzcli login -u <学工号> -p <密码>` 获取 CAS 会话。"
+            )
+
+        url = f"{self.base_url}/api/v2/{service}"
+        headers = {
+            "accept": "application/json, text/plain, */*",
+            "content-type": "application/json",
+            "cookie": cookie,
+            "origin": self.base_url,
+            "referer": f"{self.base_url}/jobs",
+            "user-agent": V2_BROWSER_UA,
+            "x-inspire-client-source": V2_CLIENT_SOURCE,
+        }
+        response = requests.post(
+            url,
+            params={"Action": action},
+            json=body,
+            headers=headers,
+            timeout=60,
+        )
+
+        if response.status_code == 401:
+            raise QzAPIError(
+                "Cookie 已过期或无效，请运行 `qzcli login` 重新获取",
+                401,
+            )
+
+        ctype = response.headers.get("Content-Type", "")
+        if "application/json" not in ctype:
+            snippet = response.text[:200].replace("\n", " ")
+            raise QzAPIError(
+                f"v2 API 返回非 JSON（{response.status_code}, content-type={ctype}）。"
+                f"通常表示认证失败、APISIX 网关拒绝、或当前 cookie 无该工作空间权限。"
+                f"试试 `qzcli login`。响应片段: {snippet}",
+                response.status_code,
+            )
+
+        try:
+            result = response.json()
+        except ValueError as e:
+            raise QzAPIError(f"v2 API 响应不是合法 JSON: {e}", response.status_code)
+
+        if response.status_code >= 400:
+            raise QzAPIError(
+                f"v2 API 请求失败 ({response.status_code}): {result}",
+                response.status_code,
+            )
+        return result
     def get_job_detail(self, job_id: str) -> Dict[str, Any]:
         """查询任务详情"""
         result = self._request("/openapi/v1/train_job/detail", {"job_id": job_id})
         return result.get("data", {})
+
+    def _resolve_pod_names(self, job_id: str, n_instances: Optional[int] = None) -> List[str]:
+        """推断 job 的所有 worker pod 名。
+
+        平台规则：pod 命名为 ``{job_id}-worker-{i}`` for i in 0..n-1。
+        n_instances 没显式给时从 detail 反推（兼容多种字段位置）。
+        """
+        if n_instances is None:
+            try:
+                d = self.get_job_detail(job_id)
+                fc = d.get("framework_config")
+                if isinstance(fc, list) and fc and isinstance(fc[0], dict):
+                    n_instances = fc[0].get("instance_count")
+                if not n_instances:
+                    n_instances = (
+                        d.get("instance_count")
+                        or d.get("instances")
+                        or d.get("replica_count")
+                    )
+            except Exception:
+                n_instances = None
+        if not n_instances or n_instances < 1:
+            n_instances = 1
+        return [f"{job_id}-worker-{i}" for i in range(n_instances)]
+
+    def get_job_logs(
+        self,
+        job_id: str,
+        page_size: int = 200,
+        pod_names: Optional[List[str]] = None,
+        start_timestamp_ms: Optional[str] = None,
+        end_timestamp_ms: Optional[str] = None,
+        sort: str = "ascend",
+    ) -> Dict[str, Any]:
+        """拉取 train job 的容器日志（v2 接口）。
+
+        Returns: ``{"logs": [<entry>, ...], "total": int}``。每条 entry 含
+        ``log_id, message, node, pod_name, time, timestamp_ms, timestamp_str``。
+        """
+        if pod_names is None:
+            pod_names = self._resolve_pod_names(job_id)
+
+        body: Dict[str, Any] = {
+            "page_size": page_size,
+            "filter": {"podNames": pod_names},
+            "sorter": [
+                {"field": "time", "sort": sort},
+                {"field": "log-id.keyword", "sort": sort},
+            ],
+        }
+        if start_timestamp_ms is not None:
+            body["filter"]["start_timestamp_ms"] = str(start_timestamp_ms)
+        if end_timestamp_ms is not None:
+            body["filter"]["end_timestamp_ms"] = str(end_timestamp_ms)
+
+        result = self._request_v2("train", "GetJobLog", body)
+        if isinstance(result.get("Result"), dict):
+            result = result["Result"]
+        return result
 
     def get_jobs_detail(
         self, job_ids: List[str], max_workers: int = 5

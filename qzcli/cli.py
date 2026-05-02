@@ -551,6 +551,99 @@ def cmd_stop(args):
         return 1
 
 
+def _parse_since(s: Optional[str]) -> Optional[str]:
+    """``--since`` 解析。
+
+    支持:
+      - 相对值: ``5m`` / ``2h`` / ``30s`` / ``1d``
+      - ISO 时间(带或不带毫秒): ``2026-05-02T19:22:00`` 等
+    返回 ms 整数字符串(平台 v2 API 要求字符串形式),失败返回 None。
+    """
+    if not s:
+        return None
+    import re
+    import time as _time
+    m = re.fullmatch(r"\s*(\d+)\s*([smhd])\s*", s)
+    if m:
+        n = int(m.group(1))
+        unit = {"s": 1, "m": 60, "h": 3600, "d": 86400}[m.group(2)]
+        return str(int((_time.time() - n * unit) * 1000))
+    try:
+        from datetime import datetime
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        return str(int(dt.timestamp() * 1000))
+    except Exception:
+        return None
+
+
+def cmd_logs(args):
+    """拉取任务日志(v2 GetJobLog)"""
+    display = get_display()
+    api = get_api()
+
+    job_id = args.job_id
+    pod_names = [args.pod] if getattr(args, "pod", None) else None
+    start_ms = _parse_since(getattr(args, "since", None))
+
+    page_size = max(args.tail, 1)
+
+    def _fetch(start: Optional[str], sort: str = "ascend"):
+        return api.get_job_logs(
+            job_id,
+            page_size=page_size,
+            pod_names=pod_names,
+            start_timestamp_ms=start,
+            sort=sort,
+        )
+
+    try:
+        first = _fetch(start_ms, sort="descend")
+    except QzAPIError as e:
+        display.print_error(f"拉取日志失败: {e}")
+        return 1
+
+    entries: List[dict] = sorted(
+        first.get("logs", []),
+        key=lambda e: (int(e.get("timestamp_ms") or 0), e.get("log_id") or ""),
+    )
+    # 初次请求按 descend 拿最近 tail 条；终端仍按时间升序打印。
+    entries = entries[-args.tail:]
+    display.print_logs(entries, raw=args.raw, json_mode=args.output_json)
+
+    if not args.follow:
+        return 0
+
+    seen = {e.get("log_id") for e in entries if e.get("log_id")}
+    last_ms = max(
+        (int(e.get("timestamp_ms") or 0) for e in entries),
+        default=int(start_ms or 0),
+    )
+
+    try:
+        while True:
+            time.sleep(max(args.interval, 0.5))
+            try:
+                batch = _fetch(str(last_ms + 1) if last_ms else None)
+            except QzAPIError as e:
+                display.print_error(f"轮询失败: {e}")
+                return 1
+            new = []
+            for e in batch.get("logs", []):
+                lid = e.get("log_id")
+                if lid and lid in seen:
+                    continue
+                if lid:
+                    seen.add(lid)
+                new.append(e)
+                ts = int(e.get("timestamp_ms") or 0)
+                if ts > last_ms:
+                    last_ms = ts
+            if new:
+                display.print_logs(new, raw=args.raw, json_mode=args.output_json)
+    except KeyboardInterrupt:
+        return 0
+
+
 def cmd_watch(args):
     """实时监控任务状态"""
     display = get_display()
@@ -6296,6 +6389,17 @@ def main():
     stop_parser.add_argument("job_id", help="任务 ID")
     stop_parser.add_argument("--yes", "-y", action="store_true", help="跳过确认")
 
+    # logs 命令 (v2 GetJobLog)
+    logs_parser = subparsers.add_parser("logs", help="查看任务日志（v2 接口，直连 pod）")
+    logs_parser.add_argument("job_id", help="任务 ID")
+    logs_parser.add_argument("--tail", "-n", type=int, default=200, help="最近 N 条(默认 200)")
+    logs_parser.add_argument("--follow", "-f", action="store_true", help="持续轮询新日志(类似 tail -f)")
+    logs_parser.add_argument("--interval", type=float, default=3.0, help="--follow 轮询间隔秒(默认 3)")
+    logs_parser.add_argument("--pod", help="只看指定 pod(默认所有 instance: <job-id>-worker-0..N)")
+    logs_parser.add_argument("--since", help="只取此时间后日志: ISO 时间或相对值如 5m/1h/30s/1d")
+    logs_parser.add_argument("--raw", action="store_true", help="只打 message,不带时间/pod 前缀")
+    logs_parser.add_argument("--json", dest="output_json", action="store_true", help="原始 JSON 输出")
+
     # watch 命令
     watch_parser = subparsers.add_parser("watch", aliases=["w"], help="实时监控")
     watch_parser.add_argument(
@@ -6595,6 +6699,7 @@ def main():
         "status": cmd_status,
         "st": cmd_status,
         "stop": cmd_stop,
+        "logs": cmd_logs,
         "watch": cmd_watch,
         "w": cmd_watch,
         "track": cmd_track,
