@@ -77,13 +77,12 @@ class ResolvePodNamesTests(unittest.TestCase):
 
 
 class RequestV2HeadersTests(unittest.TestCase):
-    """Verify body shape + that the mandatory APISIX header is sent."""
+    """Verify body shape + that cookie auth + APISIX header are sent."""
 
     def setUp(self):
         with patch("qzcli.api.get_api_base_url", return_value="https://qz.test"), \
              patch("qzcli.api.get_credentials", return_value=("u", "p")):
             self.api = QzAPI("u", "p")
-            self.api._token = "tok"
 
     def test_post_body_and_headers(self):
         fake_resp = MagicMock()
@@ -91,7 +90,8 @@ class RequestV2HeadersTests(unittest.TestCase):
         fake_resp.headers = {"Content-Type": "application/json"}
         fake_resp.json.return_value = {"logs": [], "total": 0}
 
-        with patch("qzcli.api.requests.post", return_value=fake_resp) as post:
+        with patch("qzcli.api.get_cookie", return_value={"cookie": "SESSION=abc"}), \
+             patch("qzcli.api.requests.post", return_value=fake_resp) as post:
             self.api.get_job_logs(
                 "job-abc",
                 pod_names=["job-abc-worker-0"],
@@ -101,7 +101,8 @@ class RequestV2HeadersTests(unittest.TestCase):
             kwargs = post.call_args.kwargs
             self.assertEqual(kwargs["params"], {"Action": "GetJobLog"})
             self.assertEqual(kwargs["headers"]["x-inspire-client-source"], V2_CLIENT_SOURCE)
-            self.assertEqual(kwargs["headers"]["Authorization"], "Bearer tok")
+            self.assertEqual(kwargs["headers"]["cookie"], "SESSION=abc")
+            self.assertNotIn("Authorization", kwargs["headers"])
             body = kwargs["json"]
             self.assertEqual(body["filter"]["podNames"], ["job-abc-worker-0"])
             self.assertEqual(body["filter"]["start_timestamp_ms"], "111")
@@ -109,26 +110,34 @@ class RequestV2HeadersTests(unittest.TestCase):
             # ascend so terminal output reads chronologically
             self.assertEqual(body["sorter"][0]["sort"], "ascend")
 
+    def test_missing_cookie_raises_with_login_hint(self):
+        from qzcli.api import QzAPIError
+        with patch("qzcli.api.get_cookie", return_value=None):
+            with self.assertRaises(QzAPIError) as ctx:
+                self.api._request_v2("train", "GetJobLog", {})
+            self.assertIn("qzcli login", str(ctx.exception))
+
     def test_html_response_raises_with_hint(self):
         from qzcli.api import QzAPIError
         fake_resp = MagicMock()
         fake_resp.status_code = 200
         fake_resp.headers = {"Content-Type": "text/html"}
         fake_resp.text = "<html>keycloak login</html>"
-        with patch("qzcli.api.requests.post", return_value=fake_resp):
+        with patch("qzcli.api.get_cookie", return_value={"cookie": "x"}), \
+             patch("qzcli.api.requests.post", return_value=fake_resp):
             with self.assertRaises(QzAPIError) as ctx:
                 self.api._request_v2("train", "GetJobLog", {})
             self.assertIn("非 JSON", str(ctx.exception))
 
-    def test_401_retries_once_then_raises(self):
+    def test_401_raises_cookie_expired(self):
         from qzcli.api import QzAPIError
         unauthorized = MagicMock(status_code=401, headers={"Content-Type": "application/json"})
         unauthorized.json.return_value = {"error": "unauthorized"}
-        with patch("qzcli.api.requests.post", return_value=unauthorized), \
-             patch.object(self.api, "_get_token", return_value="tok2"), \
-             patch("qzcli.api.clear_token_cache"):
-            with self.assertRaises(QzAPIError):
+        with patch("qzcli.api.get_cookie", return_value={"cookie": "x"}), \
+             patch("qzcli.api.requests.post", return_value=unauthorized):
+            with self.assertRaises(QzAPIError) as ctx:
                 self.api._request_v2("train", "GetJobLog", {})
+            self.assertIn("Cookie 已过期", str(ctx.exception))
 
 
 class CmdLogsTailTests(unittest.TestCase):

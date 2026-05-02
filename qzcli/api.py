@@ -31,7 +31,6 @@ V2_BROWSER_UA = (
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"
 )
 
-
 class QzAPIError(Exception):
     """API 错误"""
 
@@ -154,6 +153,7 @@ class QzAPI:
           - 响应不带 {code:0, data:...} 信封，直接返回业务字段
           - APISIX 网关要求 ``x-inspire-client-source`` 头，否则 302 到 Keycloak
           - 认证走 cookie（同 /api/v1/）：Bearer 在这条路径下不被接受
+        缺 cookie 时给出明确的 ``qzcli login`` 提示。
         """
         cookie_data = get_cookie()
         cookie = cookie_data.get("cookie") if cookie_data else None
