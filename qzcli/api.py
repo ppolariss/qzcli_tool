@@ -1,21 +1,32 @@
-"""
-启智平台 API 客户端
-"""
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from functools import lru_cache
+import json as _json
+from typing import Any, Dict, List, Optional
+from urllib.parse import urlencode
 
 import requests
-from typing import Optional, Dict, Any, List
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
+from . import __version__
 from .config import (
+    clear_token_cache,
     get_api_base_url,
     get_cookie,
     get_credentials,
+    get_proxy,
     get_token_cache,
     save_cookie,
     save_token_cache,
-    clear_token_cache,
 )
 from .crypto import encrypt_password
+
+
+# /api/v2/* requires this APISIX header; without it the gateway can return an
+# HTML login page even when the CAS cookie is otherwise valid.
+V2_CLIENT_SOURCE = f"qzcli/{__version__}"
+V2_BROWSER_UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"
+)
 
 
 class QzAPIError(Exception):
@@ -23,6 +34,87 @@ class QzAPIError(Exception):
     def __init__(self, message: str, code: Optional[int] = None):
         super().__init__(message)
         self.code = code
+
+
+@lru_cache(maxsize=8)
+def _get_pool_manager(proxy: str):
+    """Return a cached urllib3 manager for the configured proxy URL."""
+    import urllib3
+
+    if not proxy:
+        return urllib3.PoolManager()
+
+    normalized = proxy.rstrip("/") + "/"
+    if normalized.lower().startswith(
+        ("socks4://", "socks4a://", "socks5://", "socks5h://")
+    ):
+        try:
+            from urllib3.contrib.socks import SOCKSProxyManager
+        except ImportError as exc:
+            raise QzAPIError(
+                "当前代理配置需要 SOCKS 支持，请安装 PySocks 或 urllib3[socks]",
+            ) from exc
+        return SOCKSProxyManager(normalized)
+
+    if normalized.lower().startswith(("http://", "https://")):
+        return urllib3.ProxyManager(normalized)
+
+    raise QzAPIError(f"不支持的代理地址: {proxy}")
+
+
+class _CurlResponse:
+    """Minimal response object mimicking requests.Response."""
+
+    def __init__(
+        self,
+        status_code: int,
+        text: str,
+        url: str = "",
+        headers: Optional[Dict[str, str]] = None,
+    ):
+        self.status_code = status_code
+        self.text = text
+        self.url = url
+        self.headers = headers or {}
+
+    def json(self):
+        return _json.loads(self.text)
+
+
+def _curl_post(
+    url: str,
+    *,
+    json: Any = None,
+    headers: Optional[Dict[str, str]] = None,
+    params: Optional[Dict[str, Any]] = None,
+    timeout: int = 60,
+    **_kw,
+) -> _CurlResponse:
+    """Drop-in replacement for requests.post with explicit proxy handling."""
+    if params:
+        separator = "&" if "?" in url else "?"
+        url = f"{url}{separator}{urlencode(params)}"
+
+    pm = _get_pool_manager((get_proxy() or "").strip())
+    body = _json.dumps(json).encode("utf-8") if json is not None else None
+    hdrs = dict(headers) if headers else {}
+    header_names = {name.lower() for name in hdrs}
+    if json is not None and "content-type" not in header_names:
+        hdrs["Content-Type"] = "application/json"
+    resp = pm.request(
+        "POST",
+        url,
+        body=body,
+        headers=hdrs,
+        timeout=float(timeout),
+        redirect=False,
+    )
+    return _CurlResponse(
+        status_code=resp.status,
+        text=resp.data.decode("utf-8", errors="replace"),
+        url=url,
+        headers=dict(resp.headers),
+    )
 
 
 class QzAPI:
@@ -103,8 +195,13 @@ class QzAPI:
         if response.status_code != 200:
             raise QzAPIError(f"请求失败: HTTP {response.status_code}", response.status_code)
 
+    def _post(self, url: str, **kwargs) -> _CurlResponse:
+        return _curl_post(url, **kwargs)
+
     def _post_json(self, url: str, payload: Dict[str, Any], headers: Dict[str, str], timeout: int) -> requests.Response:
         try:
+            if (get_proxy() or "").strip():
+                return _curl_post(url, json=payload, headers=headers, timeout=timeout)  # type: ignore[return-value]
             return requests.post(
                 url,
                 json=payload,
@@ -218,6 +315,67 @@ class QzAPI:
             )
         
         return result
+
+    def _request_v2(
+        self,
+        service: str,
+        action: str,
+        body: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """POST 到 /api/v2/{service}?Action={action}，使用 CAS cookie 认证。"""
+        cookie_data = get_cookie()
+        cookie = cookie_data.get("cookie") if cookie_data else None
+        if not cookie:
+            raise QzAPIError(
+                "v2 API 需要 cookie 认证，但本地没有有效 cookie。"
+                "请先运行 `qzcli login -u <学工号> -p <密码>` 获取 CAS 会话。"
+            )
+
+        url = f"{self.base_url}/api/v2/{service}"
+        headers = {
+            "accept": "application/json, text/plain, */*",
+            "content-type": "application/json",
+            "cookie": cookie,
+            "origin": self.base_url,
+            "referer": f"{self.base_url}/jobs",
+            "user-agent": V2_BROWSER_UA,
+            "x-inspire-client-source": V2_CLIENT_SOURCE,
+        }
+        response = _curl_post(
+            url,
+            params={"Action": action},
+            json=body,
+            headers=headers,
+            timeout=60,
+        )
+
+        if response.status_code == 401:
+            raise QzAPIError(
+                "Cookie 已过期或无效，请运行 `qzcli login` 重新获取",
+                401,
+            )
+
+        ctype = response.headers.get("Content-Type", "")
+        if "application/json" not in ctype:
+            snippet = response.text[:200].replace("\n", " ")
+            raise QzAPIError(
+                f"v2 API 返回非 JSON（{response.status_code}, content-type={ctype}）。"
+                "通常表示认证失败、APISIX 网关拒绝、或当前 cookie 无该工作空间权限。"
+                f"试试 `qzcli login`。响应片段: {snippet}",
+                response.status_code,
+            )
+
+        try:
+            result = response.json()
+        except ValueError as e:
+            raise QzAPIError(f"v2 API 响应不是合法 JSON: {e}", response.status_code)
+
+        if response.status_code >= 400:
+            raise QzAPIError(
+                f"v2 API 请求失败 ({response.status_code}): {result}",
+                response.status_code,
+            )
+        return result
     
     @staticmethod
     def is_hpc_job_id(job_id: str) -> bool:
@@ -239,6 +397,61 @@ class QzAPI:
         if self.is_hpc_job_id(job_id):
             return self.get_hpc_job_detail(job_id)
         return self.get_train_job_detail(job_id)
+
+    def _resolve_pod_names(self, job_id: str, n_instances: Optional[int] = None) -> List[str]:
+        """推断 job 的 worker pod 名。"""
+        if n_instances is None:
+            try:
+                detail = self.get_job_detail(job_id)
+                framework_config = detail.get("framework_config")
+                if (
+                    isinstance(framework_config, list)
+                    and framework_config
+                    and isinstance(framework_config[0], dict)
+                ):
+                    n_instances = framework_config[0].get("instance_count")
+                if not n_instances:
+                    n_instances = (
+                        detail.get("instance_count")
+                        or detail.get("instances")
+                        or detail.get("replica_count")
+                    )
+            except Exception:
+                n_instances = None
+        if not n_instances or n_instances < 1:
+            n_instances = 1
+        return [f"{job_id}-worker-{i}" for i in range(n_instances)]
+
+    def get_job_logs(
+        self,
+        job_id: str,
+        page_size: int = 200,
+        pod_names: Optional[List[str]] = None,
+        start_timestamp_ms: Optional[str] = None,
+        end_timestamp_ms: Optional[str] = None,
+        sort: str = "ascend",
+    ) -> Dict[str, Any]:
+        """拉取 train job 的容器日志（v2 GetJobLog）。"""
+        if pod_names is None:
+            pod_names = self._resolve_pod_names(job_id)
+
+        body: Dict[str, Any] = {
+            "page_size": page_size,
+            "filter": {"podNames": pod_names},
+            "sorter": [
+                {"field": "time", "sort": sort},
+                {"field": "log-id.keyword", "sort": sort},
+            ],
+        }
+        if start_timestamp_ms is not None:
+            body["filter"]["start_timestamp_ms"] = str(start_timestamp_ms)
+        if end_timestamp_ms is not None:
+            body["filter"]["end_timestamp_ms"] = str(end_timestamp_ms)
+
+        result = self._request_v2("train", "GetJobLog", body)
+        if isinstance(result.get("Result"), dict):
+            result = result["Result"]
+        return result
     
     def get_jobs_detail(self, job_ids: List[str], max_workers: int = 5) -> Dict[str, Dict[str, Any]]:
         """批量查询任务详情（并发）"""
@@ -315,10 +528,93 @@ class QzAPI:
         result = self._request("/openapi/v1/train_job/create", config)
         return result.get("data", result)
 
-    def create_hpc_job(self, config: Dict[str, Any]) -> Dict[str, Any]:
-        """创建 HPC 任务"""
-        result = self._request("/openapi/v1/hpc_jobs/create", config)
-        return result.get("data", result)
+    def create_job_with_cookie(self, cookie: str, config: Dict[str, Any]) -> Dict[str, Any]:
+        """使用 cookie 创建分布式训练任务（内部 API）。"""
+        workspace_id = config.get("workspace_id", "")
+        data = self._cookie_request(
+            "/api/v1/train_job/create",
+            config,
+            cookie=cookie,
+            referer=f"https://qz.sii.edu.cn/jobs/distributedTraining?spaceId={workspace_id}",
+        )
+        return data
+
+    def create_hpc_job(self, *args, **kwargs) -> Dict[str, Any]:
+        """创建 HPC 任务。
+
+        兼容两种调用方式：
+        - ``create_hpc_job(config_dict)``：本地 fork 的 OpenAPI payload。
+        - ``create_hpc_job(cookie=..., job_name=..., ...)``：上游内部 cookie API。
+        """
+        if args and isinstance(args[0], dict) and not kwargs:
+            result = self._request("/openapi/v1/hpc_jobs/create", args[0])
+            return result.get("data", result)
+        if "config" in kwargs and isinstance(kwargs["config"], dict):
+            result = self._request("/openapi/v1/hpc_jobs/create", kwargs["config"])
+            return result.get("data", result)
+
+        cookie = kwargs.get("cookie") or (args[0] if args else "")
+        if not cookie:
+            raise QzAPIError("创建 HPC 任务需要 cookie")
+
+        job_name = kwargs["job_name"]
+        workspace_id = kwargs["workspace_id"]
+        project_id = kwargs["project_id"]
+        logic_compute_group_id = kwargs["logic_compute_group_id"]
+        entrypoint = kwargs["entrypoint"]
+        image = kwargs["image"]
+        predef_quota_id = kwargs["predef_quota_id"]
+        cpu = int(kwargs["cpu"])
+        mem_gi = int(kwargs["mem_gi"])
+        instances = int(kwargs.get("instances", 1))
+        cpus_per_task = int(kwargs.get("cpus_per_task", 1))
+        memory_per_cpu = kwargs.get("memory_per_cpu", "5G")
+        image_type = kwargs.get("image_type", "SOURCE_PRIVATE")
+        max_running_time_days = int(kwargs.get("max_running_time_days", 0))
+        max_running_time_hours = int(kwargs.get("max_running_time_hours", 0))
+        max_running_time_minutes = int(kwargs.get("max_running_time_minutes", 0))
+
+        payload = {
+            "job_name": job_name,
+            "workspace_id": workspace_id,
+            "project_id": project_id,
+            "logic_compute_group_id": logic_compute_group_id,
+            "enable_notification": False,
+            "dataset_info": [],
+            "sbatch_script": {
+                "number_of_tasks": instances,
+                "cpus_per_task": cpus_per_task,
+                "memory_per_cpu": memory_per_cpu,
+                "enable_hyper_threading": False,
+                "max_running_time_days": max_running_time_days,
+                "max_running_time_hours": max_running_time_hours,
+                "max_running_time_minutes": max_running_time_minutes,
+                "entrypoint": entrypoint,
+            },
+            "slurm_cluster_spec": {
+                "predef_quota_id": predef_quota_id,
+                "cpu": cpu,
+                "mem_gi": mem_gi,
+                "image": image,
+                "image_type": image_type,
+                "instance_count": instances,
+                "spec_price": {
+                    "cpu_type": "",
+                    "cpu_count": cpu,
+                    "gpu_type": "",
+                    "gpu_count": 0,
+                    "memory_size_gib": mem_gi,
+                    "logic_compute_group_id": logic_compute_group_id,
+                    "quota_id": predef_quota_id,
+                },
+            },
+        }
+        return self._cookie_request(
+            "/api/v1/hpc_jobs",
+            payload,
+            cookie=cookie,
+            referer=f"https://qz.sii.edu.cn/jobs/hpc?spaceId={workspace_id}",
+        )
     
     def test_connection(self) -> bool:
         """测试连接"""
@@ -337,7 +633,7 @@ class QzAPI:
         project_filter: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
-        获取工作空间内所有运行中的任务（使用浏览器 cookie 认证）
+        获取工作空间任务概览；旧分页参数仍兼容任务维度查询。
         
         Args:
             workspace_id: 工作空间 ID
@@ -349,28 +645,45 @@ class QzAPI:
         Returns:
             API 响应数据，包含 task_dimensions 列表
         """
+        if project_filter or page_num != 1 or page_size != 100:
+            payload = {
+                "page_num": page_num,
+                "page_size": page_size,
+                "filter": {"workspace_id": workspace_id}
+            }
+            data = self._cookie_request(
+                "/api/v1/workspace/list_task_dimension",
+                payload,
+                cookie=cookie,
+                referer=f"https://qz.sii.edu.cn/jobs/spacesOverview?spaceId={workspace_id}",
+            )
+
+            if project_filter:
+                tasks = data.get("task_dimensions", [])
+                data["task_dimensions"] = [
+                    t
+                    for t in tasks
+                    if project_filter in t.get("project", {}).get("name", "")
+                ]
+            return data
+
+        import time as _time
+
+        end_ts = int(_time.time())
+        start_ts = end_ts - 24 * 3600
         payload = {
-            "page_num": page_num,
-            "page_size": page_size,
-            "filter": {"workspace_id": workspace_id}
+            "filter": {"workspace_id": workspace_id},
+            "time_range": {
+                "start_timestamp": str(start_ts),
+                "end_timestamp": str(end_ts),
+            },
         }
-        data = self._cookie_request(
-            "/api/v1/workspace/list_task_dimension",
+        return self._cookie_request(
+            "/api/v1/cluster_metric/overview_task_metric",
             payload,
             cookie=cookie,
             referer=f"https://qz.sii.edu.cn/jobs/spacesOverview?spaceId={workspace_id}",
         )
-        
-        # 客户端过滤项目
-        if project_filter:
-            tasks = data.get("task_dimensions", [])
-            filtered = [
-                t for t in tasks
-                if project_filter in t.get("project", {}).get("name", "")
-            ]
-            data["task_dimensions"] = filtered
-        
-        return data
     
     def list_jobs_with_cookie(
         self,
@@ -410,6 +723,36 @@ class QzAPI:
             payload,
             cookie=cookie,
             referer=f"https://qz.sii.edu.cn/jobs/distributedTraining?spaceId={workspace_id}",
+        )
+
+    def list_notebooks_with_cookie(
+        self,
+        workspace_id: str,
+        cookie: str,
+        page: int = 1,
+        page_size: int = 50,
+        user_ids: Optional[List[str]] = None,
+        status: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        """使用 cookie 获取交互式建模实例列表（开发机）。"""
+        payload = {
+            "workspace_id": workspace_id,
+            "page": page,
+            "page_size": page_size,
+            "filter_by": {
+                "keyword": "",
+                "user_id": user_ids or [],
+                "logic_compute_group_id": [],
+                "status": status or [],
+                "mirror_url": [],
+            },
+            "order_by": [{"field": "created_at", "order": "desc"}],
+        }
+        return self._cookie_request(
+            "/api/v1/notebook/list",
+            payload,
+            cookie=cookie,
+            referer=f"https://qz.sii.edu.cn/jobs/interactiveModeling?spaceId={workspace_id}",
         )
 
     def list_hpc_jobs_with_cookie(
@@ -455,6 +798,23 @@ class QzAPI:
             payload,
             cookie=cookie,
             referer=f"https://qz.sii.edu.cn/jobs/hpc?spaceId={workspace_id}",
+        )
+
+    def list_hpc_jobs(
+        self,
+        workspace_id: str,
+        cookie: str,
+        status: Optional[str] = None,
+        page_num: int = 1,
+        page_size: int = 100,
+    ) -> Dict[str, Any]:
+        """兼容上游命名的 HPC 任务列表接口。"""
+        return self.list_hpc_jobs_with_cookie(
+            workspace_id,
+            cookie,
+            page_num=page_num,
+            page_size=page_size,
+            status=status,
         )
     
     def extract_resources_from_jobs(self, jobs: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -513,15 +873,24 @@ class QzAPI:
             if fc:
                 spec_info = fc[0].get("instance_spec_price_info", {})
                 spec_id = spec_info.get("quota_id", "")
+                existing_group_ids = list(
+                    (specs.get(spec_id) or {}).get("logic_compute_group_ids", [])
+                )
+                if lcg_id and lcg_id not in existing_group_ids:
+                    existing_group_ids.append(lcg_id)
                 if spec_id and spec_id not in specs:
                     specs[spec_id] = {
                         "id": spec_id,
+                        "logic_compute_group_id": lcg_id,
+                        "logic_compute_group_ids": existing_group_ids,
                         "gpu_count": spec_info.get("gpu_count", 0),
                         "cpu_count": spec_info.get("cpu_count", 0),
                         "memory_gb": spec_info.get("memory_size_gib", 0),
                         "gpu_type": spec_info.get("gpu_info", {}).get("gpu_product_simple", ""),
                         "gpu_type_display": spec_info.get("gpu_info", {}).get("gpu_type_display", ""),
                     }
+                elif spec_id and existing_group_ids:
+                    specs[spec_id]["logic_compute_group_ids"] = existing_group_ids
         
         return {
             "workspaces": list(workspaces.values()),
@@ -574,6 +943,7 @@ class QzAPI:
         workspace_id: str,
         cookie: str,
         logic_compute_group_id: Optional[str] = None,
+        compute_group_id: Optional[str] = None,
         page_num: int = 1,
         page_size: int = 100,
     ) -> Dict[str, Any]:
@@ -593,6 +963,8 @@ class QzAPI:
         filter_params = {"workspace_id": workspace_id}
         if logic_compute_group_id:
             filter_params["logic_compute_group_id"] = logic_compute_group_id
+        if compute_group_id:
+            filter_params["compute_group_id"] = compute_group_id
         
         payload = {
             "page_num": page_num,
@@ -749,6 +1121,14 @@ class QzAPI:
         from urllib.parse import urljoin, urlparse, parse_qs
         
         session = requests.Session()
+
+        proxy = get_proxy()
+        if proxy:
+            # WSL/VPN setups often export HTTP(S)_PROXY; trust_env=False prevents
+            # those env vars from overriding an explicit qzcli SOCKS proxy.
+            session.trust_env = False
+            proxy_url = proxy.replace("socks5h://", "socks5://")
+            session.proxies = {"http": proxy_url, "https": proxy_url}
         
         # 设置浏览器 User-Agent
         headers = {

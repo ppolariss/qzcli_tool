@@ -13,6 +13,7 @@ DEFAULT_CONFIG = {
     "username": "",
     "password": "",
     "token_cache_enabled": True,
+    "proxy": "",
 }
 
 # 配置目录
@@ -21,6 +22,8 @@ CONFIG_FILE = CONFIG_DIR / "config.json"
 JOBS_FILE = CONFIG_DIR / "jobs.json"
 TOKEN_CACHE_FILE = CONFIG_DIR / ".token_cache"
 COOKIE_FILE = CONFIG_DIR / ".cookie"
+DEFAULT_ENV_FILE = CONFIG_DIR / ".env"
+CREATE_INTERACTIVE_SNAPSHOT_FILE = CONFIG_DIR / "create_interactive_snapshot.json"
 
 
 def ensure_config_dir() -> Path:
@@ -53,12 +56,77 @@ def save_config(config: Dict[str, Any]) -> None:
         json.dump(config, f, indent=2, ensure_ascii=False)
 
 
-def get_credentials() -> tuple[str, str]:
-    """获取认证信息，优先使用环境变量"""
+def get_proxy() -> str:
+    """获取代理地址，优先使用配置文件，回退到环境变量。"""
     config = load_config()
+    proxy = str(config.get("proxy", "") or "").strip()
+    if proxy:
+        return proxy
+    return os.environ.get("ALL_PROXY") or os.environ.get("HTTPS_PROXY", "")
+
+
+def get_env_file_path() -> Path:
+    """返回 qzcli 默认使用的 .env 路径。"""
+    env_file = os.environ.get("QZCLI_ENV_FILE", "").strip()
+    if env_file:
+        return Path(env_file).expanduser()
+    return DEFAULT_ENV_FILE
+
+
+def load_env_file() -> Dict[str, str]:
+    """读取 qzcli 默认路径或 QZCLI_ENV_FILE 指定的 .env 文件。"""
+    env_file = get_env_file_path()
+    if not env_file.exists():
+        return {}
+
+    values: Dict[str, str] = {}
+    try:
+        with open(env_file, "r", encoding="utf-8") as f:
+            for raw_line in f:
+                line = raw_line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if line.startswith("export "):
+                    line = line[7:].lstrip()
+                if "=" not in line:
+                    continue
+
+                key, value = line.split("=", 1)
+                key = key.strip()
+                value = value.strip()
+                if not key:
+                    continue
+
+                if (
+                    len(value) >= 2
+                    and value[0] == value[-1]
+                    and value[0] in {"'", '"'}
+                ):
+                    value = value[1:-1]
+                values[key] = value
+    except IOError:
+        return {}
+
+    return values
+
+
+def get_credentials() -> tuple[str, str]:
+    """获取认证信息，优先使用环境变量，其次使用 .env，再回退配置文件。"""
+    config = load_config()
+    env_file_values = load_env_file()
     
-    username = os.environ.get("QZCLI_USERNAME") or config.get("username") or ""
-    password = os.environ.get("QZCLI_PASSWORD") or config.get("password") or ""
+    username = (
+        os.environ.get("QZCLI_USERNAME")
+        or env_file_values.get("QZCLI_USERNAME")
+        or config.get("username")
+        or ""
+    )
+    password = (
+        os.environ.get("QZCLI_PASSWORD")
+        or env_file_values.get("QZCLI_PASSWORD")
+        or config.get("password")
+        or ""
+    )
     
     return username, password
 
@@ -66,7 +134,12 @@ def get_credentials() -> tuple[str, str]:
 def get_api_base_url() -> str:
     """获取 API 基础 URL"""
     config = load_config()
-    return os.environ.get("QZCLI_API_URL") or config.get("api_base_url", DEFAULT_CONFIG["api_base_url"])
+    env_file_values = load_env_file()
+    return (
+        os.environ.get("QZCLI_API_URL")
+        or env_file_values.get("QZCLI_API_URL")
+        or config.get("api_base_url", DEFAULT_CONFIG["api_base_url"])
+    )
 
 
 def init_config(username: str, password: str, api_base_url: Optional[str] = None) -> None:
@@ -270,6 +343,30 @@ def load_all_resources() -> Dict[str, Any]:
         workspace_id: _normalize_workspace_snapshot(workspace_id, workspace_data, aliases)
         for workspace_id, workspace_data in raw_resources.items()
     }
+
+
+def save_create_interactive_snapshot(snapshot: Dict[str, Any]) -> None:
+    """保存 create -i 使用的交互资源快照。"""
+    ensure_config_dir()
+
+    import time
+
+    payload = dict(snapshot or {})
+    payload["saved_at"] = time.time()
+    with open(CREATE_INTERACTIVE_SNAPSHOT_FILE, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False)
+
+
+def load_create_interactive_snapshot() -> Optional[Dict[str, Any]]:
+    """读取 create -i 使用的交互资源快照。"""
+    if not CREATE_INTERACTIVE_SNAPSHOT_FILE.exists():
+        return None
+
+    try:
+        with open(CREATE_INTERACTIVE_SNAPSHOT_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, IOError):
+        return None
 
 
 def get_workspace_resources(workspace_id: str) -> Optional[Dict[str, Any]]:
