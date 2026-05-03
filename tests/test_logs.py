@@ -91,7 +91,7 @@ class RequestV2HeadersTests(unittest.TestCase):
         fake_resp.json.return_value = {"ResponseMetadata": {}, "Result": {"logs": [], "total": 0}}
 
         with patch("qzcli.api.get_cookie", return_value={"cookie": "SESSION=abc"}), \
-             patch("qzcli.api.requests.post", return_value=fake_resp) as post:
+             patch("qzcli.api._curl_post", return_value=fake_resp) as post:
             result = self.api.get_job_logs(
                 "job-abc",
                 pod_names=["job-abc-worker-0"],
@@ -125,7 +125,7 @@ class RequestV2HeadersTests(unittest.TestCase):
         fake_resp.headers = {"Content-Type": "text/html"}
         fake_resp.text = "<html>keycloak login</html>"
         with patch("qzcli.api.get_cookie", return_value={"cookie": "x"}), \
-             patch("qzcli.api.requests.post", return_value=fake_resp):
+             patch("qzcli.api._curl_post", return_value=fake_resp):
             with self.assertRaises(QzAPIError) as ctx:
                 self.api._request_v2("train", "GetJobLog", {})
             self.assertIn("非 JSON", str(ctx.exception))
@@ -135,7 +135,7 @@ class RequestV2HeadersTests(unittest.TestCase):
         unauthorized = MagicMock(status_code=401, headers={"Content-Type": "application/json"})
         unauthorized.json.return_value = {"error": "unauthorized"}
         with patch("qzcli.api.get_cookie", return_value={"cookie": "x"}), \
-             patch("qzcli.api.requests.post", return_value=unauthorized):
+             patch("qzcli.api._curl_post", return_value=unauthorized):
             with self.assertRaises(QzAPIError) as ctx:
                 self.api._request_v2("train", "GetJobLog", {})
             self.assertIn("Cookie 已过期", str(ctx.exception))
