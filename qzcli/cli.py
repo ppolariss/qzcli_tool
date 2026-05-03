@@ -1238,6 +1238,12 @@ def cmd_avail(args):
 
     from collections import defaultdict
 
+    progress = None
+    if not args.export and hasattr(display, "create_progress"):
+        progress = display.create_progress()
+        if progress:
+            progress.start()
+
     for workspace_id in workspace_ids:
         workspace_option = workspace_options_by_id.get(workspace_id, {})
         ws_name = str(workspace_option.get("name", "") or workspace_id)
@@ -1282,15 +1288,25 @@ def cmd_avail(args):
         if not compute_groups:
             continue
 
-        display.print(
-            f"[dim]正在查询 {ws_name} 的 {len(compute_groups)} 个计算组...[/dim]"
-        )
+        progress_task_id = None
+        if progress:
+            progress_task_id = progress.add_task(
+                f"{ws_name}: 准备查询 {len(compute_groups)} 个计算组",
+                total=len(compute_groups) + (1 if args.low_priority else 0),
+            )
+        else:
+            display.print(
+                f"[dim]正在查询 {ws_name} 的 {len(compute_groups)} 个计算组...[/dim]"
+            )
 
         # 低优任务统计（仅在 --lp 参数启用时计算）
         node_low_priority_gpu = defaultdict(int)  # node_name -> low_priority_gpu_count
 
         if args.low_priority:
-            display.print("[dim]正在获取低优任务数据（这可能较慢）...[/dim]")
+            if progress and progress_task_id is not None:
+                progress.update(progress_task_id, description=f"{ws_name}: 获取低优任务")
+            else:
+                display.print("[dim]正在获取低优任务数据（这可能较慢）...[/dim]")
             low_priority_threshold = 3  # 优先级 <= 3 为低优任务
 
             try:
@@ -1322,12 +1338,20 @@ def cmd_avail(args):
                             )
             except QzAPIError:
                 pass  # 获取任务数据失败不影响主要功能
+            finally:
+                if progress and progress_task_id is not None:
+                    progress.advance(progress_task_id)
 
         for lcg_id, lcg_info in compute_groups.items():
             lcg_name = lcg_info.get("name", lcg_id)
             gpu_type = lcg_info.get("gpu_type", "")
 
             try:
+                if progress and progress_task_id is not None:
+                    progress.update(
+                        progress_task_id,
+                        description=f"{ws_name}: 查询 {lcg_name}",
+                    )
                 nodes = _with_live_cookie(
                     api,
                     display,
@@ -1420,6 +1444,15 @@ def cmd_avail(args):
             except QzAPIError as e:
                 display.print_warning(f"查询 {lcg_name} 失败: {e}")
                 continue
+            finally:
+                if progress and progress_task_id is not None:
+                    progress.advance(progress_task_id)
+
+        if progress and progress_task_id is not None:
+            progress.update(progress_task_id, description=f"{ws_name}: 查询完成")
+
+    if progress:
+        progress.stop()
 
     if not all_results:
         display.print_error("未能获取任何计算组的节点信息")

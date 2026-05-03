@@ -42,6 +42,41 @@ class FakeDisplay:
         self.messages.append(" ".join(str(arg) for arg in args))
 
 
+class FakeProgress:
+    def __init__(self):
+        self.started = False
+        self.stopped = False
+        self.tasks = []
+        self.updates = []
+        self.advances = []
+
+    def start(self):
+        self.started = True
+
+    def stop(self):
+        self.stopped = True
+
+    def add_task(self, description, total=None):
+        task_id = len(self.tasks)
+        self.tasks.append({"description": description, "total": total})
+        return task_id
+
+    def update(self, task_id, **kwargs):
+        self.updates.append((task_id, kwargs))
+
+    def advance(self, task_id):
+        self.advances.append(task_id)
+
+
+class ProgressDisplay(FakeDisplay):
+    def __init__(self):
+        super().__init__()
+        self.progress = FakeProgress()
+
+    def create_progress(self):
+        return self.progress
+
+
 class FakeStore:
     def __init__(self):
         self.jobs = []
@@ -1959,6 +1994,70 @@ class CreateInteractiveTests(unittest.TestCase):
                 for msg in display.messages
             )
         )
+
+    def test_cmd_avail_shows_progress_for_targeted_low_priority_query(self):
+        cache = ResourceCache()
+        cache.save_resources(
+            AmbiguousDistributedWorkspaceAPI.DISTRIBUTED_WORKSPACE_ID,
+            {
+                "projects": [{"id": "project-1", "name": "Vision Project"}],
+                "compute_groups": [
+                    {
+                        "id": "lcg-1",
+                        "name": "GPU Group A",
+                        "gpu_type": "GPU-A",
+                    }
+                ],
+                "specs": [],
+            },
+            "分布式训练空间",
+        )
+        display = ProgressDisplay()
+        api = AmbiguousDistributedWorkspaceAPI()
+        args = argparse.Namespace(
+            workspace="分布式",
+            nodes=None,
+            group=None,
+            low_priority=True,
+            export=False,
+            verbose=False,
+        )
+
+        with patch.object(cli, "get_display", return_value=display), patch.object(
+            cli, "get_api", return_value=api
+        ), patch.object(
+            cli, "get_cookie", return_value={"cookie": "cookie"}
+        ), patch.object(
+            cli, "save_cookie"
+        ), patch.object(
+            cli, "get_credentials", return_value=("", "")
+        ), patch.object(
+            cli, "save_resources", side_effect=cache.save_resources
+        ), patch.object(
+            cli, "get_workspace_resources", side_effect=cache.get_workspace_resources
+        ), patch.object(
+            cli, "set_workspace_name", side_effect=cache.set_workspace_name
+        ), patch.object(
+            cli, "find_workspace_by_name", side_effect=cache.find_workspace_by_name
+        ), patch.object(
+            cli, "find_resource_by_name", side_effect=cache.find_resource_by_name
+        ), patch.object(
+            cli, "list_cached_workspaces", side_effect=cache.list_cached_workspaces
+        ):
+            ret = cli.cmd_avail(args)
+
+        self.assertEqual(0, ret)
+        self.assertTrue(display.progress.started)
+        self.assertTrue(display.progress.stopped)
+        self.assertEqual(1, len(display.progress.tasks))
+        self.assertEqual(2, display.progress.tasks[0]["total"])
+        descriptions = [
+            kwargs.get("description", "")
+            for _, kwargs in display.progress.updates
+        ]
+        self.assertTrue(any("获取低优任务" in item for item in descriptions))
+        self.assertTrue(any("查询 GPU Group A" in item for item in descriptions))
+        self.assertEqual([0, 0], display.progress.advances)
 
     def test_cmd_avail_lists_ambiguous_live_workspace_matches_without_cache_tiebreak(
         self,
