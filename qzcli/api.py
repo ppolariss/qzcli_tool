@@ -3,6 +3,7 @@
 """
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 from typing import Any, Dict, List, Optional
 
 import requests
@@ -52,6 +53,17 @@ class QzAPI:
             self._username, self._password = get_credentials()
 
         self._token: Optional[str] = None
+        self._thread_local = threading.local()
+
+    def _get_session(self) -> requests.Session:
+        session = getattr(self._thread_local, "session", None)
+        if session is None:
+            session = requests.Session()
+            self._thread_local.session = session
+        return session
+
+    def _post(self, url: str, **kwargs) -> requests.Response:
+        return self._get_session().post(url, **kwargs)
 
     def _get_token(self, force_refresh: bool = False) -> str:
         """获取 Access Token（带缓存）"""
@@ -847,7 +859,7 @@ class QzAPI:
             "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36",
         }
 
-        response = requests.post(
+        response = self._post(
             url,
             json=payload,
             headers=headers,
@@ -925,7 +937,7 @@ class QzAPI:
             "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36",
         }
 
-        response = requests.post(
+        response = self._post(
             url,
             json=payload,
             headers=headers,

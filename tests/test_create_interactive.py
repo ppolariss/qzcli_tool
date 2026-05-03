@@ -64,8 +64,9 @@ class FakeProgress:
     def update(self, task_id, **kwargs):
         self.updates.append((task_id, kwargs))
 
-    def advance(self, task_id):
-        self.advances.append(task_id)
+    def advance(self, task_id, advance=1):
+        for _ in range(advance):
+            self.advances.append(task_id)
 
 
 class ProgressDisplay(FakeDisplay):
@@ -572,6 +573,7 @@ class AmbiguousDistributedWorkspaceAPI(FakeInteractiveAPI):
     DISTRIBUTED_WORKSPACE_ID = "ws-distributed-primary"
 
     def __init__(self):
+        self.list_jobs_workspace_ids = []
         self.task_dimension_workspace_ids = []
         self.workspace_usage_snapshot_ids = []
         self.compute_group_node_workspace_ids = []
@@ -586,6 +588,18 @@ class AmbiguousDistributedWorkspaceAPI(FakeInteractiveAPI):
                 "name": "分布式开发空间",
             },
         ]
+
+    def list_jobs_with_cookie(
+        self, workspace_id, cookie, page_num=1, page_size=200, created_by=None
+    ):
+        self.list_jobs_workspace_ids.append(workspace_id)
+        return super().list_jobs_with_cookie(
+            workspace_id,
+            cookie,
+            page_num=page_num,
+            page_size=page_size,
+            created_by=created_by,
+        )
 
     def list_task_dimension(
         self, workspace_id, cookie, project_id=None, page_num=1, page_size=200
@@ -623,6 +637,30 @@ class AmbiguousDistributedWorkspaceAPI(FakeInteractiveAPI):
             page_num=page_num,
             page_size=page_size,
         )
+
+
+class UngroupedWorkspaceNodeAPI(AmbiguousDistributedWorkspaceAPI):
+    def list_node_dimension(
+        self,
+        workspace_id,
+        cookie,
+        logic_compute_group_id=None,
+        compute_group_id=None,
+        page_num=1,
+        page_size=500,
+    ):
+        data = super().list_node_dimension(
+            workspace_id,
+            cookie,
+            logic_compute_group_id=logic_compute_group_id,
+            compute_group_id=compute_group_id,
+            page_num=page_num,
+            page_size=page_size,
+        )
+        if not logic_compute_group_id and not compute_group_id:
+            for node in data.get("node_dimensions", []):
+                node.pop("logic_compute_group", None)
+        return data
 
 
 def build_create_interactive_snapshot(api, cache):
@@ -2050,14 +2088,149 @@ class CreateInteractiveTests(unittest.TestCase):
         self.assertTrue(display.progress.started)
         self.assertTrue(display.progress.stopped)
         self.assertEqual(1, len(display.progress.tasks))
-        self.assertEqual(2, display.progress.tasks[0]["total"])
+        self.assertEqual(3, display.progress.tasks[0]["total"])
         descriptions = [
             kwargs.get("description", "")
             for _, kwargs in display.progress.updates
         ]
         self.assertTrue(any("获取低优任务" in item for item in descriptions))
-        self.assertTrue(any("查询 GPU Group A" in item for item in descriptions))
-        self.assertEqual([0, 0], display.progress.advances)
+        self.assertTrue(any("获取节点数据" in item for item in descriptions))
+        self.assertTrue(any("统计 GPU Group A" in item for item in descriptions))
+        self.assertEqual([0, 0, 0], display.progress.advances)
+
+    def test_cmd_avail_light_refreshes_compute_groups_without_job_history(self):
+        cache = ResourceCache()
+        cache.set_workspace_name(
+            AmbiguousDistributedWorkspaceAPI.DISTRIBUTED_WORKSPACE_ID,
+            "分布式训练空间",
+        )
+        display = FakeDisplay()
+        api = AmbiguousDistributedWorkspaceAPI()
+        args = argparse.Namespace(
+            workspace="分布式",
+            nodes=None,
+            group=None,
+            low_priority=False,
+            export=False,
+            verbose=False,
+        )
+
+        with patch.object(cli, "get_display", return_value=display), patch.object(
+            cli, "get_api", return_value=api
+        ), patch.object(
+            cli, "get_cookie", return_value={"cookie": "cookie"}
+        ), patch.object(
+            cli, "save_cookie"
+        ), patch.object(
+            cli, "get_credentials", return_value=("", "")
+        ), patch.object(
+            cli, "save_resources", side_effect=cache.save_resources
+        ), patch.object(
+            cli, "get_workspace_resources", side_effect=cache.get_workspace_resources
+        ), patch.object(
+            cli, "set_workspace_name", side_effect=cache.set_workspace_name
+        ), patch.object(
+            cli, "find_workspace_by_name", side_effect=cache.find_workspace_by_name
+        ), patch.object(
+            cli, "find_resource_by_name", side_effect=cache.find_resource_by_name
+        ), patch.object(
+            cli, "list_cached_workspaces", side_effect=cache.list_cached_workspaces
+        ):
+            ret = cli.cmd_avail(args)
+
+        self.assertEqual(0, ret)
+        self.assertEqual([], api.list_jobs_workspace_ids)
+        self.assertEqual([], api.task_dimension_workspace_ids)
+        refreshed = cache.get_workspace_resources(
+            AmbiguousDistributedWorkspaceAPI.DISTRIBUTED_WORKSPACE_ID
+        )
+        self.assertIn("lcg-1", refreshed.get("compute_groups", {}))
+
+    def test_cmd_avail_falls_back_to_group_queries_when_nodes_are_ungrouped(self):
+        cache = ResourceCache()
+        cache.save_resources(
+            AmbiguousDistributedWorkspaceAPI.DISTRIBUTED_WORKSPACE_ID,
+            {
+                "projects": [{"id": "project-1", "name": "Vision Project"}],
+                "compute_groups": [
+                    {"id": "lcg-1", "name": "GPU Group A", "gpu_type": "GPU-A"},
+                    {"id": "lcg-2", "name": "GPU Group B", "gpu_type": "GPU-B"},
+                ],
+                "specs": [],
+            },
+            "分布式训练空间",
+        )
+        display = FakeDisplay()
+        api = UngroupedWorkspaceNodeAPI()
+        args = argparse.Namespace(
+            workspace="分布式",
+            nodes=None,
+            group=None,
+            low_priority=False,
+            export=False,
+            verbose=False,
+        )
+
+        with patch.object(cli, "get_display", return_value=display), patch.object(
+            cli, "get_api", return_value=api
+        ), patch.object(
+            cli, "get_cookie", return_value={"cookie": "cookie"}
+        ), patch.object(
+            cli, "save_cookie"
+        ), patch.object(
+            cli, "get_credentials", return_value=("", "")
+        ), patch.object(
+            cli, "save_resources", side_effect=cache.save_resources
+        ), patch.object(
+            cli, "get_workspace_resources", side_effect=cache.get_workspace_resources
+        ), patch.object(
+            cli, "set_workspace_name", side_effect=cache.set_workspace_name
+        ), patch.object(
+            cli, "find_workspace_by_name", side_effect=cache.find_workspace_by_name
+        ), patch.object(
+            cli, "find_resource_by_name", side_effect=cache.find_resource_by_name
+        ), patch.object(
+            cli, "list_cached_workspaces", side_effect=cache.list_cached_workspaces
+        ):
+            ret = cli.cmd_avail(args)
+
+        self.assertEqual(0, ret)
+        self.assertGreaterEqual(
+            api.compute_group_node_workspace_ids.count(
+                AmbiguousDistributedWorkspaceAPI.DISTRIBUTED_WORKSPACE_ID
+            ),
+            2,
+        )
+
+    def test_list_available_workspaces_shows_progress_for_usage_snapshot(self):
+        display = ProgressDisplay()
+        api = AmbiguousDistributedWorkspaceAPI()
+
+        with patch.object(
+            cli, "get_cookie", return_value={"cookie": "cookie"}
+        ), patch.object(cli, "save_cookie"), patch.object(
+            cli, "get_credentials", return_value=("", "")
+        ), patch.object(
+            cli, "set_workspace_name", return_value=True
+        ):
+            workspaces = cli._list_available_workspaces(
+                api,
+                display,
+                include_usage_snapshot=True,
+                show_progress=True,
+            )
+
+        self.assertEqual(4, len(workspaces))
+        self.assertTrue(display.progress.started)
+        self.assertTrue(display.progress.stopped)
+        self.assertEqual(1, len(display.progress.tasks))
+        self.assertEqual(4, display.progress.tasks[0]["total"])
+        self.assertEqual([0, 0, 0, 0], display.progress.advances)
+        descriptions = [
+            kwargs.get("description", "")
+            for _, kwargs in display.progress.updates
+        ]
+        self.assertTrue(any("刷新 分布式训练空间 实时占用" in item for item in descriptions))
 
     def test_cmd_avail_lists_ambiguous_live_workspace_matches_without_cache_tiebreak(
         self,
@@ -2107,6 +2280,17 @@ class CreateInteractiveTests(unittest.TestCase):
 
     def test_cmd_avail_does_not_prefetch_create_snapshot_or_specs(self):
         cache = ResourceCache()
+        cache.save_resources(
+            "ws-1",
+            {
+                "projects": [{"id": "project-1", "name": "Vision Project"}],
+                "compute_groups": [
+                    {"id": "lcg-1", "name": "GPU Group A", "gpu_type": "GPU-A"}
+                ],
+                "specs": [],
+            },
+            "Alpha Workspace",
+        )
         display = FakeDisplay()
         api = SpecPrefetchTrackingAPI()
         args = argparse.Namespace(
@@ -2152,6 +2336,17 @@ class CreateInteractiveTests(unittest.TestCase):
 
     def test_cmd_avail_reuses_refreshed_cookie_for_capacity_queries(self):
         cache = ResourceCache()
+        cache.save_resources(
+            "ws-1",
+            {
+                "projects": [{"id": "project-1", "name": "Vision Project"}],
+                "compute_groups": [
+                    {"id": "lcg-1", "name": "GPU Group A", "gpu_type": "GPU-A"}
+                ],
+                "specs": [],
+            },
+            "Alpha Workspace",
+        )
         display = FakeDisplay()
         api = AutoRefreshAPI()
         cookie_state = {"cookie": "expired"}
@@ -2205,6 +2400,17 @@ class CreateInteractiveTests(unittest.TestCase):
 
     def test_cmd_avail_auto_refreshes_when_cookie_missing(self):
         cache = ResourceCache()
+        cache.save_resources(
+            "ws-1",
+            {
+                "projects": [{"id": "project-1", "name": "Vision Project"}],
+                "compute_groups": [
+                    {"id": "lcg-1", "name": "GPU Group A", "gpu_type": "GPU-A"}
+                ],
+                "specs": [],
+            },
+            "Alpha Workspace",
+        )
         display = FakeDisplay()
         api = AutoRefreshAPI()
         cookie_state = {}
