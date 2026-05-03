@@ -88,16 +88,17 @@ class RequestV2HeadersTests(unittest.TestCase):
         fake_resp = MagicMock()
         fake_resp.status_code = 200
         fake_resp.headers = {"Content-Type": "application/json"}
-        fake_resp.json.return_value = {"logs": [], "total": 0}
+        fake_resp.json.return_value = {"ResponseMetadata": {}, "Result": {"logs": [], "total": 0}}
 
         with patch("qzcli.api.get_cookie", return_value={"cookie": "SESSION=abc"}), \
              patch("qzcli.api.requests.post", return_value=fake_resp) as post:
-            self.api.get_job_logs(
+            result = self.api.get_job_logs(
                 "job-abc",
                 pod_names=["job-abc-worker-0"],
                 start_timestamp_ms="111",
                 page_size=50,
             )
+            self.assertEqual(result, {"logs": [], "total": 0})
             kwargs = post.call_args.kwargs
             self.assertEqual(kwargs["params"], {"Action": "GetJobLog"})
             self.assertEqual(kwargs["headers"]["x-inspire-client-source"], V2_CLIENT_SOURCE)
@@ -172,6 +173,7 @@ class CmdLogsTailTests(unittest.TestCase):
         out = buf.getvalue().strip().splitlines()
         # raw mode prints just messages
         self.assertEqual(out, ["line3", "line4"])
+        self.assertEqual(api.get_job_logs.call_args.kwargs["sort"], "descend")
 
     def test_pod_filter_passed_through(self):
         api = MagicMock()
