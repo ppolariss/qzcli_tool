@@ -11,7 +11,14 @@ try:
     from rich.panel import Panel
     from rich.text import Text
     from rich.live import Live
-    from rich.progress import Progress, SpinnerColumn, TextColumn
+    from rich.progress import (
+        BarColumn,
+        Progress,
+        SpinnerColumn,
+        TaskProgressColumn,
+        TextColumn,
+        TimeElapsedColumn,
+    )
     from rich import box
     RICH_AVAILABLE = True
 except ImportError:
@@ -494,6 +501,9 @@ class Display:
             return Progress(
                 SpinnerColumn(),
                 TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                TaskProgressColumn(),
+                TimeElapsedColumn(),
                 console=self.console,
             )
         return None

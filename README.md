@@ -174,7 +174,7 @@ qzcli avail -n 4 -e
 qzcli avail --lp -n 4
 
 # 如果开启了 --lp (low priority) 模式，建议配合 -w 指定工作空间以加快速度
-qzcli avail --lp -w CI -n 4
+qzcli avail --lp -w 分布式 -n 4
 ```
 
 ### 查看任务
@@ -184,7 +184,7 @@ qzcli avail --lp -w CI -n 4
 qzcli ls -c --all-ws -r
 
 # 查看指定工作空间
-qzcli ls -c -w CI -r
+qzcli ls -c -w 分布式 -r
 ```
 
 ## 命令参考
@@ -228,7 +228,7 @@ qzcli res --list
 qzcli res -u
 
 # 更新指定工作空间
-qzcli res -w CI -u
+qzcli res -w 分布式 -u
 
 # 给工作空间设置别名
 qzcli res -w ws-xxx --name 我的空间
@@ -239,14 +239,14 @@ qzcli avail
 # 查看空余节点（包含低优任务统计，即：空节点 + 低优任务占用的节点）
 qzcli avail --lp
 
-# 只查看 CI 工作空间
-qzcli avail -w CI
+# 只查看指定工作空间
+qzcli avail -w 分布式
 
 # 只看某个计算组
-qzcli avail -w CI -g lcg-xxx
+qzcli avail -w 分布式 -g lcg-xxx
 
 # 显示空闲节点名称
-qzcli avail -w CI -v
+qzcli avail -w 分布式 -v
 
 # 找满足 N 节点需求的计算组
 qzcli avail -n 4
@@ -265,10 +265,10 @@ qzcli avail -n 4 -e
 
 ```bash
 # Cookie 模式（从 API 获取）
-qzcli ls -c -w CI           # 指定工作空间
+qzcli ls -c -w 分布式       # 指定工作空间
 qzcli ls -c --all-ws        # 所有工作空间
-qzcli ls -c -w CI -r        # 只看运行中
-qzcli ls -c -w CI -n 50     # 显示 50 条
+qzcli ls -c -w 分布式 -r    # 只看运行中
+qzcli ls -c -w 分布式 -n 50 # 显示 50 条
 
 # 本地模式（从本地存储）
 qzcli ls                    # 默认列表
@@ -494,7 +494,7 @@ qzcli ws -p "我的项目"
 ### qzcli avail -v
 
 ```
-CI-情景智能
+示例工作空间
   计算组                          空节点    总节点 GPU类型     
   -----------------------------------------------------
   OV3蒸馏训练组                       4      8 某gpu2      
@@ -503,10 +503,10 @@ CI-情景智能
     空闲: qb-prod-gpu2000
 ```
 
-### qzcli ls -c -w CI -r
+### qzcli ls -c -w 分布式 -r
 
 ```
-工作空间: CI-情景智能
+工作空间: 示例工作空间
 
 [1] ● 运行中 | 44分钟前 | 44分36秒
     eval-OpenVeo3-I2VA-A14B-1227-8s...

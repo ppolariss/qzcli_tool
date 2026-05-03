@@ -7,6 +7,7 @@ import argparse
 import sys
 import time
 import unicodedata
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -1144,9 +1145,29 @@ def cmd_avail(args):
 
     # 解析 workspace 参数（支持名称或 ID）
     workspace_input = args.workspace
+    cached_workspace_id = ""
+    cached_workspace_name = ""
+    if workspace_input and not workspace_input.startswith("ws-"):
+        # Capture the pre-refresh cache match. _list_available_workspaces updates
+        # workspace names as a side effect, so checking after it runs would turn
+        # live ambiguity into an arbitrary cache-order match.
+        cached_workspace_id = find_workspace_by_name(workspace_input) or ""
+        if cached_workspace_id:
+            cached_resources = get_workspace_resources(cached_workspace_id) or {}
+            cached_workspace_name = str(
+                cached_resources.get("name", "") or workspace_input
+            )
+
     try:
         available_workspace_options = _sort_workspace_options_for_selection(
-            _list_available_workspaces(api, display)
+            _list_workspace_options_for_avail(
+                api,
+                display,
+                workspace_input=workspace_input,
+                cached_workspace_id=cached_workspace_id,
+                include_usage_snapshot=False,
+                show_progress=not args.export,
+            )
         )
     except QzAPIError as e:
         if _is_auth_related_error(e) or "未设置 cookie" in str(e):
@@ -1165,15 +1186,20 @@ def cmd_avail(args):
             )
             return 1
     else:
-        workspace_id, ws_display = _resolve_workspace_option_from_snapshot(
-            available_workspace_options, workspace_input
+        (
+            workspace_id,
+            ws_display,
+            ambiguous_matches,
+        ) = _resolve_workspace_option_for_avail(
+            available_workspace_options,
+            workspace_input,
+            cached_workspace_id=cached_workspace_id,
+            cached_workspace_name=cached_workspace_name,
         )
         if workspace_id:
-            workspace_options = [
-                option
-                for option in available_workspace_options
-                if str(option.get("id", "")) == workspace_id
-            ]
+            workspace_options = _workspace_options_for_resolved_id(
+                available_workspace_options, workspace_id, ws_display
+            )
         elif workspace_input.startswith("ws-"):
             cached_resources = get_workspace_resources(workspace_input) or {}
             workspace_options = [
@@ -1185,9 +1211,16 @@ def cmd_avail(args):
             workspace_id = workspace_input
         else:
             display.print_error(f"未找到名称为 '{workspace_input}' 的工作空间")
-            display.print(
-                "[dim]请先运行 qzcli avail 刷新 workspace 列表，或改用 workspace ID[/dim]"
-            )
+            if ambiguous_matches:
+                display.print("[dim]该名称匹配到多个工作空间，请改用完整名称或 ID:[/dim]")
+                for match in ambiguous_matches:
+                    match_id = str(match.get("id", "") or "")
+                    match_name = str(match.get("name", "") or match_id)
+                    display.print(f"  [dim]- {match_name}: {match_id}[/dim]")
+            else:
+                display.print(
+                    "[dim]请使用 qzcli res --list 查看已缓存工作空间，或改用 workspace ID[/dim]"
+                )
             return 1
 
         if workspace_id and workspace_input != workspace_id:
@@ -1211,13 +1244,22 @@ def cmd_avail(args):
 
     from collections import defaultdict
 
+    progress = None
+    if not args.export and hasattr(display, "create_progress"):
+        progress = display.create_progress()
+        if progress:
+            progress.start()
+
+    workspace_jobs = []
     for workspace_id in workspace_ids:
         workspace_option = workspace_options_by_id.get(workspace_id, {})
         ws_name = str(workspace_option.get("name", "") or workspace_id)
         cached_resources = get_workspace_resources(workspace_id)
         if not cached_resources or not cached_resources.get("compute_groups"):
+            if not workspace_input:
+                continue
             try:
-                cached_resources = _load_workspace_resources_for_create(
+                cached_resources = _load_workspace_resources_for_avail(
                     api, display, workspace_id, ws_name
                 )
             except QzAPIError as e:
@@ -1255,15 +1297,42 @@ def cmd_avail(args):
         if not compute_groups:
             continue
 
-        display.print(
-            f"[dim]正在查询 {ws_name} 的 {len(compute_groups)} 个计算组...[/dim]"
+        progress_task_id = None
+        if progress:
+            progress_task_id = progress.add_task(
+                f"{ws_name}: 准备查询 {len(compute_groups)} 个计算组",
+                total=len(compute_groups) + 1 + (1 if args.low_priority else 0),
+            )
+        else:
+            display.print(
+                f"[dim]正在查询 {ws_name} 的 {len(compute_groups)} 个计算组...[/dim]"
+            )
+
+        workspace_jobs.append(
+            {
+                "workspace_id": workspace_id,
+                "workspace_name": ws_name,
+                "compute_groups": compute_groups,
+                "specs": specs,
+                "progress_task_id": progress_task_id,
+            }
         )
+
+    def _query_workspace_availability(job: Dict[str, Any]) -> Tuple[str, List[Dict[str, Any]], Optional[str]]:
+        workspace_id = job["workspace_id"]
+        ws_name = job["workspace_name"]
+        compute_groups = job["compute_groups"]
+        specs = job["specs"]
+        progress_task_id = job["progress_task_id"]
 
         # 低优任务统计（仅在 --lp 参数启用时计算）
         node_low_priority_gpu = defaultdict(int)  # node_name -> low_priority_gpu_count
 
         if args.low_priority:
-            display.print("[dim]正在获取低优任务数据（这可能较慢）...[/dim]")
+            if progress and progress_task_id is not None:
+                progress.update(progress_task_id, description=f"{ws_name}: 获取低优任务")
+            else:
+                display.print("[dim]正在获取低优任务数据（这可能较慢）...[/dim]")
             low_priority_threshold = 3  # 优先级 <= 3 为低优任务
 
             try:
@@ -1274,7 +1343,7 @@ def cmd_avail(args):
                         api,
                         workspace_id,
                         live_cookie,
-                        page_size=200,
+                        page_size=1000,
                     ),
                     workspace_id=workspace_id,
                 )
@@ -1295,104 +1364,193 @@ def cmd_avail(args):
                             )
             except QzAPIError:
                 pass  # 获取任务数据失败不影响主要功能
+            finally:
+                if progress and progress_task_id is not None:
+                    progress.advance(progress_task_id)
 
-        for lcg_id, lcg_info in compute_groups.items():
-            lcg_name = lcg_info.get("name", lcg_id)
-            gpu_type = lcg_info.get("gpu_type", "")
-
-            try:
-                nodes = _with_live_cookie(
+        try:
+            if progress and progress_task_id is not None:
+                progress.update(progress_task_id, description=f"{ws_name}: 获取节点数据")
+            if len(compute_groups) == 1:
+                only_lcg_id = next(iter(compute_groups.keys()))
+                all_nodes = _with_live_cookie(
                     api,
                     display,
-                    lambda live_cookie, current_lcg_id=lcg_id: _fetch_all_node_dimensions(
+                    lambda live_cookie: _fetch_all_node_dimensions(
                         api,
                         workspace_id,
                         live_cookie,
-                        logic_compute_group_id=current_lcg_id,
+                        logic_compute_group_id=only_lcg_id,
                         page_size=1000,
                     ),
                     workspace_id=workspace_id,
                 )
-                total_nodes = len(nodes)
-
-                # 统计空闲节点（GPU 使用数为 0）和空闲 GPU 分布
-                free_nodes = []
-                low_priority_free_nodes = []  # 低优空余节点
-                gpu_free_distribution = {}  # free_gpu_count -> node_count
-                total_free_gpus = 0
-                total_gpus = 0
-
-                for node in nodes:
-                    node_name = node.get("name", "")
-                    node_status = node.get("status", "")
-                    cordon_type = node.get("cordon_type", "")
-                    gpu_info = node.get("gpu", {})
-                    gpu_used = gpu_info.get("used", 0)
-                    gpu_total = gpu_info.get("total", 0)
-
-                    # 跳过异常节点（gpu_total=0 但有任务在跑，可能是故障节点）
-                    if gpu_total == 0:
-                        continue
-
-                    # 判断节点是否可调度
-                    # - 状态必须是 Ready
-                    # - 不能有 cordon 标记（hardware-fault, software-fault 等）
-                    is_schedulable = node_status == "Ready" and not cordon_type
-
-                    gpu_free = max(0, gpu_total - gpu_used)  # 避免负数
-
-                    total_gpus += gpu_total
-
-                    # 只有可调度节点的空闲 GPU 才计入统计
-                    if is_schedulable:
-                        total_free_gpus += gpu_free
-
-                        # 统计空闲 GPU 分布
-                        if gpu_free > 0:
-                            gpu_free_distribution[gpu_free] = (
-                                gpu_free_distribution.get(gpu_free, 0) + 1
-                            )
-
-                        if gpu_used == 0 and gpu_total > 0:
-                            free_nodes.append(
-                                {
-                                    "name": node_name,
-                                    "gpu_total": gpu_total,
-                                }
-                            )
-
-                        # 检查是否为低优空余节点（低优任务占满整节点）
-                        low_priority_gpu = node_low_priority_gpu.get(node_name, 0)
-                        if low_priority_gpu >= gpu_total and gpu_used > 0:
-                            low_priority_free_nodes.append(
-                                {
-                                    "name": node_name,
-                                    "low_priority_gpu": low_priority_gpu,
-                                    "gpu_total": gpu_total,
-                                }
-                            )
-
-                all_results.append(
-                    {
-                        "workspace_id": workspace_id,
-                        "workspace_name": ws_name,
-                        "id": lcg_id,
-                        "name": lcg_name,
-                        "gpu_type": gpu_type,
-                        "total_nodes": total_nodes,
-                        "free_nodes": len(free_nodes),
-                        "free_node_list": free_nodes,
-                        "low_priority_free_nodes": len(low_priority_free_nodes),
-                        "low_priority_free_node_list": low_priority_free_nodes,
-                        "total_gpus": total_gpus,
-                        "total_free_gpus": total_free_gpus,
-                        "gpu_free_distribution": gpu_free_distribution,
-                        "specs": specs,
-                    }
+                nodes_by_lcg = {only_lcg_id: all_nodes}
+            else:
+                all_nodes = _with_live_cookie(
+                    api,
+                    display,
+                    lambda live_cookie: _fetch_all_node_dimensions(
+                        api,
+                        workspace_id,
+                        live_cookie,
+                        page_size=1000,
+                    ),
+                    workspace_id=workspace_id,
                 )
-            except QzAPIError as e:
-                display.print_warning(f"查询 {lcg_name} 失败: {e}")
-                continue
+                nodes_by_lcg: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+                for node in all_nodes:
+                    lcg = node.get("logic_compute_group", {})
+                    lcg_id = _first_non_empty(
+                        lcg.get("id"), node.get("logic_compute_group_id")
+                    )
+                    if lcg_id:
+                        nodes_by_lcg[str(lcg_id)].append(node)
+                if all_nodes and not nodes_by_lcg:
+                    def _fetch_lcg_nodes(current_lcg_id: str) -> Tuple[str, List[Dict[str, Any]]]:
+                        nodes = _with_live_cookie(
+                            api,
+                            display,
+                            lambda live_cookie: _fetch_all_node_dimensions(
+                                api,
+                                workspace_id,
+                                live_cookie,
+                                logic_compute_group_id=current_lcg_id,
+                                page_size=1000,
+                            ),
+                            workspace_id=workspace_id,
+                        )
+                        return current_lcg_id, nodes
+
+                    max_lcg_workers = min(6, len(compute_groups))
+                    with ThreadPoolExecutor(max_workers=max_lcg_workers) as executor:
+                        for current_lcg_id, nodes in executor.map(
+                            _fetch_lcg_nodes, compute_groups.keys()
+                        ):
+                            nodes_by_lcg[current_lcg_id] = nodes
+            if progress and progress_task_id is not None:
+                progress.advance(progress_task_id)
+        except QzAPIError as e:
+            if progress and progress_task_id is not None:
+                progress.advance(progress_task_id, len(compute_groups))
+            return workspace_id, [], f"查询 {ws_name} 节点数据失败: {e}"
+
+        workspace_results = []
+        for lcg_id, lcg_info in compute_groups.items():
+            lcg_name = lcg_info.get("name", lcg_id)
+            gpu_type = lcg_info.get("gpu_type", "")
+
+            if progress and progress_task_id is not None:
+                progress.update(
+                    progress_task_id,
+                    description=f"{ws_name}: 统计 {lcg_name}",
+                )
+            nodes = nodes_by_lcg.get(lcg_id, [])
+            total_nodes = len(nodes)
+
+            # 统计空闲节点（GPU 使用数为 0）和空闲 GPU 分布
+            free_nodes = []
+            low_priority_free_nodes = []  # 低优空余节点
+            gpu_free_distribution = {}  # free_gpu_count -> node_count
+            total_free_gpus = 0
+            total_gpus = 0
+
+            for node in nodes:
+                node_name = node.get("name", "")
+                node_status = node.get("status", "")
+                cordon_type = node.get("cordon_type", "")
+                gpu_info = node.get("gpu", {})
+                gpu_used = gpu_info.get("used", 0)
+                gpu_total = gpu_info.get("total", 0)
+
+                # 跳过异常节点（gpu_total=0 但有任务在跑，可能是故障节点）
+                if gpu_total == 0:
+                    continue
+
+                # 判断节点是否可调度
+                # - 状态必须是 Ready
+                # - 不能有 cordon 标记（hardware-fault, software-fault 等）
+                is_schedulable = node_status == "Ready" and not cordon_type
+
+                gpu_free = max(0, gpu_total - gpu_used)  # 避免负数
+
+                total_gpus += gpu_total
+
+                # 只有可调度节点的空闲 GPU 才计入统计
+                if is_schedulable:
+                    total_free_gpus += gpu_free
+
+                    # 统计空闲 GPU 分布
+                    if gpu_free > 0:
+                        gpu_free_distribution[gpu_free] = (
+                            gpu_free_distribution.get(gpu_free, 0) + 1
+                        )
+
+                    if gpu_used == 0 and gpu_total > 0:
+                        free_nodes.append(
+                            {
+                                "name": node_name,
+                                "gpu_total": gpu_total,
+                            }
+                        )
+
+                    # 检查是否为低优空余节点（低优任务占满整节点）
+                    low_priority_gpu = node_low_priority_gpu.get(node_name, 0)
+                    if low_priority_gpu >= gpu_total and gpu_used > 0:
+                        low_priority_free_nodes.append(
+                            {
+                                "name": node_name,
+                                "low_priority_gpu": low_priority_gpu,
+                                "gpu_total": gpu_total,
+                            }
+                        )
+
+            workspace_results.append(
+                {
+                    "workspace_id": workspace_id,
+                    "workspace_name": ws_name,
+                    "id": lcg_id,
+                    "name": lcg_name,
+                    "gpu_type": gpu_type,
+                    "total_nodes": total_nodes,
+                    "free_nodes": len(free_nodes),
+                    "free_node_list": free_nodes,
+                    "low_priority_free_nodes": len(low_priority_free_nodes),
+                    "low_priority_free_node_list": low_priority_free_nodes,
+                    "total_gpus": total_gpus,
+                    "total_free_gpus": total_free_gpus,
+                    "gpu_free_distribution": gpu_free_distribution,
+                    "specs": specs,
+                }
+            )
+            if progress and progress_task_id is not None:
+                progress.advance(progress_task_id)
+
+        if progress and progress_task_id is not None:
+            progress.update(progress_task_id, description=f"{ws_name}: 查询完成")
+
+        return workspace_id, workspace_results, None
+
+    if workspace_jobs:
+        max_workers = min(6, len(workspace_jobs))
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [
+                executor.submit(_query_workspace_availability, job)
+                for job in workspace_jobs
+            ]
+            for future in as_completed(futures):
+                try:
+                    _, workspace_results, warning = future.result()
+                except QzAPIError as e:
+                    display.print_warning(f"查询节点数据失败: {e}")
+                    continue
+                if warning:
+                    display.print_warning(warning)
+                    continue
+                all_results.extend(workspace_results)
+
+    if progress:
+        progress.stop()
 
     if not all_results:
         display.print_error("未能获取任何计算组的节点信息")
@@ -2495,11 +2653,8 @@ def _fetch_all_node_dimensions(
     page_size: int = 500,
 ) -> List[Dict[str, Any]]:
     """分页获取节点维度数据。"""
-    nodes: List[Dict[str, Any]] = []
-    page_num = 1
-
-    while True:
-        data = api.list_node_dimension(
+    def _fetch_page(page_num: int) -> Dict[str, Any]:
+        return api.list_node_dimension(
             workspace_id,
             cookie,
             logic_compute_group_id=logic_compute_group_id,
@@ -2507,6 +2662,24 @@ def _fetch_all_node_dimensions(
             page_num=page_num,
             page_size=page_size,
         )
+
+    data = _fetch_page(1)
+    first_batch = data.get("node_dimensions", [])
+    nodes: List[Dict[str, Any]] = list(first_batch)
+    total = data.get("total")
+
+    if isinstance(total, int) and total > len(nodes) and first_batch:
+        # The service may cap page_size below the requested value, so derive the
+        # effective page size from the first response.
+        effective_page_size = len(first_batch)
+        page_count = (total + effective_page_size - 1) // effective_page_size
+        for page_num in range(2, page_count + 1):
+            nodes.extend(_fetch_page(page_num).get("node_dimensions", []))
+        return nodes
+
+    page_num = 2
+    while len(first_batch) >= page_size:
+        data = _fetch_page(page_num)
         batch = data.get("node_dimensions", [])
         nodes.extend(batch)
         if len(batch) < page_size:
@@ -2559,25 +2732,33 @@ def _fetch_all_task_dimensions(
     page_size: int = 200,
 ) -> List[Dict[str, Any]]:
     """分页获取 workspace 内所有 task dimensions。"""
-    tasks: List[Dict[str, Any]] = []
-    page_num = 1
-
-    while True:
-        data = api.list_task_dimension(
+    def _fetch_page(page_num: int) -> Dict[str, Any]:
+        return api.list_task_dimension(
             workspace_id,
             cookie,
             project_id=project_id,
             page_num=page_num,
             page_size=page_size,
         )
+
+    data = _fetch_page(1)
+    first_batch = data.get("task_dimensions", [])
+    tasks: List[Dict[str, Any]] = list(first_batch)
+    total = data.get("total")
+
+    if isinstance(total, int) and total > len(tasks) and first_batch:
+        effective_page_size = len(first_batch)
+        page_count = (total + effective_page_size - 1) // effective_page_size
+        for page_num in range(2, page_count + 1):
+            tasks.extend(_fetch_page(page_num).get("task_dimensions", []))
+        return tasks
+
+    page_num = 2
+    while len(first_batch) >= page_size:
+        data = _fetch_page(page_num)
         batch = data.get("task_dimensions", [])
         tasks.extend(batch)
-
-        total = data.get("total")
-        if isinstance(total, int) and total >= 0:
-            if len(tasks) >= total or not batch:
-                break
-        elif len(batch) < page_size:
+        if len(batch) < page_size:
             break
         page_num += 1
 
@@ -2931,6 +3112,113 @@ def _resolve_workspace_option_from_snapshot(
     return matched_id or None, matched_name
 
 
+def _list_workspace_options_for_avail(
+    api,
+    display,
+    *,
+    workspace_input: Optional[str],
+    cached_workspace_id: str = "",
+    include_usage_snapshot: bool = False,
+    show_progress: bool = False,
+) -> List[Dict[str, Any]]:
+    """Return workspace options for avail without forcing a slow live refresh."""
+    cached = list_cached_workspaces()
+    if cached:
+        if not workspace_input:
+            return cached
+        if workspace_input.startswith("ws-") and any(
+            str(option.get("id", "") or "") == workspace_input for option in cached
+        ):
+            return cached
+        if cached_workspace_id:
+            return cached
+
+    return _list_available_workspaces(
+        api,
+        display,
+        include_usage_snapshot=include_usage_snapshot,
+        show_progress=show_progress,
+    )
+
+
+def _workspace_options_for_resolved_id(
+    workspace_options: List[Dict[str, Any]], workspace_id: str, ws_display: str = ""
+) -> List[Dict[str, Any]]:
+    """Return the live option for a resolved workspace, or a cache-backed option."""
+    for option in workspace_options:
+        if str(option.get("id", "") or "") == workspace_id:
+            return [option]
+
+    cached_resources = get_workspace_resources(workspace_id) or {}
+    return [
+        {
+            "id": workspace_id,
+            "name": ws_display or cached_resources.get("name", workspace_id),
+        }
+    ]
+
+
+def _resolve_workspace_option_for_avail(
+    workspace_options: List[Dict[str, Any]],
+    workspace_value: str,
+    *,
+    cached_workspace_id: str = "",
+    cached_workspace_name: str = "",
+) -> Tuple[Optional[str], str, List[Dict[str, Any]]]:
+    """Resolve workspace for avail while preserving legacy cached fuzzy aliases."""
+    if not workspace_value:
+        return None, "", []
+
+    for option in workspace_options:
+        option_id = str(option.get("id", "") or "")
+        option_name = str(option.get("name", "") or option_id)
+        if not option_id:
+            continue
+        if workspace_value == option_id:
+            return option_id, option_name or option_id, []
+
+    exact_match: Optional[Dict[str, Any]] = None
+    fuzzy_matches: List[Dict[str, Any]] = []
+    lowered = workspace_value.lower()
+    for option in workspace_options:
+        option_id = str(option.get("id", "") or "")
+        option_name = str(option.get("name", "") or option_id)
+        if not option_id:
+            continue
+        if option_name == workspace_value:
+            exact_match = option
+            break
+        if option_name and lowered in option_name.lower():
+            fuzzy_matches.append(option)
+
+    if exact_match:
+        matched_id = str(exact_match.get("id", "") or "")
+        matched_name = str(exact_match.get("name", "") or matched_id)
+        return matched_id or None, matched_name, []
+
+    if cached_workspace_id:
+        for option in workspace_options:
+            if str(option.get("id", "") or "") == cached_workspace_id:
+                return (
+                    cached_workspace_id,
+                    str(
+                        option.get("name", "")
+                        or cached_workspace_name
+                        or cached_workspace_id
+                    ),
+                    [],
+                )
+        return cached_workspace_id, cached_workspace_name or cached_workspace_id, []
+
+    if len(fuzzy_matches) == 1:
+        matched = fuzzy_matches[0]
+        matched_id = str(matched.get("id", "") or "")
+        matched_name = str(matched.get("name", "") or matched_id)
+        return matched_id or None, matched_name, []
+
+    return None, "", fuzzy_matches
+
+
 def _load_create_interactive_snapshot_if_available() -> Optional[Dict[str, Any]]:
     """读取并清洗 create -i 交互快照；不存在时返回 None。"""
     snapshot = load_create_interactive_snapshot() or {}
@@ -3170,7 +3458,13 @@ def _format_capacity_summary(option: Dict[str, Any]) -> str:
     return " | ".join(parts)
 
 
-def _list_available_workspaces(api, display) -> List[Dict[str, Any]]:
+def _list_available_workspaces(
+    api,
+    display,
+    *,
+    include_usage_snapshot: bool = True,
+    show_progress: bool = False,
+) -> List[Dict[str, Any]]:
     """优先从当前可访问 workspace API 获取工作空间，失败时回退到本地缓存。"""
     workspaces: List[Dict[str, Any]] = []
 
@@ -3178,12 +3472,27 @@ def _list_available_workspaces(api, display) -> List[Dict[str, Any]]:
         workspaces = _with_live_cookie(
             api, display, lambda cookie: api.list_workspaces(cookie)
         )
+        progress = None
+        progress_task_id = None
+        if include_usage_snapshot and show_progress and hasattr(display, "create_progress"):
+            progress = display.create_progress()
+            if progress:
+                progress.start()
+                progress_task_id = progress.add_task(
+                    "刷新 workspace 实时占用", total=len(workspaces)
+                )
         for ws in workspaces:
             ws_id = ws.get("id", "")
             ws_name = ws.get("name", "")
             if ws_id:
                 set_workspace_name(ws_id, ws_name)
+            if ws_id and include_usage_snapshot:
                 try:
+                    if progress and progress_task_id is not None:
+                        progress.update(
+                            progress_task_id,
+                            description=f"刷新 {ws_name or ws_id} 实时占用",
+                        )
                     usage_snapshot = _load_workspace_usage_snapshot(api, display, ws_id)
                     ws.update(usage_snapshot.get("workspace", {}))
                     if usage_snapshot.get("compute_groups"):
@@ -3193,6 +3502,10 @@ def _list_available_workspaces(api, display) -> List[Dict[str, Any]]:
                         display.print(
                             f"[dim]{ws_name or ws_id} 的实时占用获取失败，使用缓存列表: {e}[/dim]"
                         )
+            if progress and progress_task_id is not None:
+                progress.advance(progress_task_id)
+        if progress:
+            progress.stop()
     except QzAPIError as e:
         cached = list_cached_workspaces()
         if cached:
@@ -3282,6 +3595,97 @@ def _refresh_workspace_resources_for_create(
         workspace_id, merged_resources, ws_name or cached_resources.get("name", "")
     )
     return get_workspace_resources(workspace_id)
+
+
+def _refresh_workspace_resources_for_avail(
+    api, display, workspace_id: str, ws_name: str = ""
+) -> Optional[Dict[str, Any]]:
+    """为 avail 轻量刷新 compute group 缓存，避免拉历史任务和规格。"""
+    cached_resources = get_workspace_resources(workspace_id) or {}
+
+    def _fetch_compute_groups(cookie: str) -> List[Dict[str, Any]]:
+        compute_groups_from_api: List[Dict[str, Any]] = []
+        try:
+            cluster_info = api.get_cluster_basic_info(workspace_id, cookie)
+            for cluster in cluster_info.get("compute_groups", []):
+                for lcg in cluster.get("logic_compute_groups", []):
+                    lcg_id = lcg.get("logic_compute_group_id", "")
+                    if not lcg_id:
+                        continue
+                    resource_types = lcg.get("resource_types", [])
+                    compute_groups_from_api.append(
+                        {
+                            "id": lcg_id,
+                            "name": lcg.get("logic_compute_group_name", ""),
+                            "compute_group_id": cluster.get("compute_group_id", ""),
+                            "compute_group_name": cluster.get(
+                                "compute_group_name", ""
+                            ),
+                            "cluster_id": cluster.get("cluster_id", ""),
+                            "gpu_type": _first_non_empty(
+                                lcg.get("brand"),
+                                resource_types[0] if resource_types else "",
+                                "",
+                            ),
+                            "workspace_id": workspace_id,
+                        }
+                    )
+        except QzAPIError:
+            compute_groups_from_api = []
+
+        if compute_groups_from_api:
+            return compute_groups_from_api
+
+        nodes = _fetch_all_node_dimensions(api, workspace_id, cookie, page_size=500)
+        compute_groups_from_nodes: List[Dict[str, Any]] = []
+        for node in nodes:
+            lcg = node.get("logic_compute_group", {})
+            lcg_id = lcg.get("id", "")
+            if not lcg_id:
+                continue
+            gpu_info = node.get("gpu_info", {})
+            compute_groups_from_nodes.append(
+                {
+                    "id": lcg_id,
+                    "name": lcg.get("name", ""),
+                    "gpu_type": gpu_info.get("gpu_product_simple", ""),
+                    "workspace_id": workspace_id,
+                }
+            )
+        return compute_groups_from_nodes
+
+    compute_groups = _with_live_cookie(
+        api,
+        display,
+        _fetch_compute_groups,
+        workspace_id=workspace_id,
+    )
+    merged_resources = {
+        "projects": list(cached_resources.get("projects", {}).values()),
+        "compute_groups": _merge_resource_lists(
+            list(cached_resources.get("compute_groups", {}).values()),
+            compute_groups,
+        ),
+        "specs": list(cached_resources.get("specs", {}).values()),
+    }
+    save_resources(
+        workspace_id, merged_resources, ws_name or cached_resources.get("name", "")
+    )
+    return get_workspace_resources(workspace_id)
+
+
+def _load_workspace_resources_for_avail(
+    api, display, workspace_id: str, ws_name: str = ""
+) -> Optional[Dict[str, Any]]:
+    """获取 avail 所需资源缓存，不足时仅轻量刷新 compute groups。"""
+    cached_resources = get_workspace_resources(workspace_id)
+    if cached_resources and cached_resources.get("compute_groups"):
+        return cached_resources
+
+    refreshed = _refresh_workspace_resources_for_avail(
+        api, display, workspace_id, ws_name
+    )
+    return refreshed or cached_resources
 
 
 def _load_workspace_resources_for_create(
