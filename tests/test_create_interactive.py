@@ -533,6 +533,39 @@ class SpecPrefetchTrackingAPI(MultiComputeGroupAPI):
         ]
 
 
+class AmbiguousDistributedWorkspaceAPI(FakeInteractiveAPI):
+    DISTRIBUTED_WORKSPACE_ID = "ws-distributed-primary"
+
+    def __init__(self):
+        self.task_dimension_workspace_ids = []
+
+    def list_workspaces(self, cookie):
+        return [
+            {"id": "ws-distributed-gpu", "name": "分布式GPU空间"},
+            {"id": self.DISTRIBUTED_WORKSPACE_ID, "name": "分布式训练空间"},
+            {"id": "ws-distributed-eval", "name": "分布式评测空间"},
+            {
+                "id": "ws-distributed-dev",
+                "name": "分布式开发空间",
+            },
+        ]
+
+    def list_task_dimension(
+        self, workspace_id, cookie, project_id=None, page_num=1, page_size=200
+    ):
+        self.task_dimension_workspace_ids.append(workspace_id)
+        return {
+            "task_dimensions": [
+                {
+                    "priority": 3,
+                    "gpu": {"total": 8},
+                    "nodes_occupied": {"nodes": ["node-b"]},
+                }
+            ],
+            "total": 1,
+        }
+
+
 def build_create_interactive_snapshot(api, cache):
     display = FakeDisplay()
 
@@ -1829,6 +1862,117 @@ class CreateInteractiveTests(unittest.TestCase):
         ]["lcg-1"]
         self.assertEqual("empty", spec_result["status"])
         self.assertIsNone(spec_result["error"])
+
+    def test_cmd_avail_uses_cached_fuzzy_match_to_break_live_workspace_ambiguity(
+        self,
+    ):
+        cache = ResourceCache()
+        cache.save_resources(
+            AmbiguousDistributedWorkspaceAPI.DISTRIBUTED_WORKSPACE_ID,
+            {
+                "projects": [{"id": "project-1", "name": "Vision Project"}],
+                "compute_groups": [
+                    {
+                        "id": "lcg-1",
+                        "name": "GPU Group A",
+                        "gpu_type": "GPU-A",
+                    }
+                ],
+                "specs": [],
+            },
+            "分布式训练空间",
+        )
+        display = FakeDisplay()
+        api = AmbiguousDistributedWorkspaceAPI()
+        args = argparse.Namespace(
+            workspace="分布式",
+            nodes=None,
+            group=None,
+            low_priority=True,
+            export=False,
+            verbose=False,
+        )
+
+        with patch.object(cli, "get_display", return_value=display), patch.object(
+            cli, "get_api", return_value=api
+        ), patch.object(
+            cli, "get_cookie", return_value={"cookie": "cookie"}
+        ), patch.object(
+            cli, "save_cookie"
+        ), patch.object(
+            cli, "get_credentials", return_value=("", "")
+        ), patch.object(
+            cli, "save_resources", side_effect=cache.save_resources
+        ), patch.object(
+            cli, "get_workspace_resources", side_effect=cache.get_workspace_resources
+        ), patch.object(
+            cli, "set_workspace_name", side_effect=cache.set_workspace_name
+        ), patch.object(
+            cli, "find_workspace_by_name", side_effect=cache.find_workspace_by_name
+        ), patch.object(
+            cli, "find_resource_by_name", side_effect=cache.find_resource_by_name
+        ), patch.object(
+            cli, "list_cached_workspaces", side_effect=cache.list_cached_workspaces
+        ):
+            ret = cli.cmd_avail(args)
+
+        self.assertEqual(0, ret)
+        self.assertEqual(
+            [AmbiguousDistributedWorkspaceAPI.DISTRIBUTED_WORKSPACE_ID],
+            api.task_dimension_workspace_ids,
+        )
+        self.assertTrue(
+            any(
+                f"分布式 -> {AmbiguousDistributedWorkspaceAPI.DISTRIBUTED_WORKSPACE_ID}" in msg
+                for msg in display.messages
+            )
+        )
+
+    def test_cmd_avail_lists_ambiguous_live_workspace_matches_without_cache_tiebreak(
+        self,
+    ):
+        cache = ResourceCache()
+        display = FakeDisplay()
+        api = AmbiguousDistributedWorkspaceAPI()
+        args = argparse.Namespace(
+            workspace="分布式",
+            nodes=None,
+            group=None,
+            low_priority=False,
+            export=False,
+            verbose=False,
+        )
+
+        with patch.object(cli, "get_display", return_value=display), patch.object(
+            cli, "get_api", return_value=api
+        ), patch.object(
+            cli, "get_cookie", return_value={"cookie": "cookie"}
+        ), patch.object(
+            cli, "save_cookie"
+        ), patch.object(
+            cli, "get_credentials", return_value=("", "")
+        ), patch.object(
+            cli, "save_resources", side_effect=cache.save_resources
+        ), patch.object(
+            cli, "get_workspace_resources", side_effect=cache.get_workspace_resources
+        ), patch.object(
+            cli, "set_workspace_name", side_effect=cache.set_workspace_name
+        ), patch.object(
+            cli, "find_workspace_by_name", side_effect=cache.find_workspace_by_name
+        ), patch.object(
+            cli, "find_resource_by_name", side_effect=cache.find_resource_by_name
+        ), patch.object(
+            cli, "list_cached_workspaces", side_effect=cache.list_cached_workspaces
+        ):
+            ret = cli.cmd_avail(args)
+
+        text = "\n".join(display.messages)
+        self.assertEqual(1, ret)
+        self.assertIn("匹配到多个工作空间", text)
+        self.assertIn("分布式训练空间", text)
+        self.assertIn(
+            AmbiguousDistributedWorkspaceAPI.DISTRIBUTED_WORKSPACE_ID, text
+        )
 
     def test_cmd_avail_does_not_prefetch_create_snapshot_or_specs(self):
         cache = ResourceCache()

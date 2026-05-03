@@ -1144,6 +1144,19 @@ def cmd_avail(args):
 
     # 解析 workspace 参数（支持名称或 ID）
     workspace_input = args.workspace
+    cached_workspace_id = ""
+    cached_workspace_name = ""
+    if workspace_input and not workspace_input.startswith("ws-"):
+        # Capture the pre-refresh cache match. _list_available_workspaces updates
+        # workspace names as a side effect, so checking after it runs would turn
+        # live ambiguity into an arbitrary cache-order match.
+        cached_workspace_id = find_workspace_by_name(workspace_input) or ""
+        if cached_workspace_id:
+            cached_resources = get_workspace_resources(cached_workspace_id) or {}
+            cached_workspace_name = str(
+                cached_resources.get("name", "") or workspace_input
+            )
+
     try:
         available_workspace_options = _sort_workspace_options_for_selection(
             _list_available_workspaces(api, display)
@@ -1165,15 +1178,20 @@ def cmd_avail(args):
             )
             return 1
     else:
-        workspace_id, ws_display = _resolve_workspace_option_from_snapshot(
-            available_workspace_options, workspace_input
+        (
+            workspace_id,
+            ws_display,
+            ambiguous_matches,
+        ) = _resolve_workspace_option_for_avail(
+            available_workspace_options,
+            workspace_input,
+            cached_workspace_id=cached_workspace_id,
+            cached_workspace_name=cached_workspace_name,
         )
         if workspace_id:
-            workspace_options = [
-                option
-                for option in available_workspace_options
-                if str(option.get("id", "")) == workspace_id
-            ]
+            workspace_options = _workspace_options_for_resolved_id(
+                available_workspace_options, workspace_id, ws_display
+            )
         elif workspace_input.startswith("ws-"):
             cached_resources = get_workspace_resources(workspace_input) or {}
             workspace_options = [
@@ -1185,9 +1203,16 @@ def cmd_avail(args):
             workspace_id = workspace_input
         else:
             display.print_error(f"未找到名称为 '{workspace_input}' 的工作空间")
-            display.print(
-                "[dim]请先运行 qzcli avail 刷新 workspace 列表，或改用 workspace ID[/dim]"
-            )
+            if ambiguous_matches:
+                display.print("[dim]该名称匹配到多个工作空间，请改用完整名称或 ID:[/dim]")
+                for match in ambiguous_matches:
+                    match_id = str(match.get("id", "") or "")
+                    match_name = str(match.get("name", "") or match_id)
+                    display.print(f"  [dim]- {match_name}: {match_id}[/dim]")
+            else:
+                display.print(
+                    "[dim]请使用 qzcli res --list 查看已缓存工作空间，或改用 workspace ID[/dim]"
+                )
             return 1
 
         if workspace_id and workspace_input != workspace_id:
@@ -2929,6 +2954,84 @@ def _resolve_workspace_option_from_snapshot(
     matched_id = str(matched.get("id", "") or "")
     matched_name = str(matched.get("name", "") or matched_id)
     return matched_id or None, matched_name
+
+
+def _workspace_options_for_resolved_id(
+    workspace_options: List[Dict[str, Any]], workspace_id: str, ws_display: str = ""
+) -> List[Dict[str, Any]]:
+    """Return the live option for a resolved workspace, or a cache-backed option."""
+    for option in workspace_options:
+        if str(option.get("id", "") or "") == workspace_id:
+            return [option]
+
+    cached_resources = get_workspace_resources(workspace_id) or {}
+    return [
+        {
+            "id": workspace_id,
+            "name": ws_display or cached_resources.get("name", workspace_id),
+        }
+    ]
+
+
+def _resolve_workspace_option_for_avail(
+    workspace_options: List[Dict[str, Any]],
+    workspace_value: str,
+    *,
+    cached_workspace_id: str = "",
+    cached_workspace_name: str = "",
+) -> Tuple[Optional[str], str, List[Dict[str, Any]]]:
+    """Resolve workspace for avail while preserving legacy cached fuzzy aliases."""
+    if not workspace_value:
+        return None, "", []
+
+    for option in workspace_options:
+        option_id = str(option.get("id", "") or "")
+        option_name = str(option.get("name", "") or option_id)
+        if not option_id:
+            continue
+        if workspace_value == option_id:
+            return option_id, option_name or option_id, []
+
+    exact_match: Optional[Dict[str, Any]] = None
+    fuzzy_matches: List[Dict[str, Any]] = []
+    lowered = workspace_value.lower()
+    for option in workspace_options:
+        option_id = str(option.get("id", "") or "")
+        option_name = str(option.get("name", "") or option_id)
+        if not option_id:
+            continue
+        if option_name == workspace_value:
+            exact_match = option
+            break
+        if option_name and lowered in option_name.lower():
+            fuzzy_matches.append(option)
+
+    if exact_match:
+        matched_id = str(exact_match.get("id", "") or "")
+        matched_name = str(exact_match.get("name", "") or matched_id)
+        return matched_id or None, matched_name, []
+
+    if cached_workspace_id:
+        for option in workspace_options:
+            if str(option.get("id", "") or "") == cached_workspace_id:
+                return (
+                    cached_workspace_id,
+                    str(
+                        option.get("name", "")
+                        or cached_workspace_name
+                        or cached_workspace_id
+                    ),
+                    [],
+                )
+        return cached_workspace_id, cached_workspace_name or cached_workspace_id, []
+
+    if len(fuzzy_matches) == 1:
+        matched = fuzzy_matches[0]
+        matched_id = str(matched.get("id", "") or "")
+        matched_name = str(matched.get("name", "") or matched_id)
+        return matched_id or None, matched_name, []
+
+    return None, "", fuzzy_matches
 
 
 def _load_create_interactive_snapshot_if_available() -> Optional[Dict[str, Any]]:
