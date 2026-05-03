@@ -868,6 +868,8 @@ class CreateInteractiveTests(unittest.TestCase):
                 build_fixture_value("refresh-auth"),
             ),
         ), patch.object(
+            cli, "set_workspace_name", return_value=True
+        ), patch.object(
             cli, "list_cached_workspaces", return_value=[]
         ):
             workspaces = cli._list_available_workspaces(api, display)

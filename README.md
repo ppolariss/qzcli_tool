@@ -9,6 +9,7 @@
 - **节点查询**: `qzcli avail` 查询各计算组空余节点，支持低优任务统计和 cookie 失效自动刷新
 - **交互式提交**: `qzcli create -i` 提供层级式选择界面，缺少快照时按需预加载
 - **任务列表**: 美观的卡片式显示，完整 URL 方便点击
+- **日志查看**: `qzcli logs <job-id>` 直连平台日志接口，支持 tail、follow、raw/json 输出
 - **状态监控**: watch 模式实时跟踪任务进度
 
 开启启智的极致hack
@@ -449,8 +450,31 @@ done
 |------|------|------|
 | `status` | 查看任务详情 | `qzcli status job-xxx` |
 | `stop` | 停止任务 | `qzcli stop job-xxx` |
+| `logs` | 查看任务容器日志 | `qzcli logs job-xxx --tail 100` |
 | `watch` | 实时监控 | `qzcli watch -i 10` |
 | `track` | 追踪任务 | `qzcli track job-xxx` |
+
+```bash
+# 查看最近 200 条日志（默认）
+qzcli logs job-xxx
+
+# 查看最近 N 条，按时间顺序打印
+qzcli logs job-xxx --tail 50
+
+# 类似 tail -f 持续轮询新日志
+qzcli logs job-xxx --follow --tail 20 --interval 3
+
+# 只输出 message，便于 grep/管道处理
+qzcli logs job-xxx --tail 100 --raw
+
+# 每条日志输出一行原始 JSON
+qzcli logs job-xxx --tail 10 --json
+
+# 只看指定 pod，或只看某个时间之后的日志
+qzcli logs job-xxx --pod job-xxx-worker-0 --since 10m
+```
+
+`logs` 使用平台 `/api/v2/train?Action=GetJobLog` 接口，需要 `qzcli login` 保存的 cookie。若提示 Cookie 过期，重新运行 `qzcli login` 后再试。
 
 ### 工作空间视图
 
@@ -530,4 +554,5 @@ CLI 参数 > --password-stdin > shell 环境变量 > QZCLI_ENV_FILE 指向的 .e
 - **提交 HPC 任务**: `qzcli login && qzcli hpc --name "job" --workspace ws-xxx --compute-group lcg-xxx --predef-quota-id uuid --cpu 55 --mem-gi 300 --instances 30 --image img --entrypoint "bash run.sh"`
 - **批量提交**: `qzcli batch config.json` 从配置文件批量提交
 - **监控任务**: `qzcli ls -c --all-ws -r` 查看所有工作空间运行中的任务
+- **查看日志**: `qzcli logs job-xxx --tail 100` 拉取任务容器日志，`--follow` 可持续轮询
 - **详细信息**: `qzcli ws` 查看 GPU/CPU/内存使用率
