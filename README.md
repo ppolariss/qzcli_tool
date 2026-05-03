@@ -545,6 +545,12 @@ export QZCLI_ENV_FILE="/path/to/.env"   # 可选，自定义凭据文件位置
 CLI 参数 > --password-stdin > shell 环境变量 > QZCLI_ENV_FILE 指向的 .env（默认 ~/.qzcli/.env） > ~/.qzcli/config.json > 交互输入
 ```
 
+## 致谢
+
+qzcli 的很多能力来自实际使用中的持续反馈、PR 和接口探索。感谢所有参与试用、贡献和反馈的同学。
+
+特别感谢 [`SII-Holos/holos-inspire`](https://github.com/SII-Holos/holos-inspire) 和 [`EmbodiedForge/Inspire-cli`](https://github.com/EmbodiedForge/Inspire-cli) 在启智平台命令行工作流、认证路径和接口探索上的启发与铺垫。qzcli 在此基础上继续面向任务管理、资源查询、日志查看、批量提交和 MCP/agent workflow 做了扩展，希望能让更多启智平台用户少点重复点击，多点自动化空间。
+
 ## 使用建议
 
 - **日常使用**: `qzcli login && qzcli avail` 一键登录并查看资源
