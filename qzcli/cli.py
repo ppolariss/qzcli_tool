@@ -1159,7 +1159,9 @@ def cmd_avail(args):
 
     try:
         available_workspace_options = _sort_workspace_options_for_selection(
-            _list_available_workspaces(api, display)
+            _list_available_workspaces(
+                api, display, include_usage_snapshot=not bool(workspace_input)
+            )
         )
     except QzAPIError as e:
         if _is_auth_related_error(e) or "未设置 cookie" in str(e):
@@ -3273,7 +3275,9 @@ def _format_capacity_summary(option: Dict[str, Any]) -> str:
     return " | ".join(parts)
 
 
-def _list_available_workspaces(api, display) -> List[Dict[str, Any]]:
+def _list_available_workspaces(
+    api, display, *, include_usage_snapshot: bool = True
+) -> List[Dict[str, Any]]:
     """优先从当前可访问 workspace API 获取工作空间，失败时回退到本地缓存。"""
     workspaces: List[Dict[str, Any]] = []
 
@@ -3286,6 +3290,7 @@ def _list_available_workspaces(api, display) -> List[Dict[str, Any]]:
             ws_name = ws.get("name", "")
             if ws_id:
                 set_workspace_name(ws_id, ws_name)
+            if ws_id and include_usage_snapshot:
                 try:
                     usage_snapshot = _load_workspace_usage_snapshot(api, display, ws_id)
                     ws.update(usage_snapshot.get("workspace", {}))

@@ -538,6 +538,8 @@ class AmbiguousDistributedWorkspaceAPI(FakeInteractiveAPI):
 
     def __init__(self):
         self.task_dimension_workspace_ids = []
+        self.workspace_usage_snapshot_ids = []
+        self.compute_group_node_workspace_ids = []
 
     def list_workspaces(self, cookie):
         return [
@@ -564,6 +566,28 @@ class AmbiguousDistributedWorkspaceAPI(FakeInteractiveAPI):
             ],
             "total": 1,
         }
+
+    def list_node_dimension(
+        self,
+        workspace_id,
+        cookie,
+        logic_compute_group_id=None,
+        compute_group_id=None,
+        page_num=1,
+        page_size=500,
+    ):
+        if logic_compute_group_id or compute_group_id:
+            self.compute_group_node_workspace_ids.append(workspace_id)
+        else:
+            self.workspace_usage_snapshot_ids.append(workspace_id)
+        return super().list_node_dimension(
+            workspace_id,
+            cookie,
+            logic_compute_group_id=logic_compute_group_id,
+            compute_group_id=compute_group_id,
+            page_num=page_num,
+            page_size=page_size,
+        )
 
 
 def build_create_interactive_snapshot(api, cache):
@@ -1920,6 +1944,14 @@ class CreateInteractiveTests(unittest.TestCase):
         self.assertEqual(
             [AmbiguousDistributedWorkspaceAPI.DISTRIBUTED_WORKSPACE_ID],
             api.task_dimension_workspace_ids,
+        )
+        self.assertEqual(
+            [AmbiguousDistributedWorkspaceAPI.DISTRIBUTED_WORKSPACE_ID],
+            api.workspace_usage_snapshot_ids,
+        )
+        self.assertEqual(
+            [AmbiguousDistributedWorkspaceAPI.DISTRIBUTED_WORKSPACE_ID],
+            api.compute_group_node_workspace_ids,
         )
         self.assertTrue(
             any(
