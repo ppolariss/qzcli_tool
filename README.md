@@ -1,6 +1,15 @@
 # qzcli - 启智平台任务管理 CLI
 
-一个类似 kubectl/docker 风格的 CLI 工具，用于管理启智平台任务。
+![Release](https://img.shields.io/github/v/release/tianyilt/qzcli_tool?sort=semver) ![Python](https://img.shields.io/badge/python-%3E%3D3.8-blue) ![Tests](https://img.shields.io/badge/tests-54%20passed%2C%201%20skipped-brightgreen) ![License](https://img.shields.io/badge/license-MIT-green)
+
+一个类似 `kubectl` / `docker` 风格的启智平台命令行工具，把资源查询、任务提交、任务管理、日志查看和 MCP/agent 工作流收敛到 CLI 里完成。
+
+## 项目链接
+
+- Release: <https://github.com/tianyilt/qzcli_tool/releases/tag/v0.2.0>
+- Changelog: [CHANGELOG.md](CHANGELOG.md)
+- Issues: <https://github.com/tianyilt/qzcli_tool/issues>
+- License: [MIT](LICENSE)
 
 ## 特性
 
@@ -12,10 +21,10 @@
 - **日志查看**: `qzcli logs <job-id>` 直连平台日志接口，支持 tail、follow、raw/json 输出
 - **状态监控**: watch 模式实时跟踪任务进度
 
-开启启智的极致hack
+快速查看资源：
+
 ```bash
 qzcli login -u 用户名 -p 密码 && qzcli avail
- 
 ```
 ```
 分布式
@@ -27,12 +36,11 @@ qzcli login -u 用户名 -p 密码 && qzcli avail
   cuda12.8版本某gpu1                 0      xxx  x/xxx 某gpu1   
 ```
 
-## 安装依赖
+## 安装
 
 ```bash
-pip install rich requests prompt_toolkit mcp
-
 cd qzcli_tool
+pip install -r requirements.txt
 pip install -e .
 ```
 
@@ -544,6 +552,33 @@ export QZCLI_ENV_FILE="/path/to/.env"   # 可选，自定义凭据文件位置
 ```bash
 CLI 参数 > --password-stdin > shell 环境变量 > QZCLI_ENV_FILE 指向的 .env（默认 ~/.qzcli/.env） > ~/.qzcli/config.json > 交互输入
 ```
+
+## Roadmap
+
+- Cookie-auth Plan A: 将 `create` / `status` / `stop` 等训练任务操作正式迁移到 `/api/v1/*` + session cookie，并保留 token path 作为 legacy fallback。
+- Cookie API 收敛: 提取统一的 browser headers 和 cookie request wrapper，减少 `api.py` 中重复 headers。
+- 作业提交稳定性: 完整支持 `/api/v1/train_job/create` 的 `resource_spec_price` schema，补齐相关测试。
+- Release 工程化: 继续完善 changelog、贡献者说明、issue 模板和版本发布流程。
+
+## Known Issues
+
+- 对 CAS 联合认证用户，`/auth/token` / `/openapi/v1/*` token path 可能返回 `invalid_grant`。日常功能优先使用 `qzcli login` 保存的 session cookie。
+- Cookie 有过期时间；如果命令提示 Cookie 过期，重新运行 `qzcli login`，或配置 `QZCLI_USERNAME` / `QZCLI_PASSWORD` 让 qzcli 自动刷新。
+- 平台接口字段偶尔会变化；如果输出异常，优先附带 `--json` 输出或原始报错开 issue。
+
+## Contributors
+
+感谢所有参与代码、PR、测试和反馈的同学：
+
+- [@tianyilt](https://github.com/tianyilt)
+- [@0-693](https://github.com/0-693)
+- [@gaoyang07](https://github.com/gaoyang07)
+- [@YushunXiang](https://github.com/YushunXiang)
+- [@GQH123](https://github.com/GQH123)
+- [@Hashmapw](https://github.com/Hashmapw)
+- [@SyntaxSmith](https://github.com/SyntaxSmith)
+- [@ekonwang](https://github.com/ekonwang)
+- [@Stepuuu](https://github.com/Stepuuu)
 
 ## 致谢
 
