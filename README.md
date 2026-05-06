@@ -555,9 +555,7 @@ CLI 参数 > --password-stdin > shell 环境变量 > QZCLI_ENV_FILE 指向的 .e
 
 ## Roadmap
 
-- Cookie-auth Plan A: 将 `create` / `status` / `stop` 等训练任务操作正式迁移到 `/api/v1/*` + session cookie，并保留 token path 作为 legacy fallback。
 - Cookie API 收敛: 提取统一的 browser headers 和 cookie request wrapper，减少 `api.py` 中重复 headers。
-- 作业提交稳定性: 完整支持 `/api/v1/train_job/create` 的 `resource_spec_price` schema，补齐相关测试。
 - Release 工程化: 继续完善 changelog、贡献者说明、issue 模板和版本发布流程。
 
 ## Known Issues

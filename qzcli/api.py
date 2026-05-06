@@ -124,6 +124,25 @@ def _curl_post(
     )
 
 
+def build_resource_spec_price(
+    spec_obj: Dict[str, Any], compute_group_id: str
+) -> Dict[str, Any]:
+    """Build the resource_spec_price object the new /api/v1/train_job/create expects.
+
+    Mirrors the slurm_cluster_spec.spec_price shape used by create_hpc_job. Translates
+    the cache field name `memory_gb` to the platform field name `memory_size_gib`.
+    """
+    return {
+        "cpu_type": "",
+        "cpu_count": int(spec_obj.get("cpu_count") or 0),
+        "gpu_type": spec_obj.get("gpu_type") or "",
+        "gpu_count": int(spec_obj.get("gpu_count") or 0),
+        "memory_size_gib": int(spec_obj.get("memory_gb") or 0),
+        "logic_compute_group_id": compute_group_id,
+        "quota_id": spec_obj.get("id") or "",
+    }
+
+
 class QzAPI:
     """启智平台 API 客户端"""
 

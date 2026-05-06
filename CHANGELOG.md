@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- `qzcli create` and the `qz_create_job` MCP tool now build the `/api/v1/train_job/create` payload using the platform's new `resource_spec_price` schema. The legacy `framework_config[0].spec_id` field is no longer sent (the platform rejects it with `unknown field "spec_id"`). `cpu` / `mem_gi` / `gpu_count` are also promoted to `framework_config[0]` to satisfy the same endpoint's `Cpu and Mem can't be empty.` check.
+- `qzcli create` now prefers cookie auth (`/api/v1/train_job/create`) by default and only falls back to the openapi token path when no cookie is available — this aligns the CLI with `qz_create_job` and unblocks CAS-federated users who previously got `invalid_grant`.
+- New public helper `qzcli.api.build_resource_spec_price(spec_obj, compute_group_id)` shared by CLI and MCP. New CLI helper `_lookup_spec_for_payload` auto-refreshes the spec cache when cpu/gpu/memory fields are missing, and gives a `qzcli res -u` hint if still unresolved.
+
 ## v0.2.0 - 2026-05-04
 
 qzcli v0.2.0 is the first tagged release for the project, collecting the recent work on job logs, WSL/VPN networking, faster capacity checks, MCP integration, interactive workloads, and HPC/CPU job submission into a versioned release.

@@ -10,7 +10,7 @@ from typing import Any, Optional
 
 from mcp.server.fastmcp import FastMCP
 
-from .api import QzAPIError, get_api
+from .api import QzAPIError, build_resource_spec_price, get_api
 from .config import (
     find_resource_by_name,
     find_workspace_by_name,
@@ -1101,6 +1101,49 @@ def qz_create_job(
             raise RuntimeError("未指定规格且缓存中无可用规格。请指定 spec 或先调用 qz_refresh_resources。")
         warnings.append(f"自动选择规格: {spec_name} ({spec_id})")
 
+    # Resolve full spec details for resource_spec_price (cpu/gpu/mem/gpu_type/quota_id)
+    ws_res = get_workspace_resources(workspace_id) or {}
+    spec_obj = (ws_res.get("specs") or {}).get(spec_id) or {}
+    if not (
+        spec_obj.get("cpu_count")
+        or spec_obj.get("gpu_count")
+        or spec_obj.get("memory_gb")
+    ):
+        # Try one live refresh via /openapi/v1/specs/list, merge back into cache.
+        try:
+            fetched = api.list_specs(compute_group_id) or []
+            for raw in fetched:
+                if raw.get("id") == spec_id or raw.get("quota_id") == spec_id:
+                    spec_obj = {
+                        "id": spec_id,
+                        "logic_compute_group_id": compute_group_id,
+                        "gpu_count": raw.get("gpu_count", 0),
+                        "cpu_count": raw.get("cpu_count", 0),
+                        "memory_gb": raw.get("memory_size_gib", 0)
+                        or raw.get("memory_gb", 0),
+                        "gpu_type": (raw.get("gpu_info") or {}).get(
+                            "gpu_product_simple"
+                        )
+                        or raw.get("gpu_type", ""),
+                    }
+                    break
+        except QzAPIError:
+            pass
+    if not (
+        spec_obj.get("cpu_count")
+        or spec_obj.get("gpu_count")
+        or spec_obj.get("memory_gb")
+    ):
+        raise RuntimeError(
+            f"无法解析规格 '{spec_id}' 的 cpu/gpu/memory 信息，"
+            "请先调用 qz_refresh_resources 刷新缓存后再试。"
+        )
+
+    spec_price = build_resource_spec_price(spec_obj, compute_group_id)
+
+    # 平台已弃用 framework_config[0].spec_id，改用嵌套 resource_spec_price，
+    # 同时 framework_config[0] 顶层也要带 cpu/mem_gi/gpu_count 否则会被拒
+    # ("Cpu and Mem can't be empty.")。
     payload = {
         "name": name,
         "logic_compute_group_id": compute_group_id,
@@ -1112,7 +1155,10 @@ def qz_create_job(
         "auto_fault_tolerance": False,
         "framework_config": [
             {
-                "spec_id": spec_id,
+                "cpu": int(spec_obj.get("cpu_count") or 0),
+                "gpu_count": int(spec_obj.get("gpu_count") or 0),
+                "mem_gi": int(spec_obj.get("memory_gb") or 0),
+                "resource_spec_price": spec_price,
                 "image": image,
                 "image_type": image_type,
                 "instance_count": instances,
