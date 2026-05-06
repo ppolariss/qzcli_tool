@@ -1,6 +1,8 @@
 import sys
+import socket
 import types
 from argparse import Namespace
+from http.server import BaseHTTPRequestHandler
 
 import qzcli.cli as cli
 import qzcli.create_commands as create_commands
@@ -115,6 +117,31 @@ def test_blame_alias_can_disable_dashboard(monkeypatch):
 
     assert cli.main() == 0
     assert captured == {"serve": False, "command": "blame"}
+
+
+def test_task_dashboard_skips_busy_port():
+    class _Handler(BaseHTTPRequestHandler):
+        def log_message(self, format, *args):  # noqa: A003
+            return None
+
+    busy = socket.socket()
+    server = None
+    try:
+        busy.bind(("127.0.0.1", 0))
+        busy.listen(1)
+        busy_port = busy.getsockname()[1]
+
+        server, requested = task_dimensions._bind_dashboard_server(
+            "127.0.0.1", busy_port, _Handler
+        )
+
+        assert requested == busy_port
+        assert server.server_address[1] != busy_port
+        assert busy_port < server.server_address[1] < busy_port + 50
+    finally:
+        if server is not None:
+            server.server_close()
+        busy.close()
 
 
 def test_hpc_jobs_parser_accepts_created_by_and_status(monkeypatch):

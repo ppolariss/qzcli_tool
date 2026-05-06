@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import webbrowser
 from collections import defaultdict
@@ -2106,12 +2107,15 @@ def _serve_dashboard(
     fetch_snapshot, initial_snapshot: Dict[str, Any], host: str, port: int
 ) -> int:
     display = get_display()
-    server = ThreadingHTTPServer(
-        (host, port), _make_handler(fetch_snapshot, initial_snapshot)
-    )
+    handler = _make_handler(fetch_snapshot, initial_snapshot)
+    server, requested_port = _bind_dashboard_server(host, port, handler)
     actual_port = server.server_address[1]
     url = f"http://{host}:{actual_port}/"
 
+    if requested_port and actual_port != requested_port:
+        display.print_warning(
+            f"端口 {requested_port} 已被占用，已自动改用 {actual_port}"
+        )
     display.print_success(f"前端已启动: {url}")
     display.print("[dim]页面刷新时会重新拉取最新任务数据；按 Ctrl+C 停止服务。[/dim]")
 
@@ -2126,6 +2130,29 @@ def _serve_dashboard(
     finally:
         server.server_close()
     return 0
+
+
+def _bind_dashboard_server(
+    host: str, port: int, handler
+) -> Tuple[ThreadingHTTPServer, int]:
+    """Bind dashboard server, scanning following ports when the target is busy."""
+    requested_port = port
+    if port == 0:
+        return ThreadingHTTPServer((host, port), handler), requested_port
+
+    last_error = None
+    for candidate in range(port, port + 50):
+        try:
+            return ThreadingHTTPServer((host, candidate), handler), requested_port
+        except OSError as exc:
+            last_error = exc
+            if exc.errno != errno.EADDRINUSE:
+                raise
+
+    raise OSError(
+        errno.EADDRINUSE,
+        f"端口 {port}-{port + 49} 均已被占用，请使用 --port 指定其他端口",
+    ) from last_error
 
 
 def cmd_task_dimensions(args) -> int:
