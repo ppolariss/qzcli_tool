@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from . import __version__
-from .api import QzAPIError, get_api
+from .api import QzAPIError, build_resource_spec_price, get_api
 from .config import (
     CONFIG_DIR,
     clear_cookie,
@@ -3798,6 +3798,61 @@ def _load_specs_for_create(
     )["items"]
 
 
+def _lookup_spec_for_payload(
+    api,
+    workspace_id: str,
+    ws_name: str,
+    compute_group_id: str,
+    spec_id: str,
+    display=None,
+) -> Dict[str, Any]:
+    """获取构造 resource_spec_price 所需的完整 spec 字段。
+
+    优先读 resources.json 缓存；若缺 cpu_count/gpu_count/memory_gb，自动调一次
+    /openapi/v1/specs/list 刷新再读；仍不齐则抛错，提示 ``qzcli res -w <ws> -u``。
+    """
+
+    def _read_normalized_spec(workspace_id_: str, spec_id_: str) -> Dict[str, Any]:
+        cached = get_workspace_resources(workspace_id_) or {}
+        raw = (cached.get("specs") or {}).get(spec_id_) or {}
+        normalized = _normalize_spec_item(raw, compute_group_id) if raw else None
+        return normalized or {}
+
+    spec_obj = _read_normalized_spec(workspace_id, spec_id)
+    has_resource_fields = bool(
+        spec_obj.get("cpu_count")
+        or spec_obj.get("gpu_count")
+        or spec_obj.get("memory_gb")
+    )
+    if has_resource_fields:
+        return spec_obj
+
+    # 缓存里没有可用的 cpu/gpu/mem 字段，尝试一次实时刷新。
+    try:
+        _load_specs_for_create_result(
+            api,
+            workspace_id,
+            ws_name,
+            compute_group_id,
+            display=display,
+            emit_messages=False,
+        )
+    except Exception:
+        pass
+
+    spec_obj = _read_normalized_spec(workspace_id, spec_id)
+    if not (
+        spec_obj.get("cpu_count")
+        or spec_obj.get("gpu_count")
+        or spec_obj.get("memory_gb")
+    ):
+        raise QzAPIError(
+            f"无法解析规格 '{spec_id}' 的 cpu/gpu/memory 信息，"
+            "请运行 `qzcli res -w <workspace> -u` 刷新缓存后再试"
+        )
+    return spec_obj
+
+
 def _auto_select_spec_for_compute_group(
     workspace_id: str, compute_group_id: str
 ) -> Tuple[Optional[str], Optional[str]]:
@@ -5867,7 +5922,30 @@ def cmd_create(args):
             return 1
         display.print(f"[dim]自动选择规格: {spec_display} ({spec_id})[/dim]")
 
+    # --- Resolve spec details for resource_spec_price ---
+    try:
+        spec_obj = _lookup_spec_for_payload(
+            api,
+            workspace_id,
+            ws_display,
+            compute_group_id,
+            spec_id,
+            display=display,
+        )
+    except QzAPIError as e:
+        if args.dry_run:
+            # 在 dry-run 下，缺规格字段不阻塞 payload 预览。
+            display.print(f"[dim]规格字段不完整 ({e})；dry-run 仍会输出 payload[/dim]")
+            spec_obj = {"id": spec_id}
+        else:
+            display.print_error(str(e))
+            return 1
+    spec_price = build_resource_spec_price(spec_obj, compute_group_id)
+
     # --- Build payload ---
+    # 平台已弃用 framework_config[0].spec_id，改用嵌套 resource_spec_price，
+    # 同时 framework_config[0] 顶层也要带 cpu/mem_gi/gpu_count 否则会被拒
+    # ("Cpu and Mem can't be empty.")。
     payload = {
         "name": args.name,
         "logic_compute_group_id": compute_group_id,
@@ -5879,7 +5957,10 @@ def cmd_create(args):
         "auto_fault_tolerance": False,
         "framework_config": [
             {
-                "spec_id": spec_id,
+                "cpu": int(spec_obj.get("cpu_count") or 0),
+                "gpu_count": int(spec_obj.get("gpu_count") or 0),
+                "mem_gi": int(spec_obj.get("memory_gb") or 0),
+                "resource_spec_price": spec_price,
                 "image": args.image,
                 "image_type": args.image_type,
                 "instance_count": args.instances,
@@ -5913,8 +5994,16 @@ def cmd_create(args):
     display.print("")
 
     # --- Submit ---
+    # 优先走 cookie auth (/api/v1/train_job/create)：它接受 framework_config[0]
+    # 顶层的 cpu/mem_gi 字段；老的 openapi 路径 (/openapi/v1/train_job/create)
+    # 用 protobuf 校验，会拒掉同样的字段。CAS 用户的 token path 也常因
+    # invalid_grant 失败，cookie path 是项目主推方向。
     try:
-        result = api.create_job(payload)
+        cookie_data = get_cookie()
+        if cookie_data and cookie_data.get("cookie"):
+            result = api.create_job_with_cookie(cookie_data["cookie"], payload)
+        else:
+            result = api.create_job(payload)
     except QzAPIError as e:
         display.print_error(f"任务创建失败: {e}")
         return 1
