@@ -419,7 +419,14 @@ def qz_auth_login(username: str = "", password: str = "", workspace_id: str = ""
         username = username or cfg_user
         password = password or cfg_pwd
     if not username or not password:
-        raise QzAPIError("未配置认证信息，请传入 username/password 或设置 QZCLI_USERNAME/QZCLI_PASSWORD 环境变量")
+        raise QzAPIError(
+            "未配置认证信息。可按以下任一方式提供凭据(优先级: 调用参数 > 环境变量 > "
+            "~/.qzcli/.env > ~/.qzcli/config.json):"
+            "\n  - 调用参数 username / password"
+            "\n  - 环境变量 QZCLI_USERNAME / QZCLI_PASSWORD"
+            "\n  - ~/.qzcli/.env 中的 QZCLI_USERNAME / QZCLI_PASSWORD"
+            "\n  - ~/.qzcli/config.json 的 username / password 字段(可加密)"
+        )
     api = get_api()
     cookie = api.login_with_cas(username, password)
     save_cookie(cookie, workspace_id)
