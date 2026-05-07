@@ -18,7 +18,14 @@ DEFAULT_CONFIG = {
 
 
 def get_proxy() -> str:
-    """获取 SOCKS5 代理地址，优先从配置文件读取，回退到环境变量。"""
+    """获取 HTTP 请求所用代理地址。
+
+    精度顺序: ``~/.qzcli/config.json`` 的 ``proxy`` 字段 → 环境变量
+    ``ALL_PROXY`` → 环境变量 ``HTTPS_PROXY``。返回的字符串可以是任一受支持
+    scheme 的 URL,包含 ``http://``、``https://``、``socks4://``、``socks4a://``、
+    ``socks5://``、``socks5h://``;``qzcli.api._get_pool_manager`` 会根据
+    scheme 选择合适的 urllib3 manager。空字符串表示不走代理(直连)。
+    """
     cfg = load_config()
     proxy = cfg.get("proxy", "")
     if proxy:
