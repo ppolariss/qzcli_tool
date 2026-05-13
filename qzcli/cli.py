@@ -10,7 +10,7 @@ import time
 import unicodedata
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 from . import __version__
 from .api import QzAPIError, get_api
@@ -539,6 +539,213 @@ def _hpc_job_from_api_response(job_data, workspace_name: str = "") -> JobRecord:
     return job
 
 
+SELF_CREATED_BY_ALIASES = {
+    "me",
+    "mine",
+    "self",
+    "current",
+    "current-user",
+    "我",
+    "自己",
+}
+
+
+def _created_by_identity(job_data: Dict[str, Any]) -> Dict[str, Any]:
+    created_by = job_data.get("created_by") or {}
+    if isinstance(created_by, dict):
+        return created_by
+    if created_by:
+        return {"id": str(created_by)}
+    return {}
+
+
+def _created_by_alias_values(identity: Dict[str, Any]) -> Set[str]:
+    extra_info = identity.get("extra_info") or {}
+    if not isinstance(extra_info, dict):
+        extra_info = {}
+
+    values = [
+        identity.get("id"),
+        identity.get("name"),
+        identity.get("name_en"),
+        extra_info.get("institution_id"),
+        extra_info.get("login_name"),
+    ]
+    return {
+        str(value).strip().lower()
+        for value in values
+        if str(value or "").strip()
+    }
+
+
+def _config_created_by_alias_values(config: Dict[str, Any]) -> Set[str]:
+    values = [
+        config.get("user_id"),
+        config.get("user_name"),
+        config.get("user_name_en"),
+        config.get("institution_id"),
+        config.get("login_name"),
+        config.get("username"),
+    ]
+    return {
+        str(value).strip().lower()
+        for value in values
+        if str(value or "").strip()
+    }
+
+
+def _cache_current_user_identity(identity: Dict[str, Any]) -> None:
+    user_id = str(identity.get("id") or "").strip()
+    if not user_id:
+        return
+
+    extra_info = identity.get("extra_info") or {}
+    if not isinstance(extra_info, dict):
+        extra_info = {}
+
+    config = load_config()
+    updates = {
+        "user_id": user_id,
+        "user_name": str(identity.get("name") or "").strip(),
+        "user_name_en": str(identity.get("name_en") or "").strip(),
+        "institution_id": str(extra_info.get("institution_id") or "").strip(),
+        "login_name": str(extra_info.get("login_name") or "").strip(),
+    }
+
+    changed = False
+    for key, value in updates.items():
+        if value and config.get(key) != value:
+            config[key] = value
+            changed = True
+    if changed:
+        save_config(config)
+
+
+def _should_cache_as_current_user(selector: str, identity: Dict[str, Any]) -> bool:
+    selector_norm = selector.strip().lower()
+    if selector_norm in SELF_CREATED_BY_ALIASES:
+        return True
+
+    config = load_config()
+    username = str(config.get("username") or "").strip().lower()
+    if username and username in _created_by_alias_values(identity):
+        return True
+    return bool(
+        selector_norm and selector_norm in _config_created_by_alias_values(config)
+    )
+
+
+def _resolve_created_by_from_cache(selector: str) -> str:
+    selector_norm = selector.strip().lower()
+    config = load_config()
+    user_id = str(config.get("user_id") or "").strip()
+    if not user_id:
+        return ""
+
+    if selector_norm in SELF_CREATED_BY_ALIASES:
+        return user_id
+    if selector_norm in _config_created_by_alias_values(config):
+        return user_id
+    return ""
+
+
+def _find_created_by_identity(
+    api,
+    cookie: str,
+    workspace_refs: List[Dict[str, str]],
+    selector: str,
+    *,
+    include_train: bool,
+    include_hpc: bool,
+) -> Dict[str, Any]:
+    selector_norm = selector.strip().lower()
+    config = load_config()
+    username = str(config.get("username") or "").strip().lower()
+    match_values = (
+        {selector_norm}
+        if selector_norm not in SELF_CREATED_BY_ALIASES
+        else set()
+    )
+    if selector_norm in SELF_CREATED_BY_ALIASES and username:
+        match_values.add(username)
+
+    for workspace in workspace_refs:
+        workspace_id = str(workspace.get("id", "") or "")
+        if not workspace_id:
+            continue
+
+        probe_results = []
+        if include_train:
+            try:
+                probe_results.append(
+                    api.list_jobs_with_cookie(workspace_id, cookie, page_size=100)
+                )
+            except QzAPIError:
+                pass
+        if include_hpc:
+            try:
+                probe_results.append(
+                    api.list_hpc_jobs_with_cookie(workspace_id, cookie, page_size=100)
+                )
+            except QzAPIError:
+                pass
+
+        for result in probe_results:
+            for job_data in result.get("jobs", []):
+                identity = _created_by_identity(job_data)
+                user_id = str(identity.get("id") or "").strip()
+                if not user_id:
+                    continue
+                if match_values & _created_by_alias_values(identity):
+                    return identity
+
+    return {}
+
+
+def _resolve_created_by_selector(
+    api,
+    cookie: str,
+    workspace_refs: List[Dict[str, str]],
+    selector: str,
+    *,
+    include_train: bool,
+    include_hpc: bool,
+) -> str:
+    selector = selector.strip()
+    if not selector:
+        return ""
+    if selector.startswith("user-"):
+        return selector
+
+    cached_user_id = _resolve_created_by_from_cache(selector)
+    if cached_user_id:
+        return cached_user_id
+
+    identity = _find_created_by_identity(
+        api,
+        cookie,
+        workspace_refs,
+        selector,
+        include_train=include_train,
+        include_hpc=include_hpc,
+    )
+    user_id = str(identity.get("id") or "").strip()
+    if user_id:
+        if _should_cache_as_current_user(selector, identity):
+            _cache_current_user_identity(identity)
+        return user_id
+
+    if selector.lower() in SELF_CREATED_BY_ALIASES:
+        raise ValueError(
+            "无法解析当前登录用户的 created_by，请先用 qzcli list -c "
+            "或传入 user- 开头的用户 ID"
+        )
+    raise ValueError(
+        f"无法解析 created_by={selector!r}，请传入 user- 开头的用户 ID，"
+        "或使用 me/自己的姓名/登录号"
+    )
+
+
 def cmd_hpc_jobs(args):
     """查看 /api/v1/hpc_jobs/list 任务列表。"""
     display = get_display()
@@ -567,6 +774,27 @@ def cmd_hpc_jobs(args):
         ws_resources = get_workspace_resources(workspace_id)
         ws_name = ws_resources.get("name", "") if ws_resources else ""
 
+    created_by = (args.created_by or "").strip()
+    if getattr(args, "mine", False):
+        if created_by and created_by.lower() not in SELF_CREATED_BY_ALIASES:
+            display.print_error("--mine 不能和非 me/self 的 --created-by 同时使用")
+            return 1
+        created_by = "me"
+
+    if created_by:
+        try:
+            created_by = _resolve_created_by_selector(
+                api,
+                cookie,
+                [{"id": workspace_id, "name": ws_name}],
+                created_by,
+                include_train=False,
+                include_hpc=True,
+            )
+        except ValueError as e:
+            display.print_error(str(e))
+            return 1
+
     status_filters = []
     if args.queued:
         status_filters = ["QUEUEING"]
@@ -588,7 +816,7 @@ def cmd_hpc_jobs(args):
                         cookie,
                         page_num=args.page,
                         page_size=args.limit,
-                        created_by=args.created_by,
+                        created_by=created_by,
                         status=status,
                     )
                 except QzAPIError as e:
@@ -604,7 +832,7 @@ def cmd_hpc_jobs(args):
                 cookie,
                 page_num=args.page,
                 page_size=args.limit,
-                created_by=args.created_by,
+                created_by=created_by,
             )
             total = int(result.get("total", 0) or 0)
             jobs_data = result.get("jobs", [])
@@ -632,7 +860,7 @@ def cmd_hpc_jobs(args):
             "endpoint": "/api/v1/hpc_jobs/list",
             "workspace_id": workspace_id,
             "workspace_name": ws_name,
-            "created_by": args.created_by or "",
+            "created_by": created_by,
             "status_filters": status_filters,
             "page": args.page,
             "limit": args.limit,
@@ -649,8 +877,8 @@ def cmd_hpc_jobs(args):
 
     jobs = [_hpc_job_from_api_response(job_data, ws_name) for job_data in jobs_data]
     title = f"HPC 任务列表 · {ws_name or workspace_id} (显示 {len(jobs)}/{total})"
-    if args.created_by:
-        title += f" · created_by={args.created_by}"
+    if created_by:
+        title += f" · created_by={created_by}"
     if status_filters:
         title += f" · status={','.join(status_filters)}"
 
@@ -752,9 +980,6 @@ def cmd_user_jobs(args):
     display = get_display()
     api = get_api()
 
-    if not args.created_by:
-        display.print_error("请指定创建者用户 ID: qzcli user-jobs --created-by user-xxx")
-        return 1
     if args.queued and args.running:
         display.print_error("--queued 和 --running 不能同时使用")
         return 1
@@ -779,6 +1004,19 @@ def cmd_user_jobs(args):
 
     include_train = args.kind in ("all", "train")
     include_hpc = args.kind in ("all", "hpc")
+    created_by_input = (args.created_by or "me").strip()
+    try:
+        created_by = _resolve_created_by_selector(
+            api,
+            cookie,
+            workspace_refs,
+            created_by_input,
+            include_train=include_train,
+            include_hpc=include_hpc,
+        )
+    except ValueError as e:
+        display.print_error(str(e))
+        return 1
 
     if not args.output_json:
         view_label = {"all": "分布式训练+HPC", "train": "分布式训练", "hpc": "HPC"}[args.kind]
@@ -788,7 +1026,7 @@ def cmd_user_jobs(args):
         api,
         cookie,
         workspace_refs,
-        created_by=args.created_by,
+        created_by=created_by,
         include_train=include_train,
         include_hpc=include_hpc,
         status=args.status or "",
@@ -804,7 +1042,8 @@ def cmd_user_jobs(args):
 
     if args.output_json:
         print(json.dumps({
-            "created_by": args.created_by,
+            "created_by": created_by,
+            "created_by_input": created_by_input,
             "workspace_count": len(workspace_refs),
             "kind": args.kind,
             "filters": {
@@ -826,7 +1065,7 @@ def cmd_user_jobs(args):
     for warning in result["warnings"]:
         display.print_warning(warning)
 
-    title = f"用户任务 · created_by={args.created_by} (显示 {len(jobs)}/{total_matched})"
+    title = f"用户任务 · created_by={created_by} (显示 {len(jobs)}/{total_matched})"
     if args.workspace:
         title += f" · workspace={args.workspace}"
     if args.status:
@@ -7153,7 +7392,8 @@ def main():
         help="查看 /api/v1/hpc_jobs/list（当前用户 HPC 任务，含排队/运行中）",
     )
     hpc_jobs_parser.add_argument("--workspace", "-w", help="工作空间 ID 或名称")
-    hpc_jobs_parser.add_argument("--created-by", help="创建者用户 ID（平台 created_by 过滤）")
+    hpc_jobs_parser.add_argument("--created-by", help="创建者用户 ID/姓名/登录号；也可传 me")
+    hpc_jobs_parser.add_argument("--mine", action="store_true", help="只查看当前登录用户创建的 HPC 任务")
     hpc_jobs_parser.add_argument("--status", "-s", help="按原始状态过滤，如 QUEUEING/RUNNING/SUCCEEDED")
     hpc_jobs_parser.add_argument("--queued", "-q", action="store_true", help="只显示 QUEUEING 任务")
     hpc_jobs_parser.add_argument("--running", "-r", action="store_true", help="显示 QUEUEING/RUNNING/PENDING/CREATING")
@@ -7171,7 +7411,7 @@ def main():
         aliases=["user-tasks"],
         help="按 created_by 同时查询分布式训练和 HPC 任务；不指定 -w 时查询所有可访问工作空间",
     )
-    user_jobs_parser.add_argument("--created-by", required=True, help="创建者用户 ID（平台 created_by 过滤）")
+    user_jobs_parser.add_argument("--created-by", help="创建者用户 ID/姓名/登录号；默认 me")
     user_jobs_parser.add_argument("--workspace", "-w", help="工作空间 ID 或名称；不指定则查询所有可访问工作空间")
     user_jobs_parser.add_argument(
         "--kind",

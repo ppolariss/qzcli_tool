@@ -150,6 +150,7 @@ def test_hpc_jobs_parser_accepts_created_by_and_status(monkeypatch):
     def fake_cmd_hpc_jobs(args):
         captured["workspace"] = args.workspace
         captured["created_by"] = args.created_by
+        captured["mine"] = args.mine
         captured["status"] = args.status
         captured["queued"] = args.queued
         captured["limit"] = args.limit
@@ -178,10 +179,45 @@ def test_hpc_jobs_parser_accepts_created_by_and_status(monkeypatch):
     assert captured == {
         "workspace": "CPU资源空间",
         "created_by": "user-1",
+        "mine": False,
         "status": "QUEUEING",
         "queued": False,
         "limit": 50,
         "command": "hpc-jobs",
+    }
+
+
+def test_hpc_jobs_parser_accepts_mine(monkeypatch):
+    captured = {}
+
+    def fake_cmd_hpc_jobs(args):
+        captured["workspace"] = args.workspace
+        captured["created_by"] = args.created_by
+        captured["mine"] = args.mine
+        captured["status"] = args.status
+        return 0
+
+    monkeypatch.setattr(cli, "cmd_hpc_jobs", fake_cmd_hpc_jobs)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "qzcli",
+            "hpc-jobs",
+            "-w",
+            "CPU资源空间",
+            "--mine",
+            "-s",
+            "RUNNING",
+        ],
+    )
+
+    assert cli.main() == 0
+    assert captured == {
+        "workspace": "CPU资源空间",
+        "created_by": None,
+        "mine": True,
+        "status": "RUNNING",
     }
 
 
@@ -225,6 +261,112 @@ def test_user_jobs_parser_accepts_created_by_and_filters(monkeypatch):
         "limit": 100,
         "command": "user-jobs",
     }
+
+
+def test_user_jobs_parser_allows_default_current_user(monkeypatch):
+    captured = {}
+
+    def fake_cmd_user_jobs(args):
+        captured["created_by"] = args.created_by
+        captured["kind"] = args.kind
+        captured["running"] = args.running
+        return 0
+
+    monkeypatch.setattr(cli, "cmd_user_jobs", fake_cmd_user_jobs)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "qzcli",
+            "user-jobs",
+            "--kind",
+            "hpc",
+            "--running",
+        ],
+    )
+
+    assert cli.main() == 0
+    assert captured == {
+        "created_by": None,
+        "kind": "hpc",
+        "running": True,
+    }
+
+
+def test_resolve_created_by_uses_cached_current_user(monkeypatch):
+    monkeypatch.setattr(
+        cli,
+        "load_config",
+        lambda: {"username": "login-1", "user_id": "user-1"},
+    )
+
+    class _UnexpectedAPI:
+        def list_hpc_jobs_with_cookie(self, *args, **kwargs):
+            raise AssertionError("cache should avoid API probing")
+
+    assert (
+        cli._resolve_created_by_selector(
+            _UnexpectedAPI(),
+            "cookie=value",
+            [{"id": "ws-1", "name": "CPU资源空间"}],
+            "login-1",
+            include_train=False,
+            include_hpc=True,
+        )
+        == "user-1"
+    )
+    assert (
+        cli._resolve_created_by_selector(
+            _UnexpectedAPI(),
+            "cookie=value",
+            [{"id": "ws-1", "name": "CPU资源空间"}],
+            "me",
+            include_train=False,
+            include_hpc=True,
+        )
+        == "user-1"
+    )
+
+
+def test_resolve_created_by_probes_hpc_and_caches_current_user(monkeypatch):
+    saved = {}
+    config = {"username": "login-1"}
+    monkeypatch.setattr(cli, "load_config", lambda: dict(config))
+    monkeypatch.setattr(cli, "save_config", lambda data: saved.update(data))
+
+    class _FakeAPI:
+        def list_hpc_jobs_with_cookie(self, workspace_id, cookie, page_size=100):
+            assert workspace_id == "ws-1"
+            assert cookie == "cookie=value"
+            assert page_size == 100
+            return {
+                "jobs": [
+                    {
+                        "created_by": {
+                            "id": "user-1",
+                            "name": "张三",
+                            "name_en": "zhangsan",
+                            "extra_info": {
+                                "institution_id": "login-1",
+                                "login_name": "login-1",
+                            },
+                        }
+                    }
+                ]
+            }
+
+    resolved = cli._resolve_created_by_selector(
+        _FakeAPI(),
+        "cookie=value",
+        [{"id": "ws-1", "name": "CPU资源空间"}],
+        "login-1",
+        include_train=False,
+        include_hpc=True,
+    )
+
+    assert resolved == "user-1"
+    assert saved["user_id"] == "user-1"
+    assert saved["login_name"] == "login-1"
 
 
 def test_mcp_list_hpc_jobs_uses_hpc_api(monkeypatch):
