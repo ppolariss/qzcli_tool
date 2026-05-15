@@ -179,17 +179,9 @@ class QzAPI:
             )
 
         url = f"{self.base_url}/auth/token"
-
-        # 尝试加密密码（与 CAS 登录流程一致），回退明文
-        try:
-            encrypted_pwd = encrypt_password(self._password)
-            pwd_payload = {"username": self._username, "password": encrypted_pwd, "encrypted": True}
-        except Exception:
-            pwd_payload = {"username": self._username, "password": self._password}
-
         response = _curl_post(
             url,
-            json=pwd_payload,
+            json={"username": self._username, "password": self._password},
             headers={"Content-Type": "application/json"},
             timeout=30,
         )
@@ -324,56 +316,8 @@ class QzAPI:
             )
         return result
     def get_job_detail(self, job_id: str) -> Dict[str, Any]:
-        """查询任务详情（使用 cookie 认证，优先于 token）"""
-        cookie_data = get_cookie()
-        cookie = cookie_data.get("cookie") if cookie_data else None
-        if cookie:
-            try:
-                return self.get_job_detail_with_cookie(job_id, cookie)
-            except QzAPIError:
-                pass
+        """查询任务详情"""
         result = self._request("/openapi/v1/train_job/detail", {"job_id": job_id})
-        return result.get("data", {})
-
-    def get_job_detail_with_cookie(
-        self, job_id: str, cookie: str
-    ) -> Dict[str, Any]:
-        """使用 cookie 查询任务详情（内部 API）"""
-        url = f"{self.base_url}/api/v1/train_job/detail"
-        payload = {"job_id": job_id}
-        headers = {
-            "accept": "application/json, text/plain, */*",
-            "accept-language": "en-US,en;q=0.9",
-            "cache-control": "no-cache",
-            "content-type": "application/json",
-            "cookie": cookie,
-            "origin": "https://qz.sii.edu.cn",
-            "pragma": "no-cache",
-            "referer": f"https://qz.sii.edu.cn/jobs/distributedTrainingDetail/{job_id}",
-            "sec-ch-ua": '"Not(A:Brand";v="8", "Chromium";v="144"',
-            "sec-ch-ua-mobile": "?0",
-            "sec-ch-ua-platform": '"macOS"',
-            "sec-fetch-dest": "empty",
-            "sec-fetch-mode": "cors",
-            "sec-fetch-site": "same-origin",
-            "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36",
-        }
-        response = _curl_post(url, json=payload, headers=headers, timeout=60)
-        if response.status_code == 401:
-            raise QzAPIError("Cookie 已过期或无效，请重新获取", 401)
-        if response.status_code != 200:
-            raise QzAPIError(
-                f"请求失败: HTTP {response.status_code}", response.status_code
-            )
-        try:
-            result = response.json()
-        except Exception:
-            raise QzAPIError("响应不是有效的 JSON，请检查 cookie 是否正确")
-        if result.get("code") != 0:
-            raise QzAPIError(
-                f"API 请求失败: {result.get('message', '未知错误')}",
-                result.get("code"),
-            )
         return result.get("data", {})
 
     def _resolve_pod_names(self, job_id: str, n_instances: Optional[int] = None) -> List[str]:
@@ -457,58 +401,12 @@ class QzAPI:
         return results
 
     def stop_job(self, job_id: str) -> bool:
-        """停止任务（优先 cookie 认证，回退 token）"""
-        cookie_data = get_cookie()
-        cookie = cookie_data.get("cookie") if cookie_data else None
-        if cookie:
-            try:
-                return self.stop_job_with_cookie(job_id, cookie)
-            except QzAPIError:
-                pass
+        """停止任务"""
         try:
             self._request("/openapi/v1/train_job/stop", {"job_id": job_id})
             return True
         except QzAPIError:
             return False
-
-    def stop_job_with_cookie(self, job_id: str, cookie: str) -> bool:
-        """使用 cookie 停止任务（内部 API）"""
-        url = f"{self.base_url}/api/v1/train_job/stop"
-        payload = {"job_id": job_id}
-        headers = {
-            "accept": "application/json, text/plain, */*",
-            "accept-language": "en-US,en;q=0.9",
-            "cache-control": "no-cache",
-            "content-type": "application/json",
-            "cookie": cookie,
-            "origin": "https://qz.sii.edu.cn",
-            "pragma": "no-cache",
-            "referer": f"https://qz.sii.edu.cn/jobs/distributedTrainingDetail/{job_id}",
-            "sec-ch-ua": '"Not(A:Brand";v="8", "Chromium";v="144"',
-            "sec-ch-ua-mobile": "?0",
-            "sec-ch-ua-platform": '"macOS"',
-            "sec-fetch-dest": "empty",
-            "sec-fetch-mode": "cors",
-            "sec-fetch-site": "same-origin",
-            "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36",
-        }
-        response = _curl_post(url, json=payload, headers=headers, timeout=60)
-        if response.status_code == 401:
-            raise QzAPIError("Cookie 已过期或无效，请重新获取", 401)
-        if response.status_code != 200:
-            raise QzAPIError(
-                f"请求失败: HTTP {response.status_code}", response.status_code
-            )
-        try:
-            result = response.json()
-        except Exception:
-            raise QzAPIError("响应不是有效的 JSON")
-        if result.get("code") != 0:
-            raise QzAPIError(
-                f"API 请求失败: {result.get('message', '未知错误')}",
-                result.get("code"),
-            )
-        return True
 
     def create_job(self, config: Dict[str, Any]) -> Dict[str, Any]:
         """创建任务"""
