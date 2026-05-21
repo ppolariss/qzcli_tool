@@ -959,26 +959,50 @@ def cmd_workspaces(args):
 
             display.print(f"\n[bold]发现 {len(workspaces)} 个可访问的工作空间[/bold]\n")
 
-            # 更新每个工作空间
-            for ws in workspaces:
-                ws_id = ws.get("id")
-                ws_name = ws.get("name", "")
-                display.print(f"[dim]正在更新 {ws_name or ws_id}...[/dim]")
+            # 更新每个工作空间（带进度条，沿用 cmd_avail 的 pattern）
+            progress = None
+            if hasattr(display, "create_progress"):
+                progress = display.create_progress()
+                if progress:
+                    progress.start()
+            progress_task_id = None
+            if progress:
+                progress_task_id = progress.add_task(
+                    "更新工作空间", total=len(workspaces)
+                )
 
-                try:
-                    resources, jobs_count = _collect_workspace_resources_from_live_apis(
-                        api, ws_id, cookie
-                    )
-                    # 保存到本地缓存
-                    save_resources(ws_id, resources, ws_name)
+            try:
+                for ws in workspaces:
+                    ws_id = ws.get("id")
+                    ws_name = ws.get("name", "")
+                    if progress and progress_task_id is not None:
+                        progress.update(
+                            progress_task_id,
+                            description=f"更新 {ws_name or ws_id}",
+                        )
+                    else:
+                        display.print(f"[dim]正在更新 {ws_name or ws_id}...[/dim]")
 
-                    projects_count = len(resources.get("projects", []))
-                    cg_count = len(resources.get("compute_groups", []))
-                    display.print(
-                        f"  ✓ {ws_name or ws_id}: {projects_count} 项目, {cg_count} 计算组, {jobs_count} 历史任务"
-                    )
-                except Exception as e:
-                    display.print_warning(f"  ✗ {ws_name or ws_id}: {e}")
+                    try:
+                        resources, jobs_count = _collect_workspace_resources_from_live_apis(
+                            api, ws_id, cookie
+                        )
+                        # 保存到本地缓存
+                        save_resources(ws_id, resources, ws_name)
+
+                        projects_count = len(resources.get("projects", []))
+                        cg_count = len(resources.get("compute_groups", []))
+                        display.print(
+                            f"  ✓ {ws_name or ws_id}: {projects_count} 项目, {cg_count} 计算组, {jobs_count} 历史任务"
+                        )
+                    except Exception as e:
+                        display.print_warning(f"  ✗ {ws_name or ws_id}: {e}")
+                    finally:
+                        if progress and progress_task_id is not None:
+                            progress.advance(progress_task_id)
+            finally:
+                if progress:
+                    progress.stop()
 
             display.print("")
             display.print_success("工作空间缓存更新完成！")
