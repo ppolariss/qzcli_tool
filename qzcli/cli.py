@@ -985,16 +985,21 @@ def cmd_workspaces(args):
 
                     try:
                         resources, jobs_count = _collect_workspace_resources_from_live_apis(
-                            api, ws_id, cookie
+                            api, ws_id, cookie, quick=args.quick
                         )
                         # 保存到本地缓存
                         save_resources(ws_id, resources, ws_name)
 
                         projects_count = len(resources.get("projects", []))
                         cg_count = len(resources.get("compute_groups", []))
-                        display.print(
-                            f"  ✓ {ws_name or ws_id}: {projects_count} 项目, {cg_count} 计算组, {jobs_count} 历史任务"
-                        )
+                        if args.quick:
+                            display.print(
+                                f"  ✓ {ws_name or ws_id}: {projects_count} 项目, {cg_count} 计算组 (quick: 跳过历史任务/specs)"
+                            )
+                        else:
+                            display.print(
+                                f"  ✓ {ws_name or ws_id}: {projects_count} 项目, {cg_count} 计算组, {jobs_count} 历史任务"
+                            )
                     except Exception as e:
                         display.print_warning(f"  ✗ {ws_name or ws_id}: {e}")
                     finally:
@@ -1071,10 +1076,13 @@ def cmd_workspaces(args):
         cookie = cookie_data["cookie"]
 
         try:
-            display.print("[dim]正在从历史任务中提取资源配置...[/dim]")
+            if getattr(args, "quick", False):
+                display.print("[dim]quick 模式：跳过历史任务，只走 cluster_info + task_dimension...[/dim]")
+            else:
+                display.print("[dim]正在从历史任务中提取资源配置...[/dim]")
 
             resources, jobs_count = _collect_workspace_resources_from_live_apis(
-                api, workspace_id, cookie
+                api, workspace_id, cookie, quick=getattr(args, "quick", False)
             )
 
             # 保存到本地缓存
@@ -2864,18 +2872,33 @@ def _collect_workspace_resources_from_live_apis(
     api,
     workspace_id: str,
     cookie: str,
+    quick: bool = False,
 ) -> Tuple[Dict[str, Any], int]:
-    """从任务、task_dimension、cluster_info 等接口聚合 workspace 资源。"""
-    jobs = _fetch_all_jobs_with_cookie(api, workspace_id, cookie, page_size=200)
-    resources = (
-        api.extract_resources_from_jobs(jobs)
-        if jobs
-        else {
+    """从任务、task_dimension、cluster_info 等接口聚合 workspace 资源。
+
+    Args:
+        quick: 跳过 _fetch_all_jobs_with_cookie 的全量分页，秒级返回。代价是
+            不发现 specs（specs 只能从历史任务里反推），但 compute_groups 和
+            projects 仍然完整（由 cluster_info / task_dimension 提供）。
+    """
+    if quick:
+        jobs: List[Dict[str, Any]] = []
+        resources: Dict[str, Any] = {
             "projects": [],
             "compute_groups": [],
             "specs": [],
         }
-    )
+    else:
+        jobs = _fetch_all_jobs_with_cookie(api, workspace_id, cookie, page_size=200)
+        resources = (
+            api.extract_resources_from_jobs(jobs)
+            if jobs
+            else {
+                "projects": [],
+                "compute_groups": [],
+                "specs": [],
+            }
+        )
 
     if hasattr(api, "list_task_dimension"):
         try:
@@ -7026,6 +7049,13 @@ def main():
     )
     workspaces_parser.add_argument(
         "--list", "-l", action="store_true", help="列出所有已缓存的工作空间"
+    )
+    workspaces_parser.add_argument(
+        "--quick",
+        "-q",
+        action="store_true",
+        help="快速刷新：跳过历史任务翻页，只走 cluster_info + task_dimension。"
+        " 不发现 specs，但 compute_groups/projects 完整，秒级返回。",
     )
     workspaces_parser.add_argument("--name", help="设置工作空间名称（别名）")
 
