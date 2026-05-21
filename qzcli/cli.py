@@ -959,6 +959,33 @@ def cmd_workspaces(args):
 
             display.print(f"\n[bold]发现 {len(workspaces)} 个可访问的工作空间[/bold]\n")
 
+            # 默认走 quick；显式 --full 才扫历史任务反推 specs
+            use_full = bool(getattr(args, "full", False))
+            # 并行刷新各 workspace —— 网络调用并发，磁盘写入仍在主线程串行
+            parallel_workers = max(1, int(getattr(args, "parallel", 8) or 1))
+
+            def _fetch_one(ws):
+                ws_id_ = ws.get("id")
+                ws_name_ = ws.get("name", "")
+                try:
+                    resources_, jobs_count_ = _collect_workspace_resources_from_live_apis(
+                        api, ws_id_, cookie, quick=not use_full
+                    )
+                    return {
+                        "ok": True,
+                        "ws_id": ws_id_,
+                        "ws_name": ws_name_,
+                        "resources": resources_,
+                        "jobs_count": jobs_count_,
+                    }
+                except Exception as e:
+                    return {
+                        "ok": False,
+                        "ws_id": ws_id_,
+                        "ws_name": ws_name_,
+                        "error": str(e),
+                    }
+
             # 更新每个工作空间（带进度条，沿用 cmd_avail 的 pattern）
             progress = None
             if hasattr(display, "create_progress"):
@@ -968,43 +995,43 @@ def cmd_workspaces(args):
             progress_task_id = None
             if progress:
                 progress_task_id = progress.add_task(
-                    "更新工作空间", total=len(workspaces)
+                    f"并行刷新（max_workers={parallel_workers}）",
+                    total=len(workspaces),
                 )
 
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+
             try:
-                for ws in workspaces:
-                    ws_id = ws.get("id")
-                    ws_name = ws.get("name", "")
-                    if progress and progress_task_id is not None:
-                        progress.update(
-                            progress_task_id,
-                            description=f"更新 {ws_name or ws_id}",
-                        )
-                    else:
-                        display.print(f"[dim]正在更新 {ws_name or ws_id}...[/dim]")
+                with ThreadPoolExecutor(max_workers=parallel_workers) as executor:
+                    futures = [executor.submit(_fetch_one, ws) for ws in workspaces]
+                    for future in as_completed(futures):
+                        result = future.result()
+                        ws_id = result["ws_id"]
+                        ws_name = result["ws_name"]
+                        try:
+                            if not result["ok"]:
+                                display.print_warning(
+                                    f"  ✗ {ws_name or ws_id}: {result['error']}"
+                                )
+                                continue
+                            resources = result["resources"]
+                            jobs_count = result["jobs_count"]
+                            # 保存到本地缓存（主线程串行，避免 read-modify-write 竞争）
+                            save_resources(ws_id, resources, ws_name)
 
-                    try:
-                        resources, jobs_count = _collect_workspace_resources_from_live_apis(
-                            api, ws_id, cookie, quick=args.quick
-                        )
-                        # 保存到本地缓存
-                        save_resources(ws_id, resources, ws_name)
-
-                        projects_count = len(resources.get("projects", []))
-                        cg_count = len(resources.get("compute_groups", []))
-                        if args.quick:
-                            display.print(
-                                f"  ✓ {ws_name or ws_id}: {projects_count} 项目, {cg_count} 计算组 (quick: 跳过历史任务/specs)"
-                            )
-                        else:
-                            display.print(
-                                f"  ✓ {ws_name or ws_id}: {projects_count} 项目, {cg_count} 计算组, {jobs_count} 历史任务"
-                            )
-                    except Exception as e:
-                        display.print_warning(f"  ✗ {ws_name or ws_id}: {e}")
-                    finally:
-                        if progress and progress_task_id is not None:
-                            progress.advance(progress_task_id)
+                            projects_count = len(resources.get("projects", []))
+                            cg_count = len(resources.get("compute_groups", []))
+                            if use_full:
+                                display.print(
+                                    f"  ✓ {ws_name or ws_id}: {projects_count} 项目, {cg_count} 计算组, {jobs_count} 历史任务"
+                                )
+                            else:
+                                display.print(
+                                    f"  ✓ {ws_name or ws_id}: {projects_count} 项目, {cg_count} 计算组 (默认 quick: 跳过历史任务/specs，--full 强制扫描)"
+                                )
+                        finally:
+                            if progress and progress_task_id is not None:
+                                progress.advance(progress_task_id)
             finally:
                 if progress:
                     progress.stop()
@@ -1076,13 +1103,14 @@ def cmd_workspaces(args):
         cookie = cookie_data["cookie"]
 
         try:
-            if getattr(args, "quick", False):
-                display.print("[dim]quick 模式：跳过历史任务，只走 cluster_info + task_dimension...[/dim]")
+            use_full = bool(getattr(args, "full", False))
+            if use_full:
+                display.print("[dim]--full 模式：扫描全部历史任务以反推 specs...[/dim]")
             else:
-                display.print("[dim]正在从历史任务中提取资源配置...[/dim]")
+                display.print("[dim]quick 默认模式：跳过历史任务，只走 cluster_info + task_dimension（--full 强制完整扫描）...[/dim]")
 
             resources, jobs_count = _collect_workspace_resources_from_live_apis(
-                api, workspace_id, cookie, quick=getattr(args, "quick", False)
+                api, workspace_id, cookie, quick=not use_full
             )
 
             # 保存到本地缓存
@@ -7051,11 +7079,24 @@ def main():
         "--list", "-l", action="store_true", help="列出所有已缓存的工作空间"
     )
     workspaces_parser.add_argument(
+        "--full",
+        "-F",
+        action="store_true",
+        help="完整刷新：扫描全部历史任务以反推 specs。在分布式训练空间等大型共享空间"
+        "上可能耗时数十分钟。仅在需要更新 specs 缓存时使用。",
+    )
+    workspaces_parser.add_argument(
         "--quick",
         "-q",
         action="store_true",
-        help="快速刷新：跳过历史任务翻页，只走 cluster_info + task_dimension。"
-        " 不发现 specs，但 compute_groups/projects 完整，秒级返回。",
+        help="（已是默认行为，保留 flag 仅做向后兼容；显式传 --full 走完整扫描。）",
+    )
+    workspaces_parser.add_argument(
+        "--parallel",
+        type=int,
+        default=8,
+        metavar="N",
+        help="并行刷新的 workspace 数量（默认 8）。设为 1 可恢复串行行为。",
     )
     workspaces_parser.add_argument("--name", help="设置工作空间名称（别名）")
 
