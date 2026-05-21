@@ -940,11 +940,13 @@ def qz_inspect_status_catalog(
 def qz_track_job(job_id: str, name: str = "", source: str = "", workspace_id: str = "") -> dict[str, Any]:
     api = get_api()
     store = get_store()
+    warnings = []
 
     try:
         api_data = api.get_job_detail(job_id)
         job = JobRecord.from_api_response(api_data, source=source or "")
-    except Exception:
+    except Exception as exc:
+        warnings.append(f"无法获取任务详情: {exc}，已创建本地记录。")
         job = JobRecord(
             job_id=job_id,
             name=name or "",
@@ -966,6 +968,7 @@ def qz_track_job(job_id: str, name: str = "", source: str = "", workspace_id: st
             "job": _job_summary_from_store(job),
         },
         message="任务已加入本地追踪列表。",
+        warnings=warnings,
     )
 
 
@@ -1355,10 +1358,11 @@ def qz_get_hpc_usage(
         verbose: 是否返回每个节点的详细数据（默认 False）
         top: verbose=True 时返回 CPU 利用率最高的前 N 个节点（默认 30）
     """
-    cookie, warnings = _require_cookie()
+    cookie, _ = _require_cookie()
     workspace_refs = _resolve_workspace_refs(workspace or None, all_workspaces=not bool(workspace))
     api = get_api()
     all_stats = []
+    warnings = []
 
     for workspace_ref in workspace_refs:
         workspace_id = workspace_ref["id"]
