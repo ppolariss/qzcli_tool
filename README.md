@@ -233,8 +233,11 @@ qzcli cookie --clear
 # 列出已缓存的工作空间
 qzcli res --list
 
-# 更新所有工作空间的资源缓存（默认 quick：跳过历史任务，秒级；不刷新 specs）
+# 更新所有工作空间的资源缓存（默认 quick + 8 路并行：跳过历史任务，秒级；不刷新 specs）
 qzcli res -u
+
+# 调整并发：网络抖动时可降到 1 退回串行（默认 --parallel 8）
+qzcli res -u --parallel 4
 
 # 完整刷新（包含 specs，扫描全部历史任务；大型共享空间可能耗时数十分钟）
 qzcli res -u --full
