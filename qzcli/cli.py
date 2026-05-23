@@ -4,6 +4,7 @@ qzcli - 启智平台任务管理 CLI
 """
 
 import argparse
+import re
 import sys
 import time
 import unicodedata
@@ -294,18 +295,19 @@ def cmd_list_cookie(args):
         config = load_config()
         current_user_id = config.get("user_id", "")
         if not current_user_id:
-            # 首次：从 train_job/list 获取用户 ID 并缓存
+            # 首次：从 train_job/list 找当前用户的 user_id
             try:
                 probe = api.list_jobs_with_cookie(
-                    workspace_ids[0][0], cookie, page_size=1
+                    workspace_ids[0][0], cookie, page_size=50
                 )
-                probe_jobs = probe.get("jobs", [])
-                if probe_jobs:
-                    created_by = probe_jobs[0].get("created_by") or {}
-                    current_user_id = created_by.get("id", "")
-                    if current_user_id:
-                        config["user_id"] = current_user_id
-                        save_config(config)
+                current_user_id = _detect_user_id_from_probe(
+                    probe.get("jobs", []), (config.get("username") or "").strip()
+                )
+                if current_user_id:
+                    config["user_id"] = current_user_id
+                    save_config(config)
+                # 找不到匹配就不写 —— 宁可让 filter 退化成"看全部 notebook"，
+                # 也不要把别人 id 当成自己缓存（bug ekon@6ee33c6 的根因）
             except QzAPIError:
                 pass
 
@@ -564,6 +566,7 @@ def _parse_since(s: Optional[str]) -> Optional[str]:
         return None
     import re
     import time as _time
+
     m = re.fullmatch(r"\s*(\d+)\s*([smhd])\s*", s)
     if m:
         n = int(m.group(1))
@@ -571,6 +574,7 @@ def _parse_since(s: Optional[str]) -> Optional[str]:
         return str(int((_time.time() - n * unit) * 1000))
     try:
         from datetime import datetime
+
         dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
         return str(int(dt.timestamp() * 1000))
     except Exception:
@@ -608,7 +612,7 @@ def cmd_logs(args):
         key=lambda e: (int(e.get("timestamp_ms") or 0), e.get("log_id") or ""),
     )
     # 初次请求按 descend 拿最近 tail 条；终端仍按时间升序打印。
-    entries = entries[-args.tail:]
+    entries = entries[-args.tail :]
     display.print_logs(entries, raw=args.raw, json_mode=args.output_json)
 
     if not args.follow:
@@ -968,8 +972,10 @@ def cmd_workspaces(args):
                 ws_id_ = ws.get("id")
                 ws_name_ = ws.get("name", "")
                 try:
-                    resources_, jobs_count_ = _collect_workspace_resources_from_live_apis(
-                        api, ws_id_, cookie, quick=not use_full
+                    resources_, jobs_count_ = (
+                        _collect_workspace_resources_from_live_apis(
+                            api, ws_id_, cookie, quick=not use_full
+                        )
                     )
                     return {
                         "ok": True,
@@ -1107,7 +1113,9 @@ def cmd_workspaces(args):
             if use_full:
                 display.print("[dim]--full 模式：扫描全部历史任务以反推 specs...[/dim]")
             else:
-                display.print("[dim]quick 默认模式：跳过历史任务，只走 cluster_info + task_dimension（--full 强制完整扫描）...[/dim]")
+                display.print(
+                    "[dim]quick 默认模式：跳过历史任务，只走 cluster_info + task_dimension（--full 强制完整扫描）...[/dim]"
+                )
 
             resources, jobs_count = _collect_workspace_resources_from_live_apis(
                 api, workspace_id, cookie, quick=not use_full
@@ -1272,7 +1280,9 @@ def cmd_avail(args):
         else:
             display.print_error(f"未找到名称为 '{workspace_input}' 的工作空间")
             if ambiguous_matches:
-                display.print("[dim]该名称匹配到多个工作空间，请改用完整名称或 ID:[/dim]")
+                display.print(
+                    "[dim]该名称匹配到多个工作空间，请改用完整名称或 ID:[/dim]"
+                )
                 for match in ambiguous_matches:
                     match_id = str(match.get("id", "") or "")
                     match_name = str(match.get("name", "") or match_id)
@@ -1378,7 +1388,9 @@ def cmd_avail(args):
             }
         )
 
-    def _query_workspace_availability(job: Dict[str, Any]) -> Tuple[str, List[Dict[str, Any]], Optional[str]]:
+    def _query_workspace_availability(
+        job: Dict[str, Any]
+    ) -> Tuple[str, List[Dict[str, Any]], Optional[str]]:
         workspace_id = job["workspace_id"]
         ws_name = job["workspace_name"]
         compute_groups = job["compute_groups"]
@@ -1390,7 +1402,9 @@ def cmd_avail(args):
 
         if args.low_priority:
             if progress and progress_task_id is not None:
-                progress.update(progress_task_id, description=f"{ws_name}: 获取低优任务")
+                progress.update(
+                    progress_task_id, description=f"{ws_name}: 获取低优任务"
+                )
             else:
                 display.print("[dim]正在获取低优任务数据（这可能较慢）...[/dim]")
             low_priority_threshold = 3  # 优先级 <= 3 为低优任务
@@ -1430,7 +1444,9 @@ def cmd_avail(args):
 
         try:
             if progress and progress_task_id is not None:
-                progress.update(progress_task_id, description=f"{ws_name}: 获取节点数据")
+                progress.update(
+                    progress_task_id, description=f"{ws_name}: 获取节点数据"
+                )
             if len(compute_groups) == 1:
                 only_lcg_id = next(iter(compute_groups.keys()))
                 all_nodes = _with_live_cookie(
@@ -1467,7 +1483,10 @@ def cmd_avail(args):
                     if lcg_id:
                         nodes_by_lcg[str(lcg_id)].append(node)
                 if all_nodes and not nodes_by_lcg:
-                    def _fetch_lcg_nodes(current_lcg_id: str) -> Tuple[str, List[Dict[str, Any]]]:
+
+                    def _fetch_lcg_nodes(
+                        current_lcg_id: str,
+                    ) -> Tuple[str, List[Dict[str, Any]]]:
                         nodes = _with_live_cookie(
                             api,
                             display,
@@ -2713,6 +2732,7 @@ def _fetch_all_node_dimensions(
     page_size: int = 500,
 ) -> List[Dict[str, Any]]:
     """分页获取节点维度数据。"""
+
     def _fetch_page(page_num: int) -> Dict[str, Any]:
         return api.list_node_dimension(
             workspace_id,
@@ -2792,6 +2812,7 @@ def _fetch_all_task_dimensions(
     page_size: int = 200,
 ) -> List[Dict[str, Any]]:
     """分页获取 workspace 内所有 task dimensions。"""
+
     def _fetch_page(page_num: int) -> Dict[str, Any]:
         return api.list_task_dimension(
             workspace_id,
@@ -3549,7 +3570,11 @@ def _list_available_workspaces(
         )
         progress = None
         progress_task_id = None
-        if include_usage_snapshot and show_progress and hasattr(display, "create_progress"):
+        if (
+            include_usage_snapshot
+            and show_progress
+            and hasattr(display, "create_progress")
+        ):
             progress = display.create_progress()
             if progress:
                 progress.start()
@@ -3693,9 +3718,7 @@ def _refresh_workspace_resources_for_avail(
                             "id": lcg_id,
                             "name": lcg.get("logic_compute_group_name", ""),
                             "compute_group_id": cluster.get("compute_group_id", ""),
-                            "compute_group_name": cluster.get(
-                                "compute_group_name", ""
-                            ),
+                            "compute_group_name": cluster.get("compute_group_name", ""),
                             "cluster_id": cluster.get("cluster_id", ""),
                             "gpu_type": _first_non_empty(
                                 lcg.get("brand"),
@@ -6497,63 +6520,88 @@ def cmd_batch(args):
     return 0
 
 
-def _find_notebook_jupyter_info(notebook_name, display):
-    """
-    根据开发机名称，查找 notebook_id，通过平台 API 获取 Jupyter 连接信息。
+_NOTEBOOK_UUID_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-" r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
 
-    流程：notebook/list → notebook_id → /api/v1/notebook/lab/{id} 301 → Jupyter URL with token
+_NOTEBOOK_UUID_GROUP = (
+    r"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-" r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12})"
+)
 
-    Returns: dict with {base_url, token, notebook_id} or None
-    """
-    import re
+# 覆盖 SII 平台已知的 notebook 链接形态
+_NOTEBOOK_URL_PATTERNS = (
+    re.compile(rf"[?&]notebook_id={_NOTEBOOK_UUID_GROUP}"),
+    re.compile(rf"/interactiveModel(?:ing)?Detail/{_NOTEBOOK_UUID_GROUP}"),
+    re.compile(rf"/jupyter/{_NOTEBOOK_UUID_GROUP}/"),
+    re.compile(rf"/api/v1/notebook/lab/{_NOTEBOOK_UUID_GROUP}"),
+    re.compile(rf"/notebook/(?:lab|code)/{_NOTEBOOK_UUID_GROUP}"),
+)
 
-    import requests as _requests
 
-    cookie_data = get_cookie()
-    if not cookie_data or not cookie_data.get("cookie"):
-        display.print_error("未登录，请先 qzcli login")
+def _extract_notebook_id(target):
+    """从 UUID / URL 中抽出 notebook_id；普通 name 返回 None。"""
+    if not target:
         return None
+    if _NOTEBOOK_UUID_RE.match(target):
+        return target
+    for pattern in _NOTEBOOK_URL_PATTERNS:
+        match = pattern.search(target)
+        if match:
+            return match.group(1)
+    return None
 
-    cookie = cookie_data["cookie"]
+
+def _detect_user_id_from_probe(probe_jobs, username):
+    """从 list_jobs 探针响应里按 username 反查当前用户的 user_id。
+
+    比对 `created_by.extra_info.login_name == username`（platform 的学工号）。
+    找不到匹配返回空字符串 —— 让调用方决定是否写 config，避免把别人 id 当成
+    自己缓存（bug ekon@6ee33c6 的根因）。
+    """
+    if not username or not probe_jobs:
+        return ""
+    for job in probe_jobs:
+        created_by = job.get("created_by") or {}
+        login_name = (created_by.get("extra_info") or {}).get("login_name") or ""
+        if login_name == username:
+            return created_by.get("id", "") or ""
+    return ""
+
+
+def _resolve_notebook_id_by_name(name, cookie, display):
+    """name → 在已缓存 workspaces 里搜 RUNNING notebook 拿 notebook_id。
+
+    不再按 user_id 过滤 —— 协作者机器也能命中，且免疫 user_id 缓存 bug。
+    """
     api = get_api()
-    config = load_config()
-    user_id = config.get("user_id", "")
-
-    # 1. 从 API 查找运行中的开发机
     all_resources = load_all_resources()
     if not all_resources:
         display.print_error("没有已缓存的工作空间，请先 qzcli res -u")
         return None
 
-    notebook_id = None
-    for ws_id, ws_data in all_resources.items():
+    for ws_id, _ws_data in all_resources.items():
         try:
-            user_ids = [user_id] if user_id else []
             nb_result = api.list_notebooks_with_cookie(
                 ws_id,
                 cookie,
                 page_size=50,
-                user_ids=user_ids,
+                user_ids=[],
                 status=["RUNNING"],
             )
             for nb in nb_result.get("list", []):
-                if nb.get("name") == notebook_name:
-                    notebook_id = nb.get("notebook_id")
-                    break
+                if nb.get("name") == name:
+                    return nb.get("notebook_id")
         except QzAPIError:
             continue
-        if notebook_id:
-            break
 
-    if not notebook_id:
-        display.print_error(f"未找到名为 '{notebook_name}' 的运行中开发机")
-        return None
+    display.print_error(f"未找到名为 '{name}' 的运行中开发机")
+    return None
 
-    display.print(
-        f"[dim]找到开发机: {notebook_name} (notebook_id: {notebook_id[:8]}...)[/dim]"
-    )
 
-    # 2. 通过 /api/v1/notebook/lab/{notebook_id} 获取 Jupyter URL（含 token）
+def _get_jupyter_info(notebook_id, cookie, display):
+    """notebook_id → /api/v1/notebook/lab/<id> 301 → 抽 base_url + token。"""
+    import requests as _requests
+
     try:
         resp = _requests.get(
             f"https://qz.sii.edu.cn/api/v1/notebook/lab/{notebook_id}",
@@ -6565,37 +6613,69 @@ def _find_notebook_jupyter_info(notebook_name, display):
             allow_redirects=False,
             timeout=15,
         )
-        if resp.status_code in (301, 302, 303, 307):
-            jupyter_url = resp.headers.get("Location", "")
-            # URL 格式: https://{domain}/{ws}/{proj}/{user}/jupyter/{nb_id}/{token}/lab?token={token}
-            match = re.search(
-                r"(https://[^/]+/[^/]+/[^/]+/[^/]+/jupyter/[^/]+/([^/]+))/lab",
-                jupyter_url,
-            )
-            if match:
-                base_url = match.group(1)
-                token = match.group(2)
-                display.print("[dim]已获取 Jupyter 连接信息[/dim]")
-                return {
-                    "base_url": base_url,
-                    "token": token,
-                    "notebook_id": notebook_id,
-                }
-
-        if (
-            resp.status_code == 401
-            or resp.status_code == 302
-            and "keycloak" in resp.headers.get("Location", "")
-        ):
-            display.print_error("Cookie 已过期，请重新登录: qzcli login")
-            return None
-
-        display.print_error(f"获取 Jupyter URL 失败: HTTP {resp.status_code}")
-        return None
-
     except Exception as e:
         display.print_error(f"请求失败: {e}")
         return None
+
+    if resp.status_code in (301, 302, 303, 307):
+        location = resp.headers.get("Location", "")
+        if "keycloak" in location:
+            display.print_error("Cookie 已过期，请重新登录: qzcli login")
+            return None
+        # URL 格式: https://{domain}/{ws}/{proj}/{user}/jupyter/{nb_id}/{token}/lab?token={token}
+        match = re.search(
+            r"(https://[^/]+/[^/]+/[^/]+/[^/]+/jupyter/[^/]+/([^/]+))/lab",
+            location,
+        )
+        if match:
+            return {
+                "base_url": match.group(1),
+                "token": match.group(2),
+                "notebook_id": notebook_id,
+            }
+        display.print_error(f"解析 Jupyter URL 失败: {location[:200]}")
+        return None
+
+    if resp.status_code == 401:
+        display.print_error("Cookie 已过期，请重新登录: qzcli login")
+        return None
+
+    display.print_error(f"获取 Jupyter URL 失败: HTTP {resp.status_code}")
+    return None
+
+
+def _find_notebook_jupyter_info(target, display):
+    """
+    name | notebook_id (UUID) | 完整 URL → Jupyter base_url + token。
+
+    流程：
+      1. UUID/URL: 直接抽 notebook_id（跳过 list_notebooks）
+      2. name: 按名字在已缓存 workspaces 里搜 RUNNING notebook
+      3. notebook_id → /api/v1/notebook/lab/<id> 301 → base_url + token
+
+    Returns: dict with {base_url, token, notebook_id} or None
+    """
+    cookie_data = get_cookie()
+    if not cookie_data or not cookie_data.get("cookie"):
+        display.print_error("未登录，请先 qzcli login")
+        return None
+
+    cookie = cookie_data["cookie"]
+    notebook_id = _extract_notebook_id(target)
+    if notebook_id:
+        display.print(f"[dim]目标 notebook_id: {notebook_id[:8]}...[/dim]")
+    else:
+        notebook_id = _resolve_notebook_id_by_name(target, cookie, display)
+        if not notebook_id:
+            return None
+        display.print(
+            f"[dim]找到开发机: {target} (notebook_id: {notebook_id[:8]}...)[/dim]"
+        )
+
+    info = _get_jupyter_info(notebook_id, cookie, display)
+    if info:
+        display.print("[dim]已获取 Jupyter 连接信息[/dim]")
+    return info
 
 
 def _exec_via_jupyter(jupyter_info, cmd_str, display, timeout=120):
@@ -6748,25 +6828,34 @@ def _exec_via_jupyter(jupyter_info, cmd_str, display, timeout=120):
 def cmd_exec(args):
     """在开发机上执行命令（通过 Jupyter terminal API）"""
     display = get_display()
-    host = args.host
+    target = args.host
     cmd_parts = args.remote_cmd
+    timeout = getattr(args, "timeout", 120)
 
     if not cmd_parts:
         display.print_error("请指定要执行的命令")
-        display.print("[dim]用法: qzcli exec <host> <command>[/dim]")
+        display.print(
+            "[dim]用法: qzcli exec [--timeout SEC] <name|UUID|URL> <command>[/dim]"
+        )
         display.print("[dim]示例: qzcli exec blender-rl nvidia-smi[/dim]")
+        display.print("[dim]      qzcli exec cfe43e55-... nvidia-smi[/dim]")
+        display.print(
+            "[dim]      qzcli exec 'https://qz.sii.edu.cn/ide?notebook_id=cfe43e55-...' nvidia-smi[/dim]"
+        )
         return 1
 
     cmd_str = " ".join(cmd_parts)
 
-    # 查找 Jupyter 连接信息
-    jupyter_info = _find_notebook_jupyter_info(host, display)
+    # 查找 Jupyter 连接信息（target 可以是 name / notebook_id / URL）
+    jupyter_info = _find_notebook_jupyter_info(target, display)
     if jupyter_info is None:
         return 1
 
-    display.print(f"[dim]在 {host} 上执行: {cmd_str}[/dim]")
+    display.print(f"[dim]执行: {cmd_str}[/dim]")
 
-    exit_code, output = _exec_via_jupyter(jupyter_info, cmd_str, display)
+    exit_code, output = _exec_via_jupyter(
+        jupyter_info, cmd_str, display, timeout=timeout
+    )
     if output:
         print(output)
     return exit_code
@@ -6958,15 +7047,31 @@ def main():
     stop_parser.add_argument("--yes", "-y", action="store_true", help="跳过确认")
 
     # logs 命令 (v2 GetJobLog)
-    logs_parser = subparsers.add_parser("logs", help="查看任务日志（v2 接口，直连 pod）")
+    logs_parser = subparsers.add_parser(
+        "logs", help="查看任务日志（v2 接口，直连 pod）"
+    )
     logs_parser.add_argument("job_id", help="任务 ID")
-    logs_parser.add_argument("--tail", "-n", type=int, default=200, help="最近 N 条(默认 200)")
-    logs_parser.add_argument("--follow", "-f", action="store_true", help="持续轮询新日志(类似 tail -f)")
-    logs_parser.add_argument("--interval", type=float, default=3.0, help="--follow 轮询间隔秒(默认 3)")
-    logs_parser.add_argument("--pod", help="只看指定 pod(默认所有 instance: <job-id>-worker-0..N)")
-    logs_parser.add_argument("--since", help="只取此时间后日志: ISO 时间或相对值如 5m/1h/30s/1d")
-    logs_parser.add_argument("--raw", action="store_true", help="只打 message,不带时间/pod 前缀")
-    logs_parser.add_argument("--json", dest="output_json", action="store_true", help="原始 JSON 输出")
+    logs_parser.add_argument(
+        "--tail", "-n", type=int, default=200, help="最近 N 条(默认 200)"
+    )
+    logs_parser.add_argument(
+        "--follow", "-f", action="store_true", help="持续轮询新日志(类似 tail -f)"
+    )
+    logs_parser.add_argument(
+        "--interval", type=float, default=3.0, help="--follow 轮询间隔秒(默认 3)"
+    )
+    logs_parser.add_argument(
+        "--pod", help="只看指定 pod(默认所有 instance: <job-id>-worker-0..N)"
+    )
+    logs_parser.add_argument(
+        "--since", help="只取此时间后日志: ISO 时间或相对值如 5m/1h/30s/1d"
+    )
+    logs_parser.add_argument(
+        "--raw", action="store_true", help="只打 message,不带时间/pod 前缀"
+    )
+    logs_parser.add_argument(
+        "--json", dest="output_json", action="store_true", help="原始 JSON 输出"
+    )
 
     # watch 命令
     watch_parser = subparsers.add_parser("watch", aliases=["w"], help="实时监控")
@@ -7037,7 +7142,19 @@ def main():
     exec_parser = subparsers.add_parser(
         "exec", help="在开发机上执行命令（通过 Jupyter API，无需 SSH）"
     )
-    exec_parser.add_argument("host", help="开发机名称（如 blender-rl、rtx-gpu8）")
+    exec_parser.add_argument(
+        "--timeout",
+        type=int,
+        default=120,
+        help="命令超时秒数（默认 120）。超时只切回本地，远端命令继续跑。"
+        " 注意：因 remote_cmd 用 REMAINDER 吸收，--timeout 必须放在 host 之前。",
+    )
+    exec_parser.add_argument(
+        "host",
+        metavar="target",
+        help="开发机标识：name (如 blender-rl) / notebook_id (UUID) / "
+        "完整 URL (/ide?notebook_id=..., /jobs/interactiveModel(ing)?Detail/..., /jupyter/...)",
+    )
     exec_parser.add_argument(
         "remote_cmd", nargs=argparse.REMAINDER, help="要执行的命令"
     )
