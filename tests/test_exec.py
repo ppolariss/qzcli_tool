@@ -1,0 +1,308 @@
+"""Unit tests for `qzcli exec` — name/UUID/URL resolution + user_id detection."""
+
+import argparse
+import io
+import unittest
+from contextlib import redirect_stdout
+from unittest.mock import MagicMock, patch
+
+from qzcli.api import QzAPIError
+from qzcli.cli import (
+    _detect_user_id_from_probe,
+    _extract_notebook_id,
+    _resolve_notebook_id_by_name,
+    cmd_exec,
+)
+
+UUID_REAL = "cfe43e55-e7a1-484a-898c-695596b0877b"
+WS_ID = "ws-9dcc0e1f-80a4-4af2-bc2f-0e352e7b17e6"
+
+
+class ExtractNotebookIdTests(unittest.TestCase):
+    """`_extract_notebook_id` must accept UUID + 5 URL forms; reject plain names."""
+
+    def test_uuid_pass_through(self):
+        self.assertEqual(_extract_notebook_id(UUID_REAL), UUID_REAL)
+
+    def test_uuid_uppercase(self):
+        self.assertEqual(_extract_notebook_id(UUID_REAL.upper()), UUID_REAL.upper())
+
+    def test_ide_query_url(self):
+        url = f"https://qz.sii.edu.cn/ide?notebook_id={UUID_REAL}"
+        self.assertEqual(_extract_notebook_id(url), UUID_REAL)
+
+    def test_interactive_model_detail_url(self):
+        # Note: the URL form WITHOUT "-ing-" (the one user pasted in this convo)
+        url = (
+            f"https://qz.sii.edu.cn/jobs/interactiveModelDetail/{UUID_REAL}"
+            f"?spaceId={WS_ID}"
+        )
+        self.assertEqual(_extract_notebook_id(url), UUID_REAL)
+
+    def test_interactive_modeling_detail_url(self):
+        # URL form WITH "-ing-" (the form shown in `qzcli list -ci` output)
+        url = (
+            f"https://qz.sii.edu.cn/jobs/interactiveModelingDetail/{UUID_REAL}"
+            f"?spaceId={WS_ID}"
+        )
+        self.assertEqual(_extract_notebook_id(url), UUID_REAL)
+
+    def test_full_jupyter_url(self):
+        url = (
+            "https://ai-notebook-inspire.sii.edu.cn/ws-9dcc0e1f/"
+            "project-7e0957fb/user-ef4936dd/"
+            f"jupyter/{UUID_REAL}/80f78fda/lab?token=80f78fda"
+        )
+        self.assertEqual(_extract_notebook_id(url), UUID_REAL)
+
+    def test_api_v1_notebook_lab_url(self):
+        url = f"https://qz.sii.edu.cn/api/v1/notebook/lab/{UUID_REAL}"
+        self.assertEqual(_extract_notebook_id(url), UUID_REAL)
+
+    def test_notebook_lab_short_url(self):
+        url = f"https://example.com/notebook/lab/{UUID_REAL}"
+        self.assertEqual(_extract_notebook_id(url), UUID_REAL)
+
+    def test_plain_name_returns_none(self):
+        self.assertIsNone(_extract_notebook_id("zzy-dc-ae-dev"))
+
+    def test_empty_and_none(self):
+        self.assertIsNone(_extract_notebook_id(""))
+        self.assertIsNone(_extract_notebook_id(None))
+
+    def test_uuid_inside_path_segment_not_matched_without_known_prefix(self):
+        # 一个 UUID 出现在某个不认识的路径里，不该被随便抽出
+        url = f"https://random.example/random/path/{UUID_REAL}/things"
+        self.assertIsNone(_extract_notebook_id(url))
+
+
+class ResolveNotebookIdByNameTests(unittest.TestCase):
+    """Name lookup must search list_notebooks WITHOUT user_ids filter."""
+
+    def _fake_api(self, notebooks_per_ws):
+        api = MagicMock()
+        api.list_notebooks_with_cookie.side_effect = lambda ws, *a, **kw: {
+            "list": notebooks_per_ws.get(ws, [])
+        }
+        return api
+
+    def test_finds_notebook_by_name(self):
+        api = self._fake_api(
+            {WS_ID: [{"name": "zzy-dc-ae-dev", "notebook_id": UUID_REAL}]}
+        )
+        with patch("qzcli.cli.get_api", return_value=api), patch(
+            "qzcli.cli.load_all_resources", return_value={WS_ID: {"name": "ws"}}
+        ):
+            display = MagicMock()
+            result = _resolve_notebook_id_by_name("zzy-dc-ae-dev", "cookie", display)
+        self.assertEqual(result, UUID_REAL)
+
+    def test_does_not_pass_user_ids_filter(self):
+        """Regression: ensure user_ids=[] so 协作者 notebooks 不被过滤掉."""
+        api = self._fake_api(
+            {WS_ID: [{"name": "mschen-mova-dev-copy", "notebook_id": "9ced1457-..."}]}
+        )
+        with patch("qzcli.cli.get_api", return_value=api), patch(
+            "qzcli.cli.load_all_resources", return_value={WS_ID: {"name": "ws"}}
+        ):
+            display = MagicMock()
+            _resolve_notebook_id_by_name("mschen-mova-dev-copy", "cookie", display)
+        # 必须传 user_ids=[]，不能传 [some-user-id]
+        kwargs = api.list_notebooks_with_cookie.call_args.kwargs
+        self.assertEqual(kwargs.get("user_ids"), [])
+
+    def test_not_found_prints_error(self):
+        api = self._fake_api({WS_ID: [{"name": "other", "notebook_id": "x"}]})
+        with patch("qzcli.cli.get_api", return_value=api), patch(
+            "qzcli.cli.load_all_resources", return_value={WS_ID: {"name": "ws"}}
+        ):
+            display = MagicMock()
+            result = _resolve_notebook_id_by_name("nope", "cookie", display)
+        self.assertIsNone(result)
+        display.print_error.assert_called_once()
+
+    def test_no_cached_workspaces_prints_error(self):
+        with patch("qzcli.cli.load_all_resources", return_value={}):
+            display = MagicMock()
+            result = _resolve_notebook_id_by_name("anything", "cookie", display)
+        self.assertIsNone(result)
+        display.print_error.assert_called_once()
+
+    def test_workspace_api_error_continues_to_next(self):
+        api = MagicMock()
+        api.list_notebooks_with_cookie.side_effect = [
+            QzAPIError("first ws blew up"),
+            {"list": [{"name": "found", "notebook_id": UUID_REAL}]},
+        ]
+        with patch("qzcli.cli.get_api", return_value=api), patch(
+            "qzcli.cli.load_all_resources",
+            return_value={"ws-a": {}, "ws-b": {}},
+        ):
+            display = MagicMock()
+            result = _resolve_notebook_id_by_name("found", "cookie", display)
+        self.assertEqual(result, UUID_REAL)
+
+
+class DetectUserIdFromProbeTests(unittest.TestCase):
+    """`_detect_user_id_from_probe` must match by login_name, not 'first job'."""
+
+    USERNAME = "253208120278"
+    MY_UID = "user-ef4936dd-0231-4485-ba30-34e92bf3ea53"
+    OTHER_UID = "user-d5360991-3c99-4e2f-b9be-44f8dd56e817"
+
+    def _job(self, login_name, uid):
+        return {
+            "created_by": {
+                "id": uid,
+                "extra_info": {"login_name": login_name},
+            }
+        }
+
+    def test_matches_by_login_name(self):
+        jobs = [
+            self._job("253208125555", self.OTHER_UID),
+            self._job(self.USERNAME, self.MY_UID),
+            self._job("253208120000", "user-other"),
+        ]
+        self.assertEqual(_detect_user_id_from_probe(jobs, self.USERNAME), self.MY_UID)
+
+    def test_returns_empty_if_no_match(self):
+        """Bug regression: not finding self should NOT return another user's id."""
+        jobs = [
+            self._job("253208125555", self.OTHER_UID),
+            self._job("253208123456", "user-yet-another"),
+        ]
+        self.assertEqual(_detect_user_id_from_probe(jobs, self.USERNAME), "")
+
+    def test_returns_empty_if_no_username(self):
+        jobs = [self._job(self.USERNAME, self.MY_UID)]
+        self.assertEqual(_detect_user_id_from_probe(jobs, ""), "")
+        self.assertEqual(_detect_user_id_from_probe(jobs, None), "")
+
+    def test_returns_empty_if_no_jobs(self):
+        self.assertEqual(_detect_user_id_from_probe([], self.USERNAME), "")
+
+    def test_handles_missing_created_by_fields(self):
+        jobs = [
+            {},
+            {"created_by": None},
+            {"created_by": {}},
+            {"created_by": {"extra_info": None}},
+            self._job(self.USERNAME, self.MY_UID),
+        ]
+        self.assertEqual(_detect_user_id_from_probe(jobs, self.USERNAME), self.MY_UID)
+
+
+class CmdExecTimeoutTests(unittest.TestCase):
+    """`qzcli exec --timeout N` must plumb N into _exec_via_jupyter."""
+
+    def _make_args(self, host="dev", remote_cmd=("nvidia-smi",), timeout=120):
+        return argparse.Namespace(
+            host=host, remote_cmd=list(remote_cmd), timeout=timeout
+        )
+
+    def test_default_timeout_120(self):
+        args = self._make_args()
+        with patch(
+            "qzcli.cli._find_notebook_jupyter_info",
+            return_value={"base_url": "u", "token": "t", "notebook_id": "n"},
+        ), patch(
+            "qzcli.cli._exec_via_jupyter", return_value=(0, "ok")
+        ) as mock_exec, patch(
+            "qzcli.cli.get_display", return_value=MagicMock()
+        ):
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                rc = cmd_exec(args)
+        self.assertEqual(rc, 0)
+        kwargs = mock_exec.call_args.kwargs
+        self.assertEqual(kwargs.get("timeout"), 120)
+
+    def test_custom_timeout_propagates(self):
+        args = self._make_args(timeout=600)
+        with patch(
+            "qzcli.cli._find_notebook_jupyter_info",
+            return_value={"base_url": "u", "token": "t", "notebook_id": "n"},
+        ), patch(
+            "qzcli.cli._exec_via_jupyter", return_value=(0, "")
+        ) as mock_exec, patch(
+            "qzcli.cli.get_display", return_value=MagicMock()
+        ):
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                cmd_exec(args)
+        self.assertEqual(mock_exec.call_args.kwargs.get("timeout"), 600)
+
+    def test_empty_remote_cmd_returns_1_without_calling_exec(self):
+        args = self._make_args(remote_cmd=())
+        with patch("qzcli.cli._exec_via_jupyter") as mock_exec, patch(
+            "qzcli.cli.get_display", return_value=MagicMock()
+        ):
+            rc = cmd_exec(args)
+        self.assertEqual(rc, 1)
+        mock_exec.assert_not_called()
+
+
+class FindNotebookJupyterInfoTests(unittest.TestCase):
+    """Integration: UUID/URL should skip name lookup entirely."""
+
+    def test_uuid_skips_list_notebooks(self):
+        from qzcli.cli import _find_notebook_jupyter_info
+
+        with patch("qzcli.cli.get_cookie", return_value={"cookie": "c"}), patch(
+            "qzcli.cli.get_api"
+        ) as get_api, patch(
+            "qzcli.cli._get_jupyter_info",
+            return_value={"base_url": "u", "token": "t", "notebook_id": UUID_REAL},
+        ):
+            display = MagicMock()
+            result = _find_notebook_jupyter_info(UUID_REAL, display)
+        self.assertEqual(result["notebook_id"], UUID_REAL)
+        # 关键断言：UUID 路径下根本不该调 list_notebooks_with_cookie
+        get_api.assert_not_called()
+
+    def test_url_skips_list_notebooks(self):
+        from qzcli.cli import _find_notebook_jupyter_info
+
+        url = f"https://qz.sii.edu.cn/ide?notebook_id={UUID_REAL}"
+        with patch("qzcli.cli.get_cookie", return_value={"cookie": "c"}), patch(
+            "qzcli.cli.get_api"
+        ) as get_api, patch(
+            "qzcli.cli._get_jupyter_info",
+            return_value={"base_url": "u", "token": "t", "notebook_id": UUID_REAL},
+        ):
+            display = MagicMock()
+            result = _find_notebook_jupyter_info(url, display)
+        self.assertEqual(result["notebook_id"], UUID_REAL)
+        get_api.assert_not_called()
+
+    def test_name_uses_list_notebooks(self):
+        from qzcli.cli import _find_notebook_jupyter_info
+
+        api = MagicMock()
+        api.list_notebooks_with_cookie.return_value = {
+            "list": [{"name": "dev", "notebook_id": UUID_REAL}]
+        }
+        with patch("qzcli.cli.get_cookie", return_value={"cookie": "c"}), patch(
+            "qzcli.cli.get_api", return_value=api
+        ), patch("qzcli.cli.load_all_resources", return_value={WS_ID: {}}), patch(
+            "qzcli.cli._get_jupyter_info",
+            return_value={"base_url": "u", "token": "t", "notebook_id": UUID_REAL},
+        ):
+            display = MagicMock()
+            result = _find_notebook_jupyter_info("dev", display)
+        self.assertEqual(result["notebook_id"], UUID_REAL)
+        api.list_notebooks_with_cookie.assert_called_once()
+
+    def test_no_cookie_prints_error(self):
+        from qzcli.cli import _find_notebook_jupyter_info
+
+        with patch("qzcli.cli.get_cookie", return_value=None):
+            display = MagicMock()
+            result = _find_notebook_jupyter_info(UUID_REAL, display)
+        self.assertIsNone(result)
+        display.print_error.assert_called_once()
+
+
+if __name__ == "__main__":
+    unittest.main()
