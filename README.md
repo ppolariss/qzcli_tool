@@ -468,6 +468,7 @@ done
 | `logs` | 查看任务容器日志 | `qzcli logs job-xxx --tail 100` |
 | `watch` | 实时监控 | `qzcli watch -i 10` |
 | `track` | 追踪任务 | `qzcli track job-xxx` |
+| `exec` | 在开发机上执行命令（Jupyter API，无需 SSH） | `qzcli exec blender-rl nvidia-smi` |
 
 ```bash
 # 查看最近 200 条日志（默认）
@@ -490,6 +491,28 @@ qzcli logs job-xxx --pod job-xxx-worker-0 --since 10m
 ```
 
 `logs` 使用平台 `/api/v2/train?Action=GetJobLog` 接口，需要 `qzcli login` 保存的 cookie。若提示 Cookie 过期，重新运行 `qzcli login` 后再试。
+
+### 远程执行 / 开发机命令
+
+`qzcli exec` 通过开发机自带的 Jupyter terminal API 在远端跑一条命令，**不需要起 SSH**。命令以 fire-and-forget + 轮询输出的方式执行，本地连接抖动不会杀掉远端进程；`--timeout` 只决定本地等多久后切回，远端命令继续在开发机上跑。
+
+```bash
+# 按 name 解析（最常见，需 list_notebooks 里能查到）
+qzcli exec blender-rl nvidia-smi
+
+# 按 notebook_id (UUID) 解析
+qzcli exec cfe43e55-e7a1-484a-898c-695596b0877b nvidia-smi
+
+# 直接粘贴 IDE / Jupyter URL（支持 /ide?notebook_id=、
+# /jobs/interactiveModel(ing)?Detail/、/jupyter/、/api/v1/notebook/lab/、/notebook/lab/ 等多种形式）
+qzcli exec 'https://qz.sii.edu.cn/jobs/interactiveModelingDetail/cfe43e55-...?spaceId=ws-...' df -h
+
+# 自定义本地等待超时（默认 120 秒）。
+# 注意：因 remote_cmd 用 argparse.REMAINDER 吸收，--timeout 必须放在 target 之前
+qzcli exec --timeout 600 blender-rl bash /workspace/long_running.sh
+```
+
+`exec` 走开发机域名下的 Jupyter terminal / contents 接口（与浏览器 IDE 同一套），需要 `qzcli login` 保存的 cookie。Cookie 过期时重新运行 `qzcli login` 即可。
 
 ### 工作空间视图
 
