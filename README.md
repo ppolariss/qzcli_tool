@@ -6,7 +6,7 @@
 
 ## 项目链接
 
-- Release: <https://github.com/tianyilt/qzcli_tool/releases/tag/v0.2.0>
+- Release: <https://github.com/tianyilt/qzcli_tool/releases/tag/v0.3.0>
 - Changelog: [CHANGELOG.md](CHANGELOG.md)
 - Issues: <https://github.com/tianyilt/qzcli_tool/issues>
 - License: [MIT](LICENSE)
