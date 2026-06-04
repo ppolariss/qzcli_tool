@@ -6067,6 +6067,28 @@ def cmd_create(args):
         ],
     }
 
+    # --- Dataset mounting ---
+    if getattr(args, "dataset", None):
+        dataset_info = []
+        for ds_spec in args.dataset:
+            parts = ds_spec.split(":")
+            if len(parts) == 2:
+                ds_id, ver_id = parts
+            elif len(parts) == 1:
+                ds_id, ver_id = parts[0], "v1"
+            else:
+                display.print_error(f"无效的数据集格式: {ds_spec}，应为 dataset_id:version_id")
+                return 1
+            dataset_info.append({
+                "dataset_id": ds_id,
+                "path": f"rclone-worker-1/{ds_id}/{ver_id}",
+                "version_id": ver_id,
+            })
+        payload["dataset_info"] = dataset_info
+        display.print(f"  挂载数据集: {len(dataset_info)} 个")
+        for di in dataset_info:
+            display.print(f"    - {di['dataset_id']} ({di['version_id']})")
+
     # --- Dry run ---
     if args.dry_run:
         import json as json_mod
@@ -7301,6 +7323,12 @@ def main():
     )
     create_parser.add_argument(
         "--framework", help=f"框架类型（默认 {DEFAULT_CREATE_FRAMEWORK}）"
+    )
+    create_parser.add_argument(
+        "--dataset", "-d",
+        action="append",
+        metavar="ID:VERSION",
+        help="挂载公共数据集，格式 dataset_id:version_id（可多次指定），如 --dataset open-p2p-full:v1 --dataset videogamebunny:v1",
     )
     create_parser.add_argument("--no-track", action="store_true", help="不自动追踪任务")
     create_parser.add_argument(
