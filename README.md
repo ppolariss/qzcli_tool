@@ -508,11 +508,20 @@ qzcli exec cfe43e55-e7a1-484a-898c-695596b0877b nvidia-smi
 qzcli exec 'https://qz.sii.edu.cn/jobs/interactiveModelingDetail/cfe43e55-...?spaceId=ws-...' df -h
 
 # 自定义本地等待超时（默认 120 秒）。
-# 注意：因 remote_cmd 用 argparse.REMAINDER 吸收，--timeout 必须放在 target 之前
+# 注意：因 remote_cmd 用 argparse.REMAINDER 吸收，--timeout/--detach 必须放在 target 之前
 qzcli exec --timeout 600 blender-rl bash /workspace/long_running.sh
+
+# 后台启动长命令：立即返回 job_id，不等待结果
+qzcli exec --detach blender-rl bash /workspace/train.sh
+# → 打印 job_id，例如 qzcli_1700000000
+
+# 之后随时重连，继续拉取输出 / 退出码（未结束可反复 attach）
+qzcli exec-attach blender-rl qzcli_1700000000
 ```
 
-`exec` 走开发机域名下的 Jupyter terminal / contents 接口（与浏览器 IDE 同一套），需要 `qzcli login` 保存的 cookie。Cookie 过期时重新运行 `qzcli login` 即可。
+`exec` 走开发机域名下的 Jupyter terminal / contents 接口（与浏览器 IDE 同一套），需要 `qzcli login` 保存的 cookie。**Cookie 过期会用本地凭据自动重登一次**（凭据来自 env / `~/.qzcli/.env` / `config.json`），无凭据时回退提示重新 `qzcli login`。
+
+> 对 agent / 自动化：MCP 工具 `qz_exec`（短命令同步；`detach=True` 用于编译、下载、训练等长命令）和 `qz_exec_attach`（轮询长命令结果）提供与上面等价的能力，无需 shell-out，并共享 cookie 自动重登。
 
 ### 工作空间视图
 

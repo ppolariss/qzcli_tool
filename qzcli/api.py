@@ -2,7 +2,12 @@
 启智平台 API 客户端
 """
 
+import functools
+import inspect
 import json as _json
+import random
+import threading
+import time as _time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import lru_cache
 from typing import Any, Dict, List, Optional
@@ -14,14 +19,14 @@ from . import __version__
 from .config import (
     clear_token_cache,
     get_api_base_url,
-    get_credentials,
     get_cookie,
+    get_credentials,
     get_proxy,
     get_token_cache,
+    save_cookie,
     save_token_cache,
 )
 from .crypto import encrypt_password
-
 
 # /api/v2/* requires this header — without it APISIX gateway redirects to
 # Keycloak login (returning HTML) even when the Bearer token is valid.
@@ -35,12 +40,63 @@ V2_BROWSER_UA = (
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"
 )
 
+
 class QzAPIError(Exception):
     """API 错误"""
 
     def __init__(self, message: str, code: Optional[int] = None):
         super().__init__(message)
         self.code = code
+
+
+class QzTransientError(QzAPIError):
+    """瞬时故障（SSL EOF、连接重置、5xx/代理抖动），值得重试。
+
+    继承自 ``QzAPIError``，所以现有 ``except QzAPIError`` 仍能捕获；区别只是用类型
+    标记“可重试”，避免靠匹配错误文案来判断。
+    """
+
+
+# CAS 登录瞬时失败的重试参数（指数退避 + 抖动）。
+_LOGIN_MAX_TRIES = 3
+
+
+def _backoff_delay(attempt: int, base: float = 0.5, cap: float = 2.0) -> float:
+    """第 ``attempt`` 次重试（从 0 起）的退避秒数：base*2^n，封顶 cap，叠加抖动。"""
+    delay = min(cap, base * (2**attempt))
+    return delay + random.uniform(0, delay * 0.25)
+
+
+def with_auth_retry(method):
+    """装饰 cookie 认证的 ``QzAPI`` 方法：遇到 401（cookie 过期）时，用本地凭据
+    透明地 ``login_with_cas`` 重新登录一次并重试原调用。
+
+    - 带 ``cookie`` 形参的方法，重试时会换上刚拿到的新 cookie；
+    - 自行从磁盘读 cookie 的方法（如 ``_request_v2``），重试时自然读到刷新后的 cookie。
+
+    当没有凭据、``_auto_relogin`` 关闭、或重新登录失败时为 no-op：原始 401 会被重新
+    抛出，从而保留既有回退逻辑（例如 token 认证）。
+    """
+    sig = inspect.signature(method)
+    takes_cookie = "cookie" in sig.parameters
+
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        try:
+            return method(self, *args, **kwargs)
+        except QzAPIError as exc:
+            if exc.code != 401 or not getattr(self, "_auto_relogin", True):
+                raise
+            new_cookie = self._relogin()
+            if not new_cookie:
+                raise
+            if takes_cookie:
+                bound = sig.bind(self, *args, **kwargs)
+                bound.arguments["cookie"] = new_cookie
+                return method(*bound.args, **bound.kwargs)
+            return method(self, *args, **kwargs)
+
+    return wrapper
 
 
 @lru_cache(maxsize=8)
@@ -156,9 +212,32 @@ class QzAPI:
             self._username, self._password = get_credentials()
 
         self._token: Optional[str] = None
+        # 关掉可临时禁用 cookie 过期自动重登（如只读 / 无凭据场景）。
+        self._auto_relogin = True
+        self._relogin_lock = threading.Lock()
 
     def _post(self, url: str, **kwargs) -> _CurlResponse:
         return _curl_post(url, **kwargs)
+
+    def _relogin(self) -> Optional[str]:
+        """用本地凭据走 CAS 重新登录并持久化新 cookie。
+
+        返回新 cookie 字符串；没有凭据或登录失败时返回 ``None``。线程安全：并发
+        调用（如 ``get_jobs_detail`` 扇出）共享一次登录，避免对 CAS 造成登录风暴。
+        """
+        if not (self._username and self._password):
+            return None
+        stale = (get_cookie() or {}).get("cookie")
+        with self._relogin_lock:
+            current = (get_cookie() or {}).get("cookie")
+            if current and current != stale:
+                return current  # 其他线程已经刷新过了
+            try:
+                cookie = self.login_with_cas(self._username, self._password)
+            except QzAPIError:
+                return None
+            save_cookie(cookie, (get_cookie() or {}).get("workspace_id", ""))
+            return cookie
 
     def _get_token(self, force_refresh: bool = False) -> str:
         """获取 Access Token（带缓存）"""
@@ -248,6 +327,7 @@ class QzAPI:
 
         return result
 
+    @with_auth_retry
     def _request_v2(
         self,
         service: str,
@@ -315,6 +395,7 @@ class QzAPI:
                 response.status_code,
             )
         return result
+
     def get_job_detail(self, job_id: str) -> Dict[str, Any]:
         """查询任务详情（使用 cookie 认证，优先于 token）"""
         cookie_data = get_cookie()
@@ -327,9 +408,8 @@ class QzAPI:
         result = self._request("/openapi/v1/train_job/detail", {"job_id": job_id})
         return result.get("data", {})
 
-    def get_job_detail_with_cookie(
-        self, job_id: str, cookie: str
-    ) -> Dict[str, Any]:
+    @with_auth_retry
+    def get_job_detail_with_cookie(self, job_id: str, cookie: str) -> Dict[str, Any]:
         """使用 cookie 查询任务详情（内部 API）"""
         url = f"{self.base_url}/api/v1/train_job/detail"
         payload = {"job_id": job_id}
@@ -368,7 +448,9 @@ class QzAPI:
             )
         return result.get("data", {})
 
-    def _resolve_pod_names(self, job_id: str, n_instances: Optional[int] = None) -> List[str]:
+    def _resolve_pod_names(
+        self, job_id: str, n_instances: Optional[int] = None
+    ) -> List[str]:
         """推断 job 的所有 worker pod 名。
 
         平台规则：pod 命名为 ``{job_id}-worker-{i}`` for i in 0..n-1。
@@ -463,6 +545,7 @@ class QzAPI:
         except QzAPIError:
             return False
 
+    @with_auth_retry
     def stop_job_with_cookie(self, job_id: str, cookie: str) -> bool:
         """使用 cookie 停止任务（内部 API）"""
         url = f"{self.base_url}/api/v1/train_job/stop"
@@ -507,7 +590,10 @@ class QzAPI:
         result = self._request("/openapi/v1/train_job/create", config)
         return result.get("data", result)
 
-    def create_job_with_cookie(self, cookie: str, config: Dict[str, Any]) -> Dict[str, Any]:
+    @with_auth_retry
+    def create_job_with_cookie(
+        self, cookie: str, config: Dict[str, Any]
+    ) -> Dict[str, Any]:
         """使用 cookie 创建任务（内部 API）"""
         url = f"{self.base_url}/api/v1/train_job/create"
         workspace_id = config.get("workspace_id", "")
@@ -523,12 +609,17 @@ class QzAPI:
         if response.status_code == 401:
             raise QzAPIError("Cookie 已过期或无效，请重新获取", 401)
         if response.status_code != 200:
-            raise QzAPIError(f"请求失败: HTTP {response.status_code}", response.status_code)
+            raise QzAPIError(
+                f"请求失败: HTTP {response.status_code}", response.status_code
+            )
         result = response.json()
         if result.get("code") != 0:
-            raise QzAPIError(f"API 请求失败: {result.get('message', '未知错误')}", result.get("code"))
+            raise QzAPIError(
+                f"API 请求失败: {result.get('message', '未知错误')}", result.get("code")
+            )
         return result.get("data", result)
 
+    @with_auth_retry
     def create_hpc_job(
         self,
         cookie: str,
@@ -617,6 +708,7 @@ class QzAPI:
             )
         return result.get("data", {})
 
+    @with_auth_retry
     def list_hpc_jobs(
         self,
         workspace_id: str,
@@ -689,6 +781,7 @@ class QzAPI:
         except Exception:
             return False
 
+    @with_auth_retry
     def list_workspace_tasks(
         self,
         workspace_id: str,
@@ -757,6 +850,7 @@ class QzAPI:
 
         return result.get("data", {})
 
+    @with_auth_retry
     def list_jobs_with_cookie(
         self,
         workspace_id: str,
@@ -836,6 +930,7 @@ class QzAPI:
 
         return result.get("data", {})
 
+    @with_auth_retry
     def list_notebooks_with_cookie(
         self,
         workspace_id: str,
@@ -1014,6 +1109,7 @@ class QzAPI:
         )
         return result.get("data", {}).get("specs", [])
 
+    @with_auth_retry
     def list_node_dimension(
         self,
         workspace_id: str,
@@ -1097,6 +1193,7 @@ class QzAPI:
 
         return result.get("data", {})
 
+    @with_auth_retry
     def list_task_dimension(
         self,
         workspace_id: str,
@@ -1175,6 +1272,7 @@ class QzAPI:
 
         return result.get("data", {})
 
+    @with_auth_retry
     def get_cluster_basic_info(self, workspace_id: str, cookie: str) -> Dict[str, Any]:
         """
         获取工作空间的集群和计算组信息
@@ -1235,6 +1333,7 @@ class QzAPI:
 
         return result.get("data", {})
 
+    @with_auth_retry
     def list_workspaces(self, cookie: str) -> List[Dict[str, Any]]:
         """
         获取用户可访问的工作空间列表
@@ -1319,8 +1418,23 @@ class QzAPI:
         return any("session" in name.lower() for name in cookies)
 
     def login_with_cas(self, username: str, password: str) -> str:
+        """通过 CAS 统一认证登录，获取 session cookie。
+
+        瞬时故障（SSL EOF、连接重置、CAS/代理 5xx）会以指数退避重试；用户名密码
+        错误等永久性错误立即抛出，不重试。
         """
-        通过 CAS 统一认证登录，获取 session cookie
+        last_exc: Optional[QzAPIError] = None
+        for attempt in range(_LOGIN_MAX_TRIES):
+            try:
+                return self._login_with_cas_once(username, password)
+            except QzTransientError as exc:
+                last_exc = exc
+                if attempt < _LOGIN_MAX_TRIES - 1:
+                    _time.sleep(_backoff_delay(attempt))
+        raise last_exc  # 重试用尽，抛出最后一次瞬时错误
+
+    def _login_with_cas_once(self, username: str, password: str) -> str:
+        """单次 CAS 登录流程（不含重试）。
 
         登录流程：
         1. 访问 qz.sii.edu.cn -> 重定向到 Keycloak
@@ -1361,7 +1475,11 @@ class QzAPI:
         try:
             resp = session.get(self.base_url, timeout=30, allow_redirects=True)
         except requests.RequestException as e:
-            raise QzAPIError(f"无法连接到启智平台: {e}")
+            raise QzTransientError(f"无法连接到启智平台: {e}")
+        if resp.status_code >= 500:
+            raise QzTransientError(
+                f"启智平台/代理暂时不可用 (HTTP {resp.status_code})", resp.status_code
+            )
 
         current_url = resp.url
         current_host = urlparse(current_url).netloc
@@ -1398,7 +1516,7 @@ class QzAPI:
                     resp = session.get(cas_broker_url, timeout=30, allow_redirects=True)
                     current_url = resp.url
                 except requests.RequestException as e:
-                    raise QzAPIError(f"跳转 CAS 失败: {e}")
+                    raise QzTransientError(f"跳转 CAS 失败: {e}")
             else:
                 raise QzAPIError("Keycloak 页面中未找到 CAS 登录链接")
 
@@ -1446,7 +1564,7 @@ class QzAPI:
                 allow_redirects=True,
             )
         except requests.RequestException as e:
-            raise QzAPIError(f"登录请求失败: {e}")
+            raise QzTransientError(f"登录请求失败: {e}")
 
         current_url = resp.url
 
@@ -1466,7 +1584,7 @@ class QzAPI:
             try:
                 resp = session.get(self.base_url, timeout=30, allow_redirects=True)
             except requests.RequestException as e:
-                raise QzAPIError(f"获取 session 失败: {e}")
+                raise QzTransientError(f"获取 session 失败: {e}")
 
         # 收集所有 qz.sii.edu.cn 域的 cookies
         all_cookies = {}
