@@ -25,7 +25,6 @@ from .config import (
 )
 from .store import JobRecord, get_store
 
-
 TYPE_NAMES = {
     "distributed_training": "分布式训练",
     "interactive_modeling": "交互式建模",
@@ -96,7 +95,9 @@ def _now_iso() -> str:
     return datetime.now().isoformat()
 
 
-def _result(data: Any, *, message: str = "", warnings: Optional[list[str]] = None) -> dict[str, Any]:
+def _result(
+    data: Any, *, message: str = "", warnings: Optional[list[str]] = None
+) -> dict[str, Any]:
     return {
         "ok": True,
         "message": message,
@@ -115,7 +116,9 @@ def _cookie_preview(cookie: str) -> str:
 def _require_cookie() -> tuple[str, dict[str, Any]]:
     cookie_data = get_cookie()
     if not cookie_data or not cookie_data.get("cookie"):
-        raise RuntimeError("未设置 cookie，请先运行 qzcli login / qzcli cookie，或调用 qz_auth_login / qz_set_cookie。")
+        raise RuntimeError(
+            "未设置 cookie，请先运行 qzcli login / qzcli cookie，或调用 qz_auth_login / qz_set_cookie。"
+        )
     return cookie_data["cookie"], cookie_data
 
 
@@ -155,7 +158,9 @@ def _resolve_workspace_refs(
         if cached:
             return [{"id": item["id"], "name": item.get("name", "")} for item in cached]
         if not cookie:
-            raise RuntimeError("没有已缓存的工作空间，且当前没有可用 cookie 用于远端发现。")
+            raise RuntimeError(
+                "没有已缓存的工作空间，且当前没有可用 cookie 用于远端发现。"
+            )
         return get_api().list_workspaces(cookie)
 
     if workspace:
@@ -166,7 +171,12 @@ def _resolve_workspace_refs(
         workspace_id = find_workspace_by_name(workspace)
         if workspace_id:
             ws_resources = get_workspace_resources(workspace_id)
-            return [{"id": workspace_id, "name": (ws_resources or {}).get("name", workspace)}]
+            return [
+                {
+                    "id": workspace_id,
+                    "name": (ws_resources or {}).get("name", workspace),
+                }
+            ]
 
         if not cookie:
             cookie, _ = _require_cookie()
@@ -181,7 +191,9 @@ def _resolve_workspace_refs(
         default_workspace = cookie_data.get("workspace_id", "")
         if default_workspace:
             ws_resources = get_workspace_resources(default_workspace)
-            return [{"id": default_workspace, "name": (ws_resources or {}).get("name", "")}]
+            return [
+                {"id": default_workspace, "name": (ws_resources or {}).get("name", "")}
+            ]
 
     raise RuntimeError("请指定 workspace，或先给 cookie 设置默认 workspace_id。")
 
@@ -276,13 +288,17 @@ def _is_running_like(status_info: dict[str, Any]) -> bool:
     return "running" in normalized or "queue" in normalized or "pending" in normalized
 
 
-def _paginate_task_dimensions(workspace_id: str, cookie: str, page_size: int = 200) -> list[dict[str, Any]]:
+def _paginate_task_dimensions(
+    workspace_id: str, cookie: str, page_size: int = 200
+) -> list[dict[str, Any]]:
     api = get_api()
     tasks: list[dict[str, Any]] = []
     page_num = 1
 
     while True:
-        data = api.list_task_dimension(workspace_id, cookie, page_num=page_num, page_size=page_size)
+        data = api.list_task_dimension(
+            workspace_id, cookie, page_num=page_num, page_size=page_size
+        )
         page_tasks = data.get("task_dimensions", [])
         total_count = data.get("total", 0)
         tasks.extend(page_tasks)
@@ -293,7 +309,9 @@ def _paginate_task_dimensions(workspace_id: str, cookie: str, page_size: int = 2
     return tasks
 
 
-def _refresh_workspace_resources(workspace_id: str, workspace_name: str, cookie: str) -> dict[str, Any]:
+def _refresh_workspace_resources(
+    workspace_id: str, workspace_name: str, cookie: str
+) -> dict[str, Any]:
     api = get_api()
     result = api.list_jobs_with_cookie(workspace_id, cookie, page_size=200)
     jobs = result.get("jobs", [])
@@ -403,17 +421,26 @@ def _availability_result(
         "free_nodes": len(free_nodes),
         "free_node_names": [item["name"] for item in free_nodes],
         "low_priority_free_nodes": len(low_priority_free_nodes),
-        "low_priority_free_node_names": [item["name"] for item in low_priority_free_nodes],
+        "low_priority_free_node_names": [
+            item["name"] for item in low_priority_free_nodes
+        ],
         "total_gpus": total_gpus,
         "total_free_gpus": total_free_gpus,
         "gpu_utilization_ratio": gpu_utilization_ratio,
-        "gpu_free_distribution": {str(key): value for key, value in sorted(gpu_free_distribution.items(), reverse=True)},
+        "gpu_free_distribution": {
+            str(key): value
+            for key, value in sorted(gpu_free_distribution.items(), reverse=True)
+        },
         "raw_node_count": len(nodes),
     }
 
 
-@server.tool(description="通过 CAS 登录启智平台并保存 cookie。未传参数时自动读取环境变量 QZCLI_USERNAME/QZCLI_PASSWORD 或 ~/.qzcli/config.json。")
-def qz_auth_login(username: str = "", password: str = "", workspace_id: str = "") -> dict[str, Any]:
+@server.tool(
+    description="通过 CAS 登录启智平台并保存 cookie。未传参数时自动读取环境变量 QZCLI_USERNAME/QZCLI_PASSWORD 或 ~/.qzcli/config.json。"
+)
+def qz_auth_login(
+    username: str = "", password: str = "", workspace_id: str = ""
+) -> dict[str, Any]:
     if not username or not password:
         cfg_user, cfg_pwd = get_credentials()
         username = username or cfg_user
@@ -430,7 +457,11 @@ def qz_auth_login(username: str = "", password: str = "", workspace_id: str = ""
     api = get_api()
     cookie = api.login_with_cas(username, password)
     save_cookie(cookie, workspace_id)
-    cookie_names = [segment.split("=", 1)[0].strip() for segment in cookie.split(";") if "=" in segment]
+    cookie_names = [
+        segment.split("=", 1)[0].strip()
+        for segment in cookie.split(";")
+        if "=" in segment
+    ]
 
     return _result(
         {
@@ -438,20 +469,32 @@ def qz_auth_login(username: str = "", password: str = "", workspace_id: str = ""
             "cookie_saved": True,
             "cookie_preview": _cookie_preview(cookie),
             "cookie_names": cookie_names,
-            "session_cookie_detected": any("session" in name.lower() for name in cookie_names),
+            "session_cookie_detected": any(
+                "session" in name.lower() for name in cookie_names
+            ),
         },
         message="登录成功并已保存 cookie。",
     )
 
 
 @server.tool(description="手动设置浏览器 cookie，可选校验默认工作空间是否可访问。")
-def qz_set_cookie(cookie: str, workspace_id: str = "", test: bool = True) -> dict[str, Any]:
+def qz_set_cookie(
+    cookie: str, workspace_id: str = "", test: bool = True
+) -> dict[str, Any]:
     total = None
     if test and workspace_id:
-        total = get_api().list_jobs_with_cookie(workspace_id, cookie, page_size=1).get("total", 0)
+        total = (
+            get_api()
+            .list_jobs_with_cookie(workspace_id, cookie, page_size=1)
+            .get("total", 0)
+        )
 
     save_cookie(cookie, workspace_id)
-    cookie_names = [segment.split("=", 1)[0].strip() for segment in cookie.split(";") if "=" in segment]
+    cookie_names = [
+        segment.split("=", 1)[0].strip()
+        for segment in cookie.split(";")
+        if "=" in segment
+    ]
 
     return _result(
         {
@@ -459,7 +502,9 @@ def qz_set_cookie(cookie: str, workspace_id: str = "", test: bool = True) -> dic
             "cookie_saved": True,
             "cookie_preview": _cookie_preview(cookie),
             "cookie_names": cookie_names,
-            "session_cookie_detected": any("session" in name.lower() for name in cookie_names),
+            "session_cookie_detected": any(
+                "session" in name.lower() for name in cookie_names
+            ),
             "validated_total_jobs": total,
         },
         message="cookie 已保存。",
@@ -509,9 +554,13 @@ def qz_list_workspaces(refresh: bool = True) -> dict[str, Any]:
 
 
 @server.tool(description="刷新一个或全部工作空间的资源缓存（项目、计算组、规格）。")
-def qz_refresh_resources(workspace: str = "", all_workspaces: bool = False) -> dict[str, Any]:
+def qz_refresh_resources(
+    workspace: str = "", all_workspaces: bool = False
+) -> dict[str, Any]:
     cookie, _ = _require_cookie()
-    workspace_refs = _resolve_workspace_refs(workspace or None, all_workspaces=all_workspaces or not workspace)
+    workspace_refs = _resolve_workspace_refs(
+        workspace or None, all_workspaces=all_workspaces or not workspace
+    )
 
     results = []
     warnings = []
@@ -519,7 +568,9 @@ def qz_refresh_resources(workspace: str = "", all_workspaces: bool = False) -> d
         workspace_id = workspace_ref.get("id", "")
         workspace_name = workspace_ref.get("name", "")
         try:
-            refreshed = _refresh_workspace_resources(workspace_id, workspace_name, cookie)
+            refreshed = _refresh_workspace_resources(
+                workspace_id, workspace_name, cookie
+            )
             results.append(refreshed)
             if refreshed.get("cluster_info_warning"):
                 warnings.append(
@@ -548,7 +599,9 @@ def qz_get_availability(
     refresh_if_missing: bool = True,
 ) -> dict[str, Any]:
     cookie, _ = _require_cookie()
-    workspace_refs = _resolve_workspace_refs(workspace or None, all_workspaces=not bool(workspace))
+    workspace_refs = _resolve_workspace_refs(
+        workspace or None, all_workspaces=not bool(workspace)
+    )
     api = get_api()
     warnings = []
     all_results = []
@@ -560,15 +613,21 @@ def qz_get_availability(
 
         if not cached_resources:
             if refresh_if_missing:
-                refreshed = _refresh_workspace_resources(workspace_id, workspace_name, cookie)
+                refreshed = _refresh_workspace_resources(
+                    workspace_id, workspace_name, cookie
+                )
                 cached_resources = get_workspace_resources(workspace_id)
-                warnings.append(f"{workspace_name or workspace_id}: 未命中缓存，已自动刷新资源。")
+                warnings.append(
+                    f"{workspace_name or workspace_id}: 未命中缓存，已自动刷新资源。"
+                )
                 if refreshed.get("cluster_info_warning"):
                     warnings.append(
                         f"{workspace_name or workspace_id}: cluster_basic_info 失败，结果可能缺少部分计算组。"
                     )
             else:
-                warnings.append(f"{workspace_name or workspace_id}: 未命中缓存，已跳过。")
+                warnings.append(
+                    f"{workspace_name or workspace_id}: 未命中缓存，已跳过。"
+                )
                 continue
 
         if not cached_resources:
@@ -603,10 +662,14 @@ def qz_get_availability(
                 node_names = task.get("nodes_occupied", {}).get("nodes", [])
                 gpu_per_node = gpu_total // len(node_names) if node_names else 0
                 for node_name in node_names:
-                    node_low_priority_gpu[node_name] += gpu_per_node if len(node_names) > 1 else gpu_total
+                    node_low_priority_gpu[node_name] += (
+                        gpu_per_node if len(node_names) > 1 else gpu_total
+                    )
 
         for group_id, group_info in compute_groups.items():
-            nodes = api.list_node_dimension(workspace_id, cookie, group_id, page_size=1000).get("node_dimensions", [])
+            nodes = api.list_node_dimension(
+                workspace_id, cookie, group_id, page_size=1000
+            ).get("node_dimensions", [])
             availability = _availability_result(
                 workspace_id,
                 cached_resources.get("name", workspace_name) or workspace_id,
@@ -641,10 +704,15 @@ def qz_get_availability(
     if required_nodes > 0:
         if include_low_priority:
             available_results = [
-                item for item in sorted_results if item["free_nodes"] + item["low_priority_free_nodes"] >= required_nodes
+                item
+                for item in sorted_results
+                if item["free_nodes"] + item["low_priority_free_nodes"]
+                >= required_nodes
             ]
         else:
-            available_results = [item for item in sorted_results if item["free_nodes"] >= required_nodes]
+            available_results = [
+                item for item in sorted_results if item["free_nodes"] >= required_nodes
+            ]
 
     recommended = available_results[0] if available_results else None
 
@@ -674,7 +742,9 @@ def qz_list_jobs(
     limit: int = 20,
 ) -> dict[str, Any]:
     cookie, _ = _require_cookie()
-    workspace_refs = _resolve_workspace_refs(workspace or None, all_workspaces=all_workspaces)
+    workspace_refs = _resolve_workspace_refs(
+        workspace or None, all_workspaces=all_workspaces
+    )
     api = get_api()
 
     jobs = []
@@ -713,8 +783,14 @@ def qz_list_jobs(
         {
             "workspace_count": len(workspace_refs),
             "job_count": len(jobs),
-            "status_counts": dict(sorted(status_counts.items(), key=lambda item: (-item[1], item[0]))),
-            "status_family_counts": dict(sorted(status_family_counts.items(), key=lambda item: (-item[1], item[0]))),
+            "status_counts": dict(
+                sorted(status_counts.items(), key=lambda item: (-item[1], item[0]))
+            ),
+            "status_family_counts": dict(
+                sorted(
+                    status_family_counts.items(), key=lambda item: (-item[1], item[0])
+                )
+            ),
             "jobs": jobs,
         },
         message="任务列表查询完成。",
@@ -775,7 +851,9 @@ def qz_stop_job(job_id: str) -> dict[str, Any]:
 @server.tool(description="统计工作空间 GPU 使用分布。")
 def qz_get_usage(workspace: str = "") -> dict[str, Any]:
     cookie, _ = _require_cookie()
-    workspace_refs = _resolve_workspace_refs(workspace or None, all_workspaces=not bool(workspace))
+    workspace_refs = _resolve_workspace_refs(
+        workspace or None, all_workspaces=not bool(workspace)
+    )
     api = get_api()
     all_stats = []
     warnings = []
@@ -791,8 +869,12 @@ def qz_get_usage(workspace: str = "") -> dict[str, Any]:
             gpu_distribution: dict[int, int] = defaultdict(int)
             user_gpu: dict[str, int] = defaultdict(int)
             project_gpu: dict[str, int] = defaultdict(int)
-            type_stats: dict[str, dict[str, int]] = defaultdict(lambda: {"count": 0, "gpu": 0})
-            priority_stats: dict[int, dict[str, int]] = defaultdict(lambda: {"count": 0, "gpu": 0})
+            type_stats: dict[str, dict[str, int]] = defaultdict(
+                lambda: {"count": 0, "gpu": 0}
+            )
+            priority_stats: dict[int, dict[str, int]] = defaultdict(
+                lambda: {"count": 0, "gpu": 0}
+            )
             total_gpu = 0
             projects_found: dict[str, dict[str, str]] = {}
 
@@ -806,7 +888,10 @@ def qz_get_usage(workspace: str = "") -> dict[str, Any]:
                 priority = task.get("priority", 0)
 
                 if project_id and project_id not in projects_found:
-                    projects_found[project_id] = {"id": project_id, "name": project_name}
+                    projects_found[project_id] = {
+                        "id": project_id,
+                        "name": project_name,
+                    }
 
                 gpu_distribution[gpu_total] += 1
                 user_gpu[user_name] += gpu_total
@@ -818,7 +903,9 @@ def qz_get_usage(workspace: str = "") -> dict[str, Any]:
                 total_gpu += gpu_total
 
             if projects_found:
-                update_workspace_projects(workspace_id, list(projects_found.values()), workspace_name)
+                update_workspace_projects(
+                    workspace_id, list(projects_found.values()), workspace_name
+                )
 
             try:
                 node_data = api.list_node_dimension(workspace_id, cookie, page_size=500)
@@ -836,7 +923,11 @@ def qz_get_usage(workspace: str = "") -> dict[str, Any]:
                             "workspace_id": workspace_id,
                         }
                 if compute_groups_found:
-                    update_workspace_compute_groups(workspace_id, list(compute_groups_found.values()), workspace_name)
+                    update_workspace_compute_groups(
+                        workspace_id,
+                        list(compute_groups_found.values()),
+                        workspace_name,
+                    )
             except QzAPIError:
                 pass
 
@@ -846,19 +937,32 @@ def qz_get_usage(workspace: str = "") -> dict[str, Any]:
                     "workspace_name": workspace_name,
                     "total_tasks": len(tasks),
                     "total_gpu": total_gpu,
-                    "gpu_distribution": {str(key): value for key, value in sorted(gpu_distribution.items())},
-                    "user_gpu": dict(sorted(user_gpu.items(), key=lambda item: (-item[1], item[0]))),
-                    "project_gpu": dict(sorted(project_gpu.items(), key=lambda item: (-item[1], item[0]))),
+                    "gpu_distribution": {
+                        str(key): value
+                        for key, value in sorted(gpu_distribution.items())
+                    },
+                    "user_gpu": dict(
+                        sorted(user_gpu.items(), key=lambda item: (-item[1], item[0]))
+                    ),
+                    "project_gpu": dict(
+                        sorted(
+                            project_gpu.items(), key=lambda item: (-item[1], item[0])
+                        )
+                    ),
                     "type_stats": {
                         task_type: {
                             **info,
                             "display_name": TYPE_NAMES.get(task_type, task_type),
                         }
-                        for task_type, info in sorted(type_stats.items(), key=lambda item: -item[1]["gpu"])
+                        for task_type, info in sorted(
+                            type_stats.items(), key=lambda item: -item[1]["gpu"]
+                        )
                     },
                     "priority_stats": {
                         str(priority): info
-                        for priority, info in sorted(priority_stats.items(), key=lambda item: -item[0])
+                        for priority, info in sorted(
+                            priority_stats.items(), key=lambda item: -item[0]
+                        )
                     },
                 }
             )
@@ -888,7 +992,9 @@ def qz_inspect_status_catalog(
     sample_limit: int = 5,
 ) -> dict[str, Any]:
     cookie, _ = _require_cookie()
-    workspace_refs = _resolve_workspace_refs(workspace or None, all_workspaces=all_workspaces)
+    workspace_refs = _resolve_workspace_refs(
+        workspace or None, all_workspaces=all_workspaces
+    )
     api = get_api()
 
     catalog: dict[str, dict[str, Any]] = {}
@@ -898,7 +1004,9 @@ def qz_inspect_status_catalog(
         workspace_id = workspace_ref["id"]
         workspace_name = workspace_ref.get("name", "")
         try:
-            payload = api.list_jobs_with_cookie(workspace_id, cookie, page_size=limit_per_workspace)
+            payload = api.list_jobs_with_cookie(
+                workspace_id, cookie, page_size=limit_per_workspace
+            )
             for job_data in payload.get("jobs", []):
                 status_info = _normalize_status(job_data.get("status", ""))
                 status_raw = status_info["status_raw"]
@@ -915,13 +1023,20 @@ def qz_inspect_status_catalog(
                 catalog_item["count"] += 1
                 if len(catalog_item["sample_job_ids"]) < sample_limit:
                     catalog_item["sample_job_ids"].append(job_data.get("job_id", ""))
-                if workspace_id not in catalog_item["sample_workspace_ids"] and len(catalog_item["sample_workspace_ids"]) < sample_limit:
+                if (
+                    workspace_id not in catalog_item["sample_workspace_ids"]
+                    and len(catalog_item["sample_workspace_ids"]) < sample_limit
+                ):
                     catalog_item["sample_workspace_ids"].append(workspace_id)
         except Exception as exc:
             warnings.append(f"{workspace_name or workspace_id}: {exc}")
 
-    sorted_catalog = sorted(catalog.values(), key=lambda item: (-item["count"], item["status_raw"]))
-    unknown_entries = [item for item in sorted_catalog if item["status_family"] == "unknown"]
+    sorted_catalog = sorted(
+        catalog.values(), key=lambda item: (-item["count"], item["status_raw"])
+    )
+    unknown_entries = [
+        item for item in sorted_catalog if item["status_family"] == "unknown"
+    ]
 
     return _result(
         {
@@ -937,7 +1052,9 @@ def qz_inspect_status_catalog(
 
 
 @server.tool(description="将任务 ID 加入本地追踪列表。")
-def qz_track_job(job_id: str, name: str = "", source: str = "", workspace_id: str = "") -> dict[str, Any]:
+def qz_track_job(
+    job_id: str, name: str = "", source: str = "", workspace_id: str = ""
+) -> dict[str, Any]:
     api = get_api()
     store = get_store()
     warnings = []
@@ -973,7 +1090,9 @@ def qz_track_job(job_id: str, name: str = "", source: str = "", workspace_id: st
 
 
 @server.tool(description="列出本地追踪任务，可选刷新非终态任务状态。")
-def qz_list_tracked_jobs(limit: int = 20, running_only: bool = False, refresh: bool = True) -> dict[str, Any]:
+def qz_list_tracked_jobs(
+    limit: int = 20, running_only: bool = False, refresh: bool = True
+) -> dict[str, Any]:
     store = get_store()
     api = get_api()
     fetch_limit = limit * 3 if running_only else limit
@@ -981,7 +1100,11 @@ def qz_list_tracked_jobs(limit: int = 20, running_only: bool = False, refresh: b
     warnings = []
 
     if refresh and jobs:
-        job_ids = [job.job_id for job in jobs if not _normalize_status(job.status)["is_terminal"]]
+        job_ids = [
+            job.job_id
+            for job in jobs
+            if not _normalize_status(job.status)["is_terminal"]
+        ]
         if job_ids:
             try:
                 results = api.get_jobs_detail(job_ids)
@@ -1072,7 +1195,9 @@ def qz_create_job(
     else:
         workspace_id = find_workspace_by_name(workspace)
         if not workspace_id:
-            raise RuntimeError(f"未找到名称为 '{workspace}' 的工作空间。请先运行 qz_refresh_resources。")
+            raise RuntimeError(
+                f"未找到名称为 '{workspace}' 的工作空间。请先运行 qz_refresh_resources。"
+            )
 
     # Resolve project
     if project:
@@ -1085,7 +1210,9 @@ def qz_create_job(
     else:
         project_id, proj_name = _auto_select_resource_mcp(workspace_id, "projects")
         if not project_id:
-            raise RuntimeError("未指定项目且缓存中无可用项目。请指定 project 或先调用 qz_refresh_resources。")
+            raise RuntimeError(
+                "未指定项目且缓存中无可用项目。请指定 project 或先调用 qz_refresh_resources。"
+            )
         warnings.append(f"自动选择项目: {proj_name} ({project_id})")
 
     # Resolve compute group
@@ -1093,13 +1220,19 @@ def qz_create_job(
         if compute_group.startswith("lcg-"):
             compute_group_id = compute_group
         else:
-            compute_group_id, _ = _resolve_resource_id_mcp(workspace_id, "compute_groups", compute_group)
+            compute_group_id, _ = _resolve_resource_id_mcp(
+                workspace_id, "compute_groups", compute_group
+            )
             if not compute_group_id:
                 raise RuntimeError(f"未找到计算组 '{compute_group}'。")
     else:
-        compute_group_id, cg_name = _auto_select_resource_mcp(workspace_id, "compute_groups")
+        compute_group_id, cg_name = _auto_select_resource_mcp(
+            workspace_id, "compute_groups"
+        )
         if not compute_group_id:
-            raise RuntimeError("未指定计算组且缓存中无可用计算组。请指定 compute_group 或先调用 qz_refresh_resources。")
+            raise RuntimeError(
+                "未指定计算组且缓存中无可用计算组。请指定 compute_group 或先调用 qz_refresh_resources。"
+            )
         warnings.append(f"自动选择计算组: {cg_name} ({compute_group_id})")
 
     # Resolve spec
@@ -1108,7 +1241,9 @@ def qz_create_job(
     else:
         spec_id, spec_name = _auto_select_resource_mcp(workspace_id, "specs")
         if not spec_id:
-            raise RuntimeError("未指定规格且缓存中无可用规格。请指定 spec 或先调用 qz_refresh_resources。")
+            raise RuntimeError(
+                "未指定规格且缓存中无可用规格。请指定 spec 或先调用 qz_refresh_resources。"
+            )
         warnings.append(f"自动选择规格: {spec_name} ({spec_id})")
 
     # Resolve full spec details for resource_spec_price (cpu/gpu/mem/gpu_type/quota_id)
@@ -1273,7 +1408,9 @@ def qz_create_hpc_job(
     else:
         workspace_id = find_workspace_by_name(workspace)
         if not workspace_id:
-            raise RuntimeError(f"未找到名称为 '{workspace}' 的工作空间。请先运行 qz_refresh_resources。")
+            raise RuntimeError(
+                f"未找到名称为 '{workspace}' 的工作空间。请先运行 qz_refresh_resources。"
+            )
 
     # Resolve project
     if project:
@@ -1286,7 +1423,9 @@ def qz_create_hpc_job(
     else:
         project_id, proj_name = _auto_select_resource_mcp(workspace_id, "projects")
         if not project_id:
-            raise RuntimeError("未指定项目且缓存中无可用项目。请指定 project 或先调用 qz_refresh_resources。")
+            raise RuntimeError(
+                "未指定项目且缓存中无可用项目。请指定 project 或先调用 qz_refresh_resources。"
+            )
         warnings.append(f"自动选择项目: {proj_name} ({project_id})")
 
     result = api.create_hpc_job(
@@ -1359,7 +1498,9 @@ def qz_get_hpc_usage(
         top: verbose=True 时返回 CPU 利用率最高的前 N 个节点（默认 30）
     """
     cookie, _ = _require_cookie()
-    workspace_refs = _resolve_workspace_refs(workspace or None, all_workspaces=not bool(workspace))
+    workspace_refs = _resolve_workspace_refs(
+        workspace or None, all_workspaces=not bool(workspace)
+    )
     api = get_api()
     all_stats = []
     warnings = []
@@ -1373,7 +1514,8 @@ def qz_get_hpc_usage(
             page_size = 200
             while True:
                 data = api.list_node_dimension(
-                    workspace_id, cookie,
+                    workspace_id,
+                    cookie,
                     logic_compute_group_id=compute_group or None,
                     page_num=page_num,
                     page_size=page_size,
@@ -1406,12 +1548,18 @@ def qz_get_hpc_usage(
             }
 
             if verbose:
-                sorted_nodes = sorted(hpc_nodes, key=lambda n: -n.get("cpu", {}).get("usage_rate", 0))
+                sorted_nodes = sorted(
+                    hpc_nodes, key=lambda n: -n.get("cpu", {}).get("usage_rate", 0)
+                )
                 stat["nodes"] = [
                     {
                         "name": n.get("name", ""),
-                        "cpu_usage_pct": round(n.get("cpu", {}).get("usage_rate", 0) * 100, 2),
-                        "mem_usage_pct": round(n.get("memory", {}).get("usage_rate", 0) * 100, 2),
+                        "cpu_usage_pct": round(
+                            n.get("cpu", {}).get("usage_rate", 0) * 100, 2
+                        ),
+                        "mem_usage_pct": round(
+                            n.get("memory", {}).get("usage_rate", 0) * 100, 2
+                        ),
                         "cpu_used": n.get("cpu", {}).get("used", 0),
                         "cpu_total": n.get("cpu", {}).get("total", 0),
                         "mem_used_gib": round(n.get("memory", {}).get("used", 0), 2),
@@ -1430,6 +1578,106 @@ def qz_get_hpc_usage(
             "workspaces": all_stats,
         },
         warnings=warnings,
+    )
+
+
+class _CollectingDisplay:
+    """收集 exec 辅助函数的输出，避免 print 污染 MCP 的 stdio 协议。"""
+
+    def __init__(self) -> None:
+        self.messages: list[str] = []
+
+    def print(self, *args: Any, **kwargs: Any) -> None:
+        self.messages.append(" ".join(str(a) for a in args))
+
+    print_error = print
+    print_warning = print
+    print_success = print
+
+
+@server.tool(
+    description=(
+        "在开发机上执行命令（通过 Jupyter API，无需 SSH）。target 支持 name / "
+        "notebook_id (UUID) / 完整 URL。detach=True 时后台启动并立即返回 job_id，"
+        "之后用 qz_exec_attach 拉取输出（适合编译、下载、训练等长命令）。"
+    )
+)
+def qz_exec(
+    target: str, command: str, timeout: int = 120, detach: bool = False
+) -> dict[str, Any]:
+    _require_cookie()
+    from .cli import _exec_launch, _exec_poll, _find_notebook_jupyter_info
+
+    display = _CollectingDisplay()
+    info = _find_notebook_jupyter_info(target, display)
+    if info is None:
+        raise RuntimeError(
+            "; ".join(display.messages) or "未找到开发机或无法连接 Jupyter"
+        )
+
+    job_id = _exec_launch(info, command, display)
+    if job_id is None:
+        raise RuntimeError("; ".join(display.messages) or "命令启动失败")
+
+    if detach:
+        return _result(
+            {
+                "notebook_id": info["notebook_id"],
+                "job_id": job_id,
+                "detached": True,
+                "finished": False,
+                "log": display.messages,
+            },
+            message=f"已后台启动 {job_id}，用 qz_exec_attach 拉取输出。",
+        )
+
+    exit_code, output, finished = _exec_poll(info, job_id, display, timeout=timeout)
+    return _result(
+        {
+            "notebook_id": info["notebook_id"],
+            "job_id": job_id,
+            "exit_code": exit_code,
+            "output": output,
+            "finished": finished,
+            "log": display.messages,
+        },
+        message=(
+            "命令已完成。"
+            if finished
+            else f"命令在 {timeout}s 内未结束，远端仍在运行；用 qz_exec_attach 续读。"
+        ),
+    )
+
+
+@server.tool(
+    description="重连 qz_exec(detach=True) 启动的命令，继续拉取其输出与退出码（可多次调用直到 finished=True）。"
+)
+def qz_exec_attach(target: str, job_id: str, timeout: int = 120) -> dict[str, Any]:
+    _require_cookie()
+    from .cli import _exec_poll, _find_notebook_jupyter_info
+
+    display = _CollectingDisplay()
+    info = _find_notebook_jupyter_info(target, display)
+    if info is None:
+        raise RuntimeError(
+            "; ".join(display.messages) or "未找到开发机或无法连接 Jupyter"
+        )
+
+    exit_code, output, finished = _exec_poll(info, job_id, display, timeout=timeout)
+    return _result(
+        {
+            "notebook_id": info["notebook_id"],
+            "job_id": job_id,
+            "exit_code": exit_code,
+            "output": output,
+            "finished": finished,
+            "log": display.messages,
+        },
+        message=(
+            "命令已完成。"
+            if finished
+            else f"命令在 {timeout}s 内仍未结束，可再次调用 qz_exec_attach 继续等待。"
+        ),
     )
 
 

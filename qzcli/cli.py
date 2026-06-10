@@ -1389,7 +1389,7 @@ def cmd_avail(args):
         )
 
     def _query_workspace_availability(
-        job: Dict[str, Any]
+        job: Dict[str, Any],
     ) -> Tuple[str, List[Dict[str, Any]], Optional[str]]:
         workspace_id = job["workspace_id"]
         ws_name = job["workspace_name"]
@@ -3134,7 +3134,7 @@ def _build_compute_group_options_with_usage(
 
 
 def _sort_project_options_for_selection(
-    options: List[Dict[str, Any]]
+    options: List[Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
     """按名称稳定排序项目选项。"""
     return sorted(
@@ -4030,7 +4030,7 @@ def _prompt_select_option(
 
 
 def _sort_workspace_options_for_selection(
-    options: List[Dict[str, Any]]
+    options: List[Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
     """按 avail 风格排序 workspace，优先展示有实时容量且空闲资源更多的项。"""
     return sorted(
@@ -4163,7 +4163,7 @@ def _render_workspace_selection_table(display, options: List[Dict[str, Any]]) ->
 
 
 def _sort_compute_group_options_for_selection(
-    options: List[Dict[str, Any]]
+    options: List[Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
     """按实时空闲容量排序计算组，容量未知项排在后面。"""
     return sorted(
@@ -4501,7 +4501,7 @@ def _build_spec_choice_context_lines(
 
 
 def _build_workspace_choice_table(
-    options: List[Dict[str, Any]]
+    options: List[Dict[str, Any]],
 ) -> Tuple[List[str], List[str]]:
     """构造工作空间箭头菜单表格。"""
     rows = []
@@ -4537,7 +4537,7 @@ def _build_workspace_choice_table(
 
 
 def _build_project_choice_table(
-    options: List[Dict[str, Any]]
+    options: List[Dict[str, Any]],
 ) -> Tuple[List[str], List[str]]:
     """构造项目箭头菜单表格。"""
     rows = [
@@ -4556,7 +4556,7 @@ def _build_project_choice_table(
 
 
 def _build_compute_group_choice_table(
-    options: List[Dict[str, Any]]
+    options: List[Dict[str, Any]],
 ) -> Tuple[List[str], List[str]]:
     """构造计算组箭头菜单表格。"""
     rows = []
@@ -4595,7 +4595,7 @@ def _build_compute_group_choice_table(
 
 
 def _build_spec_choice_table(
-    options: List[Dict[str, Any]]
+    options: List[Dict[str, Any]],
 ) -> Tuple[List[str], List[str]]:
     """构造规格箭头菜单表格。"""
     rows = []
@@ -6642,8 +6642,7 @@ def _get_jupyter_info(notebook_id, cookie, display):
     if resp.status_code in (301, 302, 303, 307):
         location = resp.headers.get("Location", "")
         if "keycloak" in location:
-            display.print_error("Cookie 已过期，请重新登录: qzcli login")
-            return None
+            raise QzAPIError("Cookie 已过期", 401)
         # URL 格式: https://{domain}/{ws}/{proj}/{user}/jupyter/{nb_id}/{token}/lab?token={token}
         match = re.search(
             r"(https://[^/]+/[^/]+/[^/]+/[^/]+/jupyter/[^/]+/([^/]+))/lab",
@@ -6659,8 +6658,7 @@ def _get_jupyter_info(notebook_id, cookie, display):
         return None
 
     if resp.status_code == 401:
-        display.print_error("Cookie 已过期，请重新登录: qzcli login")
-        return None
+        raise QzAPIError("Cookie 已过期", 401)
 
     display.print_error(f"获取 Jupyter URL 失败: HTTP {resp.status_code}")
     return None
@@ -6694,24 +6692,37 @@ def _find_notebook_jupyter_info(target, display):
             f"[dim]找到开发机: {target} (notebook_id: {notebook_id[:8]}...)[/dim]"
         )
 
-    info = _get_jupyter_info(notebook_id, cookie, display)
+    try:
+        info = _get_jupyter_info(notebook_id, cookie, display)
+    except QzAPIError as exc:
+        if exc.code != 401:
+            display.print_error(str(exc))
+            return None
+        # cookie 过期：用本地凭据自动重登一次再试（避免 exec 前手动 login）
+        new_cookie = get_api()._relogin()
+        if not new_cookie:
+            display.print_error("Cookie 已过期，请重新登录: qzcli login")
+            return None
+        display.print("[dim]cookie 已过期，已自动重新登录[/dim]")
+        try:
+            info = _get_jupyter_info(notebook_id, new_cookie, display)
+        except QzAPIError:
+            display.print_error("Cookie 已过期，请重新登录: qzcli login")
+            return None
+
     if info:
         display.print("[dim]已获取 Jupyter 连接信息[/dim]")
     return info
 
 
-def _exec_via_jupyter(jupyter_info, cmd_str, display, timeout=120):
-    """
-    通过 Jupyter Contents API + Terminal 稳健执行命令。
+def _exec_launch(jupyter_info, cmd_str, display, job_id=None):
+    """发起 fire-and-forget 执行：建好 Contents API 中转目录，再通过 Terminal 写入
+    一条复合命令（输出落到 /tmp/.qzcli/<job_id>_out、退出码落到 _exit）。
 
-    流程：
-    1. Terminal 发送脚本命令：在 /tmp 执行，完成后拷贝结果到 Contents API 可读目录
-    2. Contents API 轮询读取输出文件
-    3. 清理临时文件
-
+    只负责“启动”，不轮询、不清理——输出文件留待 ``_exec_poll`` / ``exec-attach`` 读取。
     命令执行与网络连接解耦：即使 WebSocket 断连，命令仍在服务端完整运行。
 
-    Returns: (exit_code, output_str)
+    Returns: job_id（成功）或 None（失败）。
     """
     import json as _json
     import time as _time
@@ -6720,7 +6731,7 @@ def _exec_via_jupyter(jupyter_info, cmd_str, display, timeout=120):
         import websocket
     except ImportError:
         display.print_error("需要 websocket-client: pip install websocket-client")
-        return 1, ""
+        return None
 
     import requests as _requests
 
@@ -6729,22 +6740,11 @@ def _exec_via_jupyter(jupyter_info, cmd_str, display, timeout=120):
     token = jupyter_info["token"]
     headers = {"authorization": f"token {token}", "content-type": "application/json"}
 
-    job_id = f"qzcli_{int(_time.time())}"
+    if job_id is None:
+        job_id = f"qzcli_{int(_time.time())}"
     tmp_dir = "/tmp/.qzcli"
     # Contents API 通过 symlink 读取 /tmp/.qzcli
     api_dir = "_qzcli"
-    api_out = f"{api_dir}/{job_id}_out"
-    api_exit = f"{api_dir}/{job_id}_exit"
-
-    def cleanup():
-        # Contents API 删除会同时删掉 /tmp 里的文件（因为 symlink）
-        for fname in [api_out, api_exit]:
-            try:
-                _requests.delete(
-                    f"{base_http}/api/contents/{fname}", headers=headers, timeout=5
-                )
-            except Exception:
-                pass
 
     # 1. 确保 Contents API 中转目录存在
     try:
@@ -6766,7 +6766,6 @@ def _exec_via_jupyter(jupyter_info, cmd_str, display, timeout=120):
         f"echo $? > {tmp_dir}/{job_id}_exit"
     )
 
-    launched = False
     for attempt in range(3):
         try:
             resp_t = _requests.get(
@@ -6796,20 +6795,45 @@ def _exec_via_jupyter(jupyter_info, cmd_str, display, timeout=120):
             ws.send(_json.dumps(["stdin", shell_cmd + "\r"]))
             _time.sleep(0.5)
             ws.close()
-            launched = True
-            break
+            return job_id
         except Exception as e:
             if attempt < 2:
                 display.print_warning(f"连接失败，重试中... ({attempt + 1}/3)")
                 _time.sleep(2)
             else:
                 display.print_error(f"启动命令失败: {e}")
-                return 1, ""
+                return None
 
-    if not launched:
-        return 1, ""
+    return None
 
-    # 3. 轮询 Contents API 读取输出
+
+def _exec_poll(jupyter_info, job_id, display, timeout=120, cleanup_on_done=True):
+    """轮询某个 job_id 的输出/退出码。
+
+    Returns: (exit_code, output, finished)。finished=False 表示 timeout 内命令仍在
+    运行——此时不清理输出文件，可再次 attach 继续拉取。
+    """
+    import time as _time
+
+    import requests as _requests
+
+    base_http = jupyter_info["base_url"]
+    token = jupyter_info["token"]
+    headers = {"authorization": f"token {token}", "content-type": "application/json"}
+    api_dir = "_qzcli"
+    api_out = f"{api_dir}/{job_id}_out"
+    api_exit = f"{api_dir}/{job_id}_exit"
+
+    def cleanup():
+        # Contents API 删除会同时删掉 /tmp 里的文件（因为 symlink）
+        for fname in [api_out, api_exit]:
+            try:
+                _requests.delete(
+                    f"{base_http}/api/contents/{fname}", headers=headers, timeout=5
+                )
+            except Exception:
+                pass
+
     deadline = _time.time() + timeout
     exit_code = 1
     output = ""
@@ -6835,16 +6859,33 @@ def _exec_via_jupyter(jupyter_info, cmd_str, display, timeout=120):
                 if resp_out.status_code == 200:
                     output = resp_out.json().get("content", "").rstrip()
 
-                cleanup()
-                return exit_code, output
+                if cleanup_on_done:
+                    cleanup()
+                return exit_code, output, True
         except Exception:
             pass
 
         poll_interval = min(poll_interval * 1.5, 5)
 
-    cleanup()
-    display.print_warning("命令执行超时，输出可能不完整")
-    return 124, output
+    # 超时：命令仍在远端运行，保留输出文件以便 exec-attach 续读
+    return 124, output, False
+
+
+def _exec_via_jupyter(jupyter_info, cmd_str, display, timeout=120):
+    """启动并轮询命令直到完成或超时。Returns: (exit_code, output_str)。"""
+    job_id = _exec_launch(jupyter_info, cmd_str, display)
+    if job_id is None:
+        return 1, ""
+
+    exit_code, output, finished = _exec_poll(
+        jupyter_info, job_id, display, timeout=timeout
+    )
+    if not finished:
+        display.print_warning(
+            f"命令执行超时（{timeout}s），远端命令仍在运行，输出可能不完整。"
+            f"\n  继续拉取剩余输出: qzcli exec-attach {jupyter_info['notebook_id']} {job_id}"
+        )
+    return exit_code, output
 
 
 def cmd_exec(args):
@@ -6853,11 +6894,12 @@ def cmd_exec(args):
     target = args.host
     cmd_parts = args.remote_cmd
     timeout = getattr(args, "timeout", 120)
+    detach = getattr(args, "detach", False)
 
     if not cmd_parts:
         display.print_error("请指定要执行的命令")
         display.print(
-            "[dim]用法: qzcli exec [--timeout SEC] <name|UUID|URL> <command>[/dim]"
+            "[dim]用法: qzcli exec [--timeout SEC] [--detach] <name|UUID|URL> <command>[/dim]"
         )
         display.print("[dim]示例: qzcli exec blender-rl nvidia-smi[/dim]")
         display.print("[dim]      qzcli exec cfe43e55-... nvidia-smi[/dim]")
@@ -6873,6 +6915,18 @@ def cmd_exec(args):
     if jupyter_info is None:
         return 1
 
+    if detach:
+        job_id = _exec_launch(jupyter_info, cmd_str, display)
+        if job_id is None:
+            return 1
+        display.print_success(f"已后台启动: {job_id}")
+        display.print(
+            f"[dim]拉取输出: qzcli exec-attach {jupyter_info['notebook_id']} {job_id}[/dim]"
+        )
+        # job_id 单独打到 stdout，方便脚本/agent 直接捕获
+        print(job_id)
+        return 0
+
     display.print(f"[dim]执行: {cmd_str}[/dim]")
 
     exit_code, output = _exec_via_jupyter(
@@ -6880,6 +6934,29 @@ def cmd_exec(args):
     )
     if output:
         print(output)
+    return exit_code
+
+
+def cmd_exec_attach(args):
+    """重新连上一个 `exec --detach` 启动的命令，继续轮询其输出/退出码。"""
+    display = get_display()
+    timeout = getattr(args, "timeout", 120)
+
+    jupyter_info = _find_notebook_jupyter_info(args.host, display)
+    if jupyter_info is None:
+        return 1
+
+    display.print(f"[dim]attach: {args.job_id}[/dim]")
+    exit_code, output, finished = _exec_poll(
+        jupyter_info, args.job_id, display, timeout=timeout
+    )
+    if output:
+        print(output)
+    if not finished:
+        display.print_warning(
+            f"命令仍在运行（{timeout}s 内未结束）。"
+            f"可再次执行同样的 exec-attach 继续等待，或调大 --timeout。"
+        )
     return exit_code
 
 
@@ -7169,7 +7246,13 @@ def main():
         type=int,
         default=120,
         help="命令超时秒数（默认 120）。超时只切回本地，远端命令继续跑。"
-        " 注意：因 remote_cmd 用 REMAINDER 吸收，--timeout 必须放在 host 之前。",
+        " 注意：因 remote_cmd 用 REMAINDER 吸收，--timeout/--detach 必须放在 host 之前。",
+    )
+    exec_parser.add_argument(
+        "--detach",
+        "--no-wait",
+        action="store_true",
+        help="后台启动后立即返回 job_id，不等待结果；之后用 `qzcli exec-attach` 拉取输出。",
     )
     exec_parser.add_argument(
         "host",
@@ -7179,6 +7262,25 @@ def main():
     )
     exec_parser.add_argument(
         "remote_cmd", nargs=argparse.REMAINDER, help="要执行的命令"
+    )
+
+    # exec-attach 命令：重连一个 `exec --detach` 启动的命令
+    exec_attach_parser = subparsers.add_parser(
+        "exec-attach", help="重连 `exec --detach` 启动的命令，继续拉取输出"
+    )
+    exec_attach_parser.add_argument(
+        "--timeout",
+        type=int,
+        default=120,
+        help="本次轮询的最长等待秒数（默认 120）。未结束可再次 attach。",
+    )
+    exec_attach_parser.add_argument(
+        "host",
+        metavar="target",
+        help="开发机标识：name / notebook_id (UUID) / 完整 URL（同 exec）",
+    )
+    exec_attach_parser.add_argument(
+        "job_id", help="exec --detach 返回的 job_id（如 qzcli_1700000000）"
     )
 
     # workspace 命令
@@ -7442,6 +7544,7 @@ def main():
         "clear": cmd_clear,
         "cookie": cmd_cookie,
         "exec": cmd_exec,
+        "exec-attach": cmd_exec_attach,
         "login": cmd_login,
         "workspace": cmd_workspace,
         "ws": cmd_workspace,
