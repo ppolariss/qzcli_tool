@@ -85,6 +85,8 @@ def test_tasks_parser_defaults_to_served_dashboard(monkeypatch):
         captured["workspace"] = args.workspace
         captured["project"] = args.project
         captured["page_size"] = args.page_size
+        captured["debug_api"] = args.debug_api
+        captured["api_workers"] = args.api_workers
         captured["serve"] = args.serve
         captured["command"] = args.command
         return 0
@@ -96,7 +98,9 @@ def test_tasks_parser_defaults_to_served_dashboard(monkeypatch):
     assert captured == {
         "workspace": None,
         "project": None,
-        "page_size": 100,
+        "page_size": 2000,
+        "debug_api": False,
+        "api_workers": 8,
         "serve": True,
         "command": "tasks",
     }

@@ -5,12 +5,14 @@
 from __future__ import annotations
 
 import json
+import time
 import webbrowser
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from .api import QzAPIError, get_api
 from .config import get_workspace_resources, load_all_resources
@@ -324,6 +326,15 @@ HTML_PAGE = """<!doctype html>
       cursor: not-allowed;
       transform: none;
     }
+    .load-status {
+      min-height: 20px;
+      margin-top: 8px;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.4;
+    }
+    .load-status.ok { color: var(--good); }
+    .load-status.error { color: var(--bad); }
     .two-col {
       display: grid;
       grid-template-columns: 1.3fr 1fr;
@@ -640,6 +651,7 @@ HTML_PAGE = """<!doctype html>
           <div>
             <label>&nbsp;</label>
             <button id="refreshButton">Refresh Data</button>
+            <div id="loadStatus" class="load-status"></div>
           </div>
           <div>
             <label>&nbsp;</label>
@@ -716,15 +728,46 @@ HTML_PAGE = """<!doctype html>
       selectedWorkspaceId: "",
       selectedProject: "",
       selectedGroup: "",
+      loadRequestId: 0,
     };
 
     const byId = (id) => document.getElementById(id);
     const COLUMN_WIDTH_STORAGE_KEY = "qzcli.task_dimensions.column_widths.v1";
 
+    function setLoadStatus(message = "", kind = "") {
+      const status = byId("loadStatus");
+      if (!status) return;
+      status.textContent = message;
+      status.className = `load-status${kind ? ` ${kind}` : ""}`;
+    }
+
+    function setLoading(isLoading, message = "") {
+      const refreshButton = byId("refreshButton");
+      refreshButton.disabled = isLoading;
+      refreshButton.textContent = isLoading ? "Loading..." : "Refresh Data";
+      if (message) {
+        setLoadStatus(message);
+      }
+    }
+
+    function formatLocalTime(date = new Date()) {
+      return date.toLocaleTimeString([], {
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit",
+      });
+    }
+
     function fmtNumber(value) {
       const num = Number(value || 0);
       if (!Number.isFinite(num)) return "0";
       return num.toLocaleString("zh-CN", { maximumFractionDigits: 2 });
+    }
+
+    function formatApiProfile(profile) {
+      if (!profile || !profile.request_count) return "";
+      const elapsed = Number(profile.total_elapsed_s || 0).toFixed(3);
+      return ` | API ${profile.request_count} req/${elapsed}s`;
     }
 
     function badgeClass(status) {
@@ -964,7 +1007,7 @@ HTML_PAGE = """<!doctype html>
         `Workspace ID: ${snapshot.workspace_id}`,
         `Project Filter: ${snapshot.project_display || "全部项目"}`,
         `Partition Filter: ${snapshot.group_display || "全部分区"}`,
-        `My Tasks In Workspace: ${fmtNumber(snapshot.my_task_count || 0)}`,
+        "Stop Permission: platform validated",
         `Endpoint: ${snapshot.endpoint}`,
         `Generated: ${snapshot.generated_at}`,
       ];
@@ -1129,7 +1172,7 @@ HTML_PAGE = """<!doctype html>
           ${rows.map((row) => `
             <tr>
               <td style="max-width:72px;">
-                ${row.is_mine ? `<input type="checkbox" data-row-id="${row.id}" ${state.selectedRowIds.includes(row.id) ? "checked" : ""} />` : `<span class="muted">-</span>`}
+                <input type="checkbox" data-row-id="${row.id}" ${state.selectedRowIds.includes(row.id) ? "checked" : ""} />
               </td>
               ${columns.map((col) => {
                 const value = normalizeCell(row[col.key]);
@@ -1180,7 +1223,8 @@ HTML_PAGE = """<!doctype html>
       byId("filterValue").value = state.filterValue;
       byId("statsColumn").value = state.statsColumn;
       byId("metricColumn").value = state.metricColumn;
-      byId("onlyMineToggle").textContent = state.onlyMine ? "Only Mine" : "All Tasks";
+      byId("onlyMineToggle").disabled = true;
+      byId("onlyMineToggle").textContent = "All Tasks";
       setGroupBySelect(state.columns);
       renderGroupByChips(state.columns);
       updateSelectionControls();
@@ -1273,7 +1317,7 @@ HTML_PAGE = """<!doctype html>
         if (!retry) {
           state.selectedRowIds = failedRows
             .map((row) => row.id)
-            .filter((id) => refreshedRowsById.has(id) && refreshedRowsById.get(id).is_mine);
+            .filter((id) => refreshedRowsById.has(id));
           syncInputs();
           render();
           return;
@@ -1283,18 +1327,19 @@ HTML_PAGE = """<!doctype html>
     }
 
     function updateSelectionControls() {
-      const stoppableIds = new Set(state.rows.filter((row) => row.is_mine).map((row) => row.id));
+      const stoppableIds = new Set(state.rows.map((row) => row.id));
       state.selectedRowIds = state.selectedRowIds.filter((id) => stoppableIds.has(id));
       const button = byId("stopSelectedButton");
       const count = state.selectedRowIds.length;
       button.disabled = count === 0;
       button.textContent = count ? `停止任务 (${count})` : "停止任务";
       byId("stopSelectedCount").textContent = String(count);
+      byId("stopScopeLabel").textContent = "平台校验";
       const rowsById = new Map(state.rows.map((row) => [row.id, row]));
       const list = byId("stopSelectionList");
       const selectedRows = state.selectedRowIds.map((id) => rowsById.get(id)).filter(Boolean);
       if (!selectedRows.length) {
-        list.innerHTML = `<div class="muted">未选择任何可停止的任务</div>`;
+        list.innerHTML = `<div class="muted">未选择任何任务</div>`;
         return;
       }
       list.innerHTML = selectedRows.map((row) => `
@@ -1322,15 +1367,15 @@ HTML_PAGE = """<!doctype html>
         state.selectedWorkspaceId = event.target.value;
         state.selectedProject = "";
         state.selectedGroup = "";
-        loadData(false);
+        loadData(false, "Loading workspace...");
       });
       byId("projectSelect").addEventListener("change", (event) => {
         state.selectedProject = event.target.value;
-        loadData(false);
+        loadData(false, "Loading project...");
       });
       byId("groupSelect").addEventListener("change", (event) => {
         state.selectedGroup = event.target.value;
-        loadData(false);
+        loadData(false, "Loading partition...");
       });
       byId("search").addEventListener("input", (event) => { state.search = event.target.value; render(); });
       byId("filterColumn").addEventListener("change", (event) => { state.filterColumn = event.target.value; render(); });
@@ -1356,7 +1401,7 @@ HTML_PAGE = """<!doctype html>
         syncInputs();
         render();
       });
-      byId("refreshButton").addEventListener("click", () => loadData(true));
+      byId("refreshButton").addEventListener("click", () => loadData(true, "Refreshing data from QZ..."));
       byId("resetButton").addEventListener("click", () => {
         state.search = "";
         state.filterColumn = "";
@@ -1376,57 +1421,77 @@ HTML_PAGE = """<!doctype html>
       byId("stopSelectedButton").addEventListener("click", stopSelectedJobs);
     }
 
-    async function loadData(refresh = false) {
+    async function loadData(refresh = false, loadingMessage = "") {
+      const requestId = ++state.loadRequestId;
+      setLoading(true, loadingMessage || (refresh ? "Refreshing data from QZ..." : "Loading data..."));
       const params = new URLSearchParams();
       if (state.selectedWorkspaceId) params.set("workspace_id", state.selectedWorkspaceId);
       if (state.selectedProject) params.set("project", state.selectedProject);
       if (state.selectedGroup) params.set("group", state.selectedGroup);
       const prefix = refresh ? "/api/refresh" : "/api/tasks";
-      const response = await fetch(params.size ? `${prefix}?${params.toString()}` : prefix, { cache: "no-store" });
-      const snapshot = await response.json();
-      state.snapshot = snapshot;
-      state.rows = snapshot.rows || [];
-      state.selectedRowIds = [];
-      state.columns = snapshot.columns || [];
-      hydrateColumnWidths(state.columns);
-      state.selectedWorkspaceId = snapshot.selected_workspace_id || "";
-      state.selectedProject = snapshot.selected_project || "";
-      state.selectedGroup = snapshot.selected_group || "";
-      const options = state.columns.map((col) => ({ value: col.key, label: `${col.label} (${col.key})` }));
-      const numericOptions = state.columns.filter((col) => col.kind === "number").map((col) => ({ value: col.key, label: `${col.label} (${col.key})` }));
-      setOptions(
-        byId("workspaceSelect"),
-        (snapshot.workspace_options || []).map((item) => ({ value: item.id, label: item.name || item.id }))
-      );
-      setOptions(
-        byId("projectSelect"),
-        (snapshot.project_options || []).map((item) => ({ value: item.id, label: item.name || item.id })),
-        true,
-        "All projects"
-      );
-      setOptions(
-        byId("groupSelect"),
-        (snapshot.group_options || []).map((item) => ({ value: item.id, label: item.name || item.id })),
-        true,
-        "All partitions"
-      );
-      setOptions(byId("filterColumn"), options, true, "All columns");
-      setOptions(byId("statsColumn"), options);
-      setOptions(byId("metricColumn"), numericOptions);
-      updateMeta(snapshot);
-      const defaultGroupBy = Array.isArray(snapshot.default_group_by)
-        ? snapshot.default_group_by
-        : (snapshot.default_group_by ? [snapshot.default_group_by] : []);
-      state.groupByKeys = state.groupByKeys.length ? state.groupByKeys : defaultGroupBy;
-      state.statsColumn = state.statsColumn || defaultGroupBy[0] || "status";
-      syncInputs();
-      render();
+      try {
+        const response = await fetch(params.size ? `${prefix}?${params.toString()}` : prefix, { cache: "no-store" });
+        const snapshot = await response.json();
+        if (!response.ok) {
+          throw new Error(snapshot.error || `HTTP ${response.status}`);
+        }
+        if (requestId !== state.loadRequestId) {
+          return;
+        }
+        state.snapshot = snapshot;
+        state.rows = snapshot.rows || [];
+        state.selectedRowIds = [];
+        state.columns = snapshot.columns || [];
+        hydrateColumnWidths(state.columns);
+        state.selectedWorkspaceId = snapshot.selected_workspace_id || "";
+        state.selectedProject = snapshot.selected_project || "";
+        state.selectedGroup = snapshot.selected_group || "";
+        const options = state.columns.map((col) => ({ value: col.key, label: `${col.label} (${col.key})` }));
+        const numericOptions = state.columns.filter((col) => col.kind === "number").map((col) => ({ value: col.key, label: `${col.label} (${col.key})` }));
+        setOptions(
+          byId("workspaceSelect"),
+          (snapshot.workspace_options || []).map((item) => ({ value: item.id, label: item.name || item.id }))
+        );
+        setOptions(
+          byId("projectSelect"),
+          (snapshot.project_options || []).map((item) => ({ value: item.id, label: item.name || item.id })),
+          true,
+          "All projects"
+        );
+        setOptions(
+          byId("groupSelect"),
+          (snapshot.group_options || []).map((item) => ({ value: item.id, label: item.name || item.id })),
+          true,
+          "All partitions"
+        );
+        setOptions(byId("filterColumn"), options, true, "All columns");
+        setOptions(byId("statsColumn"), options);
+        setOptions(byId("metricColumn"), numericOptions);
+        updateMeta(snapshot);
+        const defaultGroupBy = Array.isArray(snapshot.default_group_by)
+          ? snapshot.default_group_by
+          : (snapshot.default_group_by ? [snapshot.default_group_by] : []);
+        state.groupByKeys = state.groupByKeys.length ? state.groupByKeys : defaultGroupBy;
+        state.statsColumn = state.statsColumn || defaultGroupBy[0] || "status";
+        syncInputs();
+        render();
+        setLoadStatus(
+          `${refresh ? "Refreshed" : "Loaded"} ${fmtNumber(state.rows.length)} rows at ${formatLocalTime()}${formatApiProfile(snapshot.api_profile)}`,
+          "ok"
+        );
+      } catch (error) {
+        if (requestId === state.loadRequestId) {
+          setLoadStatus(`Load failed: ${error.message || error}`, "error");
+        }
+      } finally {
+        if (requestId === state.loadRequestId) {
+          setLoading(false);
+        }
+      }
     }
 
     wireInputs();
-    loadData(false).catch((error) => {
-      byId("stats").innerHTML = `<div class="stat"><div class="k">Load Error</div><div class="v">${error}</div></div>`;
-    });
+    loadData(false, "Loading data...");
   </script>
 </body>
 </html>
@@ -1581,32 +1646,148 @@ def _default_group_in_workspace(workspace_id: str) -> Tuple[str, str]:
     return "", ""
 
 
+def _new_api_profile() -> Dict[str, Any]:
+    return {"request_count": 0, "total_elapsed_s": 0.0, "endpoints": {}}
+
+
+def _record_api_profile(
+    api_profile: Optional[Dict[str, Any]], endpoint: str, elapsed_s: float
+) -> None:
+    if api_profile is None:
+        return
+    endpoints = api_profile.setdefault("endpoints", {})
+    item = endpoints.setdefault(endpoint, {"count": 0, "elapsed_s": 0.0})
+    item["count"] += 1
+    item["elapsed_s"] = round(float(item["elapsed_s"]) + elapsed_s, 3)
+    api_profile["request_count"] = int(api_profile.get("request_count", 0)) + 1
+
+
+def _format_api_profile(
+    api_profile: Optional[Dict[str, Any]], *, detail: bool = False
+) -> str:
+    if not api_profile:
+        return ""
+
+    endpoint_parts = []
+    for endpoint, item in sorted((api_profile.get("endpoints") or {}).items()):
+        label = endpoint.rsplit("/", 1)[-1]
+        endpoint_parts.append(
+            f"{label} {item.get('count', 0)} req/{item.get('elapsed_s', 0):.3f}s"
+        )
+
+    total_elapsed = float(api_profile.get("total_elapsed_s", 0.0) or 0.0)
+    total_count = int(api_profile.get("request_count", 0) or 0)
+    detail_text = "; ".join(endpoint_parts)
+    return f"API {total_count} req/{total_elapsed:.3f}s" + (
+        f" ({detail_text})" if detail and detail_text else ""
+    )
+
+
+def _safe_total(value: Any) -> Optional[int]:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _fetch_paginated_items(
+    *,
+    fetch_page,
+    item_key: str,
+    endpoint: str,
+    label: str,
+    page_size: int,
+    api_profile: Optional[Dict[str, Any]],
+    api_debug: bool,
+    api_workers: int,
+) -> List[Dict[str, Any]]:
+    display = get_display() if api_debug else None
+
+    def fetch_timed(page_num: int) -> Tuple[int, Dict[str, Any], float]:
+        started_at = time.perf_counter()
+        data = fetch_page(page_num)
+        return page_num, data, time.perf_counter() - started_at
+
+    if display:
+        display.print(f"[dim]API -> {label} page=1 size={page_size}[/dim]")
+    page_num, data, elapsed_s = fetch_timed(1)
+    _record_api_profile(api_profile, endpoint, elapsed_s)
+    first_items = data.get(item_key, [])
+    total = _safe_total(data.get("total"))
+    if display:
+        display.print(
+            f"[dim]API <- {label} page={page_num} items={len(first_items)} "
+            f"total={data.get('total')} elapsed={elapsed_s:.3f}s[/dim]"
+        )
+
+    if not first_items:
+        return []
+    if total is None or total <= len(first_items) or len(first_items) < page_size:
+        return list(first_items)
+
+    last_page = max(1, (total + page_size - 1) // page_size)
+    if last_page <= 1:
+        return list(first_items)
+
+    items_by_page: Dict[int, List[Dict[str, Any]]] = {1: list(first_items)}
+    workers = max(1, min(api_workers, last_page - 1))
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {}
+        for next_page in range(2, last_page + 1):
+            if display:
+                display.print(
+                    f"[dim]API -> {label} page={next_page} size={page_size}[/dim]"
+                )
+            futures[executor.submit(fetch_timed, next_page)] = next_page
+
+        for future in as_completed(futures):
+            page_num, page_data, elapsed_s = future.result()
+            _record_api_profile(api_profile, endpoint, elapsed_s)
+            page_items = page_data.get(item_key, [])
+            items_by_page[page_num] = list(page_items)
+            if display:
+                display.print(
+                    f"[dim]API <- {label} page={page_num} items={len(page_items)} "
+                    f"total={page_data.get('total')} elapsed={elapsed_s:.3f}s[/dim]"
+                )
+
+    items: List[Dict[str, Any]] = []
+    for page_num in sorted(items_by_page):
+        items.extend(items_by_page[page_num])
+    return items
+
+
 def _collect_group_node_names(
-    api, workspace_id: str, cookie: str, group_id: str
+    api,
+    workspace_id: str,
+    cookie: str,
+    group_id: str,
+    api_profile: Optional[Dict[str, Any]] = None,
+    api_debug: bool = False,
+    api_workers: int = 8,
 ) -> set[str]:
-    page_num = 1
     node_names: set[str] = set()
-    while True:
-        data = api.list_node_dimension(
+
+    page_nodes = _fetch_paginated_items(
+        fetch_page=lambda page_num: api.list_node_dimension(
             workspace_id,
             cookie,
             logic_compute_group_id=group_id,
             page_num=page_num,
-            page_size=200,
-        )
-        page_nodes = data.get("node_dimensions", [])
-        if not page_nodes:
-            break
-        for node in page_nodes:
-            name = str(node.get("name", "") or "")
-            if name:
-                node_names.add(name)
-        total = data.get("total")
-        if total is not None and len(node_names) >= int(total):
-            break
-        if len(page_nodes) < 200:
-            break
-        page_num += 1
+            page_size=500,
+        ),
+        item_key="node_dimensions",
+        endpoint="/api/v1/cluster_metric/list_node_dimension",
+        label="list_node_dimension",
+        page_size=500,
+        api_profile=api_profile,
+        api_debug=api_debug,
+        api_workers=api_workers,
+    )
+    for node in page_nodes:
+        name = str(node.get("name", "") or "")
+        if name:
+            node_names.add(name)
     return node_names
 
 
@@ -1659,27 +1840,31 @@ def _fetch_task_dimensions(
     group_id: str = "",
     group_display: str = "",
     page_size: int = 100,
+    trace_api: bool = False,
+    api_debug: bool = False,
+    api_workers: int = 8,
 ) -> Dict[str, Any]:
+    api_profile: Optional[Dict[str, Any]] = _new_api_profile() if trace_api else None
+    fetch_started_at = time.perf_counter()
     api = get_api()
     cookie = api.ensure_cookie()["cookie"]
-    my_job_ids = _fetch_my_job_ids(api, workspace_id, cookie)
 
-    tasks: List[Dict[str, Any]] = []
-    page_num = 1
-    while True:
-        data = api.list_task_dimension(
+    tasks = _fetch_paginated_items(
+        fetch_page=lambda page_num: api.list_task_dimension(
             workspace_id,
             cookie,
             project_id=project_id or None,
             page_num=page_num,
             page_size=page_size,
-        )
-        page_tasks = data.get("task_dimensions", [])
-        tasks.extend(page_tasks)
-        total = data.get("total", 0)
-        if len(tasks) >= total or not page_tasks:
-            break
-        page_num += 1
+        ),
+        item_key="task_dimensions",
+        endpoint="/api/v1/cluster_metric/list_task_dimension",
+        label="list_task_dimension",
+        page_size=page_size,
+        api_profile=api_profile,
+        api_debug=api_debug,
+        api_workers=api_workers,
+    )
 
     if project_name_filter:
         tasks = [
@@ -1690,7 +1875,15 @@ def _fetch_task_dimensions(
         ]
 
     if group_id:
-        group_nodes = _collect_group_node_names(api, workspace_id, cookie, group_id)
+        group_nodes = _collect_group_node_names(
+            api,
+            workspace_id,
+            cookie,
+            group_id,
+            api_profile=api_profile,
+            api_debug=api_debug,
+            api_workers=api_workers,
+        )
         tasks = [
             task
             for task in tasks
@@ -1704,18 +1897,22 @@ def _fetch_task_dimensions(
             task,
             workspace_id,
             workspace_name,
-            is_mine=str(task.get("id", "") or "") in my_job_ids,
         )
         for task in tasks
     ]
-    return {
+    result = {
         "workspace_id": workspace_id,
         "workspace_name": workspace_name,
         "project_display": project_display or (project_name_filter or ""),
         "group_display": group_display,
-        "my_task_count": len(my_job_ids),
         "rows": rows,
     }
+    if api_profile is not None:
+        api_profile["total_elapsed_s"] = round(
+            time.perf_counter() - fetch_started_at, 3
+        )
+        result["api_profile"] = api_profile
+    return result
 
 
 def _flatten_task_dimension(
@@ -1803,32 +2000,6 @@ def _workspace_snapshot_options(
     return projects, groups
 
 
-def _fetch_my_job_ids(api, workspace_id: str, cookie: str) -> set[str]:
-    job_ids: set[str] = set()
-    page_num = 1
-    while True:
-        data = api.list_jobs_with_cookie(
-            workspace_id,
-            cookie,
-            page_num=page_num,
-            page_size=200,
-        )
-        jobs = data.get("jobs", [])
-        if not jobs:
-            break
-        for job in jobs:
-            job_id = str(job.get("job_id", "") or "")
-            if job_id:
-                job_ids.add(job_id)
-        total = data.get("total")
-        if total is not None and len(job_ids) >= int(total):
-            break
-        if len(jobs) < 200:
-            break
-        page_num += 1
-    return job_ids
-
-
 def _build_snapshot(
     data: Dict[str, Any],
     *,
@@ -1848,7 +2019,7 @@ def _build_snapshot(
         "workspace_name": data["workspace_name"],
         "project_display": data["project_display"],
         "group_display": data.get("group_display", ""),
-        "my_task_count": data.get("my_task_count", 0),
+        "api_profile": data.get("api_profile", {}),
         "generated_at": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
         "row_count": len(rows),
         "default_group_by": default_group_by,
@@ -2062,20 +2233,9 @@ def _make_handler(fetch_snapshot, initial_snapshot: Dict[str, Any]):
                 requested_job_ids = [
                     str(job_id) for job_id in payload.get("job_ids", []) if str(job_id)
                 ]
-                snapshot = fetch_snapshot(
-                    workspace_id=workspace_id, project=project, group=group
-                )
-                stoppable_ids = {
-                    row["id"] for row in snapshot.get("rows", []) if row.get("is_mine")
-                }
                 api = get_api()
                 results = []
                 for job_id in requested_job_ids:
-                    if job_id not in stoppable_ids:
-                        results.append(
-                            {"job_id": job_id, "stopped": False, "error": "not_owned"}
-                        )
-                        continue
                     result = api.stop_job_result(job_id)
                     results.append(result)
                 body = json.dumps({"results": results}, ensure_ascii=False).encode(
@@ -2156,6 +2316,9 @@ def cmd_task_dimensions(args) -> int:
             group_id=default_group_id,
             group_display=default_group_display,
             page_size=args.page_size,
+            trace_api=True,
+            api_debug=getattr(args, "debug_api", False),
+            api_workers=getattr(args, "api_workers", 8),
         )
     except (QzAPIError, ResourceResolutionError) as exc:
         display.print_error(str(exc))
@@ -2164,6 +2327,12 @@ def cmd_task_dimensions(args) -> int:
     title = f"Task Dimensions · {workspace_name or workspace_id}"
     if project_display or project_name_filter:
         title += f" · {project_display or project_name_filter}"
+
+    api_profile_text = _format_api_profile(
+        data.get("api_profile"), detail=getattr(args, "debug_api", False)
+    )
+    if api_profile_text:
+        display.print(f"[dim]{api_profile_text}[/dim]")
 
     if not args.serve:
         rows = data["rows"]
@@ -2205,6 +2374,9 @@ def cmd_task_dimensions(args) -> int:
             group_id=selected_group_id,
             group_display=selected_group_display,
             page_size=args.page_size,
+            trace_api=True,
+            api_debug=getattr(args, "debug_api", False),
+            api_workers=getattr(args, "api_workers", 8),
         )
         return _build_snapshot(
             fresh,
