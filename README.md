@@ -503,6 +503,9 @@ qzcli exec blender-rl nvidia-smi
 # 按 notebook_id (UUID) 解析
 qzcli exec cfe43e55-e7a1-484a-898c-695596b0877b nvidia-smi
 
+# 也能只粘 notebook_id 的一段前缀（前缀唯一才解析；撞到多个会列出候选让你补全）
+qzcli exec cfe43e55 nvidia-smi
+
 # 直接粘贴 IDE / Jupyter URL（支持 /ide?notebook_id=、
 # /jobs/interactiveModel(ing)?Detail/、/jupyter/、/api/v1/notebook/lab/、/notebook/lab/ 等多种形式）
 qzcli exec 'https://qz.sii.edu.cn/jobs/interactiveModelingDetail/cfe43e55-...?spaceId=ws-...' df -h

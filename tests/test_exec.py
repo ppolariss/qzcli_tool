@@ -142,6 +142,54 @@ class ResolveNotebookIdByNameTests(unittest.TestCase):
             result = _resolve_notebook_id_by_name("found", "cookie", display)
         self.assertEqual(result, UUID_REAL)
 
+    def test_finds_by_exact_notebook_id(self):
+        """粘贴完整 notebook_id（名字不匹配时）也能解析。"""
+        api = self._fake_api(
+            {WS_ID: [{"name": "some-dev", "notebook_id": UUID_REAL}]}
+        )
+        with patch("qzcli.cli.get_api", return_value=api), patch(
+            "qzcli.cli.load_all_resources", return_value={WS_ID: {"name": "ws"}}
+        ):
+            display = MagicMock()
+            result = _resolve_notebook_id_by_name(UUID_REAL, "cookie", display)
+        self.assertEqual(result, UUID_REAL)
+
+    def test_finds_by_notebook_id_prefix(self):
+        """唯一的 notebook_id 前缀命中即返回。"""
+        api = self._fake_api(
+            {
+                WS_ID: [
+                    {"name": "dev-a", "notebook_id": UUID_REAL},
+                    {"name": "dev-b", "notebook_id": "9ced1457-1111-2222-3333-444455556666"},
+                ]
+            }
+        )
+        with patch("qzcli.cli.get_api", return_value=api), patch(
+            "qzcli.cli.load_all_resources", return_value={WS_ID: {"name": "ws"}}
+        ):
+            display = MagicMock()
+            result = _resolve_notebook_id_by_name(UUID_REAL[:8], "cookie", display)
+        self.assertEqual(result, UUID_REAL)
+
+    def test_ambiguous_prefix_returns_none(self):
+        """前缀撞到多个 notebook_id → 报错、不默默取第一个。"""
+        shared = "cfe43e55"
+        api = self._fake_api(
+            {
+                WS_ID: [
+                    {"name": "dev-a", "notebook_id": f"{shared}-aaaa-484a-898c-695596b0877b"},
+                    {"name": "dev-b", "notebook_id": f"{shared}-bbbb-484a-898c-695596b0877b"},
+                ]
+            }
+        )
+        with patch("qzcli.cli.get_api", return_value=api), patch(
+            "qzcli.cli.load_all_resources", return_value={WS_ID: {"name": "ws"}}
+        ):
+            display = MagicMock()
+            result = _resolve_notebook_id_by_name(shared, "cookie", display)
+        self.assertIsNone(result)
+        display.print_error.assert_called_once()
+
 
 class DetectUserIdFromProbeTests(unittest.TestCase):
     """`_detect_user_id_from_probe` must match by login_name, not 'first job'."""

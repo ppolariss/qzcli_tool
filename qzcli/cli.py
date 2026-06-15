@@ -6590,10 +6590,17 @@ def _detect_user_id_from_probe(probe_jobs, username):
     return ""
 
 
-def _resolve_notebook_id_by_name(name, cookie, display):
-    """name → 在已缓存 workspaces 里搜 RUNNING notebook 拿 notebook_id。
+def _resolve_notebook_id_by_name(target, cookie, display):
+    """target → 在已缓存 workspaces 里搜 RUNNING notebook 拿 notebook_id。
 
-    不再按 user_id 过滤 —— 协作者机器也能命中，且免疫 user_id 缓存 bug。
+    target 可以是开发机名字、完整 notebook_id，或 notebook_id 的前缀（粘贴一段
+    就行）。匹配顺序：
+
+      1. 精确命中 —— ``name == target`` 或 ``notebook_id == target``，意图明确，直接返回。
+      2. 前缀模糊 —— ``notebook_id.startswith(target)``；恰好 1 个命中才返回，
+         撞到多个时列出候选并报错（不默默取第一个），0 个落到"未找到"。
+
+    不按 user_id 过滤 —— 协作者机器也能命中，且免疫 user_id 缓存 bug。
     """
     api = get_api()
     all_resources = load_all_resources()
@@ -6601,6 +6608,8 @@ def _resolve_notebook_id_by_name(name, cookie, display):
         display.print_error("没有已缓存的工作空间，请先 qzcli res -u")
         return None
 
+    # 先把所有 workspace 的 RUNNING notebook 收集成候选，便于做精确/前缀两级匹配。
+    notebooks = []
     for ws_id, _ws_data in all_resources.items():
         try:
             nb_result = api.list_notebooks_with_cookie(
@@ -6610,13 +6619,35 @@ def _resolve_notebook_id_by_name(name, cookie, display):
                 user_ids=[],
                 status=["RUNNING"],
             )
-            for nb in nb_result.get("list", []):
-                if nb.get("name") == name:
-                    return nb.get("notebook_id")
         except QzAPIError:
             continue
+        notebooks.extend(nb_result.get("list", []))
 
-    display.print_error(f"未找到名为 '{name}' 的运行中开发机")
+    # 1. 精确命中：name 或 notebook_id 完全相等。
+    for nb in notebooks:
+        if nb.get("name") == target or nb.get("notebook_id") == target:
+            return nb.get("notebook_id")
+
+    # 2. 前缀模糊：notebook_id 以 target 开头。
+    if target:
+        prefix_hits = [
+            nb
+            for nb in notebooks
+            if str(nb.get("notebook_id", "")).startswith(target)
+        ]
+        if len(prefix_hits) == 1:
+            return prefix_hits[0].get("notebook_id")
+        if len(prefix_hits) > 1:
+            candidates = "、".join(
+                f"{nb.get('name')} ({str(nb.get('notebook_id', ''))[:8]}…)"
+                for nb in prefix_hits
+            )
+            display.print_error(
+                f"'{target}' 前缀匹配到多个开发机：{candidates}；请给更长的前缀或完整名字/UUID"
+            )
+            return None
+
+    display.print_error(f"未找到名为 '{target}' 的运行中开发机")
     return None
 
 
@@ -6666,11 +6697,12 @@ def _get_jupyter_info(notebook_id, cookie, display):
 
 def _find_notebook_jupyter_info(target, display):
     """
-    name | notebook_id (UUID) | 完整 URL → Jupyter base_url + token。
+    name | notebook_id (UUID 或前缀) | 完整 URL → Jupyter base_url + token。
 
     流程：
       1. UUID/URL: 直接抽 notebook_id（跳过 list_notebooks）
-      2. name: 按名字在已缓存 workspaces 里搜 RUNNING notebook
+      2. name / notebook_id 前缀: 在已缓存 workspaces 里搜 RUNNING notebook
+         （精确 name/notebook_id，或唯一的 notebook_id 前缀）
       3. notebook_id → /api/v1/notebook/lab/<id> 301 → base_url + token
 
     Returns: dict with {base_url, token, notebook_id} or None
@@ -7257,7 +7289,7 @@ def main():
     exec_parser.add_argument(
         "host",
         metavar="target",
-        help="开发机标识：name (如 blender-rl) / notebook_id (UUID) / "
+        help="开发机标识：name (如 blender-rl) / notebook_id (UUID 或前缀) / "
         "完整 URL (/ide?notebook_id=..., /jobs/interactiveModel(ing)?Detail/..., /jupyter/...)",
     )
     exec_parser.add_argument(
@@ -7277,7 +7309,7 @@ def main():
     exec_attach_parser.add_argument(
         "host",
         metavar="target",
-        help="开发机标识：name / notebook_id (UUID) / 完整 URL（同 exec）",
+        help="开发机标识：name / notebook_id (UUID 或前缀) / 完整 URL（同 exec）",
     )
     exec_attach_parser.add_argument(
         "job_id", help="exec --detach 返回的 job_id（如 qzcli_1700000000）"
