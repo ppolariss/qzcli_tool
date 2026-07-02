@@ -1,0 +1,393 @@
+#!/usr/bin/env python3
+"""qzcli GPU 使用「成分下钻」看板（Streamlit）。
+
+由 ``qzcli dashboard`` 子命令通过 ``streamlit run`` 拉起。主视图是 plotly
+treemap/sunburst：块面积 = GPU 数，默认自顶向下按
+``计算组 → 优先级档 → 项目 → 用户 → 任务`` 逐层下钻——点一块 native 放大、
+点中心面包屑退回，一眼看出「各计算组里谁占最多、各自高低优」。
+
+数据全部复用 qzcli 的 API 客户端与数据层纯函数（``qzcli.cli``），
+无独立平台请求逻辑。
+"""
+
+import os
+
+import pandas as pd
+import plotly.express as px
+import streamlit as st
+
+from qzcli import cli
+from qzcli.api import QzAPIError, get_api
+from qzcli.config import (
+    find_workspace_by_name,
+    get_cookie,
+    get_workspace_resources,
+    load_all_resources,
+)
+
+# 可作为下钻层级 / 筛选的维度列（顺序即默认下钻顺序）
+HIERARCHY_DIMS = ["计算组", "GPU类型", "集群", "优先级档", "任务类型", "项目", "用户"]
+DEFAULT_HIERARCHY = ["计算组", "优先级档", "项目", "用户"]
+COLOR_DIMS = [
+    "优先级档",
+    "任务类型",
+    "计算组",
+    "GPU利用率(空占卡预警)",
+    "运行时长(越久越红)",
+]
+FILTER_DIMS = ["计算组", "优先级档", "任务类型", "项目", "用户", "状态"]
+LEAF = "任务名"
+
+# 连续配色维度 -> (数据列, 色阶, 固定区间 or None, 中点 or None)
+CONTINUOUS_COLOR = {
+    "GPU利用率(空占卡预警)": ("GPU利用率", "RdYlGn", [0, 100], 50),
+    "运行时长(越久越红)": ("运行时长h", "OrRd", None, None),
+}
+
+
+def _resolve_workspace(ws_input):
+    """把「分布式」这类名字解析成 (workspace_id, 显示名)。"""
+    if ws_input and ws_input.startswith("ws-"):
+        res = get_workspace_resources(ws_input) or {}
+        return ws_input, res.get("name", ws_input)
+    ws_id = find_workspace_by_name(ws_input) if ws_input else None
+    if not ws_id:
+        return None, ws_input
+    res = get_workspace_resources(ws_id) or {}
+    return ws_id, res.get("name", ws_input)
+
+
+FREE_LABEL = "空闲"  # 灰块：未占用的 GPU 容量
+FREE_COLOR = "#d9d9d9"
+
+# 固定优先级档配色，避免叠加灰块后 px 重排调色板（高优蓝/中优红/低优绿/空闲灰）
+PRIORITY_COLORS = {
+    "高优(≥6)": "#636EFA",
+    "中优(4-5)": "#EF553B",
+    "低优(≤3)": "#00CC96",
+    FREE_LABEL: FREE_COLOR,
+}
+
+
+@st.cache_data(ttl=90, show_spinner="拉取任务与计算组映射中…")
+def load_df(ws_id, ws_name):
+    """拉取在跑任务 + 计算组映射。
+
+    返回 ``(df, free_by_lcg)``：df 是每个在跑任务一行；free_by_lcg 是
+    ``{计算组: 空闲GPU数}``（= 节点容量总和 − 已用），用于叠加灰块。
+    """
+    api = get_api()
+    cookie_data = get_cookie()
+    if not cookie_data or not cookie_data.get("cookie"):
+        raise QzAPIError("未设置 cookie，请先运行: qzcli login")
+    cookie = cookie_data["cookie"]
+    node_map = cli.build_node_to_lcg_map(api, ws_id, cookie)
+    tasks = cli.fetch_all_task_dimensions(api, ws_id, cookie)
+    rows = [cli.task_dimension_to_row(t, node_map, ws_id) for t in tasks]
+
+    # 每个计算组的空闲 GPU（按节点容量 − 已用聚合，去重到节点粒度）
+    cap, used = {}, {}
+    for info in node_map.values():
+        lcg = info["lcg"]
+        cap[lcg] = cap.get(lcg, 0) + info.get("gpu_total", 0)
+        used[lcg] = used.get(lcg, 0) + info.get("gpu_used", 0)
+    free_by_lcg = {lcg: max(cap[lcg] - used.get(lcg, 0), 0) for lcg in cap}
+    return pd.DataFrame(rows), free_by_lcg
+
+
+def _free_rows(free_by_lcg, keep_lcgs):
+    """把 {计算组: 空闲GPU} 变成灰块行（每个非零计算组一行）。"""
+    out = []
+    for lcg, free in free_by_lcg.items():
+        if free <= 0 or (keep_lcgs is not None and lcg not in keep_lcgs):
+            continue
+        out.append(
+            {
+                "任务名": f"{FREE_LABEL} {int(free)} GPU",
+                "用户": FREE_LABEL,
+                "项目": FREE_LABEL,
+                "任务类型": FREE_LABEL,
+                "优先级": -1,
+                "优先级档": FREE_LABEL,
+                "计算组": lcg,
+                "GPU类型": FREE_LABEL,
+                "集群": FREE_LABEL,
+                "GPU": int(free),
+                "GPU利用率": 0.0,
+                "状态": FREE_LABEL,
+                "节点数": 0,
+                "节点": "",
+                "运行时长h": 0.0,
+                "创建时间": "",
+                "job_url": "",
+                "id": "",
+            }
+        )
+    return out
+
+
+def _node_customdata(fig, gdf, path_cols, root):
+    """为 treemap 每个节点（含内部节点）算聚合明细。
+
+    px 只能把 `values`(GPU) 沿树求和，其它列在内部节点会变 NaN/(?)；这里按节点
+    的完整路径匹配 gdf 叶子行，自己算：[任务数, GPU 加权平均利用率, 最长运行h, 类型]。
+    """
+    sep = "/"
+    fp = gdf[path_cols].astype(str).agg(sep.join, axis=1)
+    gpu = gdf["GPU"].to_numpy()
+    util = gdf["GPU利用率"].to_numpy()
+    rt = gdf["运行时长h"].to_numpy()
+    cnt = gdf["任务数"].to_numpy()
+    types = gdf["任务类型"].astype(str).to_numpy()
+    out = []
+    for nid in fig.data[0].ids:
+        if nid == root:
+            mask = slice(None)
+        else:
+            rel = nid[len(root) + 1 :] if nid.startswith(root + sep) else nid
+            mask = (fp.values == rel) | fp.str.startswith(rel + sep).values
+        g = gpu[mask]
+        tot = float(g.sum())
+        wutil = float((util[mask] * g).sum() / tot) if tot > 0 else 0.0
+        mrt = float(rt[mask].max()) if len(g) else 0.0
+        uniq = set(types[mask].tolist())
+        tstr = next(iter(uniq)) if len(uniq) == 1 else f"{len(uniq)}类混合"
+        out.append([int(cnt[mask].sum()), wutil, mrt, tstr])
+    return out
+
+
+def _apply_filters(df, selections, search):
+    out = df
+    for dim, chosen in selections.items():
+        if chosen:
+            out = out[out[dim].isin(chosen)]
+    if search:
+        mask = out["任务名"].str.contains(search, case=False, na=False) | out[
+            "节点"
+        ].str.contains(search, case=False, na=False)
+        out = out[mask]
+    return out
+
+
+def main():
+    st.set_page_config(page_title="qzcli GPU 看板", layout="wide")
+
+    default_ws = os.environ.get("QZCLI_DASHBOARD_WS", "分布式")
+
+    # 本地缓存的工作空间列表（qzcli res -u 维护），做成下拉框
+    resources = load_all_resources() or {}
+    ws_options = sorted(
+        ((wid, (d.get("name") or wid)) for wid, d in resources.items()),
+        key=lambda x: x[1],
+    )
+    ids = [wid for wid, _ in ws_options]
+    names = {wid: nm for wid, nm in ws_options}
+
+    # 把默认值（可能是名称或 ws- ID）解析成 ID
+    default_id = (
+        default_ws if default_ws in names else find_workspace_by_name(default_ws)
+    )
+
+    # ---- 标题行：workspace 下拉框 + 刷新 ----
+    head_l, head_r = st.columns([4, 1])
+    with head_l:
+        if ids:
+            idx = ids.index(default_id) if default_id in ids else 0
+            ws_id = st.selectbox(
+                "工作空间",
+                ids,
+                index=idx,
+                format_func=lambda i: names.get(i, i),
+            )
+            ws_name = names.get(ws_id, ws_id)
+        else:
+            # 缓存为空时回退到手输
+            ws_input = st.text_input("工作空间（名称或 ws- ID）", value=default_ws)
+            ws_id, ws_name = _resolve_workspace(ws_input)
+    with head_r:
+        st.write("")
+        st.write("")
+        if st.button("🔄 刷新数据", use_container_width=True):
+            load_df.clear()
+
+    if not ws_id:
+        st.error("未找到可用工作空间。先在终端跑 `qzcli res -u` 刷新缓存，再重试。")
+        st.stop()
+
+    st.title(f"🧩 {ws_name} · GPU 占用成分")
+
+    try:
+        df, free_by_lcg = load_df(ws_id, ws_name)
+    except QzAPIError as e:
+        st.error(f"{e}\n\n请在终端运行 `qzcli login` 后点上方「🔄 刷新数据」。")
+        st.stop()
+
+    if df.empty:
+        st.info("当前没有在跑任务。")
+        st.stop()
+
+    # ---- Sidebar 筛选 ----
+    st.sidebar.header("筛选")
+    selections = {}
+    for dim in FILTER_DIMS:
+        opts = sorted(x for x in df[dim].dropna().unique().tolist() if x != "")
+        if opts:
+            selections[dim] = st.sidebar.multiselect(dim, opts, default=[])
+    search = st.sidebar.text_input("🔍 任务名 / 节点关键字")
+
+    fdf = _apply_filters(df, selections, search)
+
+    # ---- KPI ----
+    total_free = int(sum(free_by_lcg.values()))
+    total_gpu = int(fdf["GPU"].sum())
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("运行任务数", f"{len(fdf):,}")
+    k2.metric("已占用 GPU", f"{total_gpu:,}")
+    k3.metric("空闲 GPU", f"{total_free:,}")
+    k4.metric("计算组数", fdf[fdf["计算组"] != "排队/未分配"]["计算组"].nunique())
+
+    # ---- 按任务类型占用（看交互式建模/训练/推理各占多少）----
+    type_gpu = fdf.groupby("任务类型")["GPU"].sum().sort_values(ascending=False)
+    if total_gpu > 0:
+        parts = []
+        for i, (t, g) in enumerate(type_gpu.items()):
+            seg = f"{t} {int(g)} GPU（{g / total_gpu * 100:.0f}%）"
+            parts.append(f"**🔹 {seg}**" if i == 0 else seg)
+        st.markdown("**按类型占用：** " + " ・ ".join(parts))
+
+    # ---- 控制条 ----
+    c1, c2, c3 = st.columns([1, 2, 1.4])
+    with c1:
+        view = st.radio("视图", ["Treemap", "Sunburst", "Icicle"], horizontal=False)
+    with c2:
+        hierarchy = st.multiselect(
+            "下钻层级顺序（从外到内）", HIERARCHY_DIMS, default=DEFAULT_HIERARCHY
+        )
+    with c3:
+        color_dim = st.selectbox("配色维度", COLOR_DIMS, index=0)
+        show_free = st.checkbox("叠加空闲 GPU（灰块）", value=False)
+
+    # 叠加空闲灰块（只对当前筛选到的计算组补），追加到绘图数据
+    pdf = fdf
+    if show_free:
+        keep = set(fdf["计算组"].unique()) if selections.get("计算组") else None
+        free_rows = _free_rows(free_by_lcg, keep)
+        if free_rows:
+            pdf = pd.concat([fdf, pd.DataFrame(free_rows)], ignore_index=True)
+
+    if not hierarchy:
+        st.warning("请至少选择一个下钻层级。")
+        st.stop()
+
+    if fdf.empty:
+        st.warning("当前筛选下没有任务。")
+        st.stop()
+
+    # ---- 预聚合到叶子粒度 ----
+    # 同名 clone 任务若不先聚合，px 会把它们并成一个叶子且逐行数值字段丢成 NaN；
+    # 这里按完整路径分组，显式指定聚合方式（GPU 求和、利用率取均值、运行时长取最长），
+    # 保证叶子悬停有干净数值，并额外带上「任务数」。
+    # 同时剔除 0 GPU 的行：treemap 无面积，且会让 px 连续配色的加权平均除零报错。
+    plot_df = pdf[pdf["GPU"] > 0]
+    if plot_df.empty:
+        st.warning("当前筛选下没有占用 GPU 的任务。")
+        st.stop()
+    cont = CONTINUOUS_COLOR.get(color_dim)
+    color_col = cont[0] if cont else color_dim
+    path_cols = hierarchy + [LEAF]
+    agg_map = {"GPU": ("GPU", "sum"), "任务数": (LEAF, "size")}
+    agg_extra = [("GPU利用率", "mean"), ("运行时长h", "max"), ("任务类型", "first")]
+    if not cont:  # 分类配色列也要能取到（可能不在下钻层级里）
+        agg_extra.append((color_col, "first"))
+    for col, fn in agg_extra:
+        if col not in path_cols and col not in agg_map:
+            agg_map[col] = (col, fn)
+    gdf = plot_df.groupby(path_cols, as_index=False, sort=False).agg(**agg_map)
+
+    # ---- 主视图：treemap / sunburst / icicle ----
+    plot_kwargs = dict(
+        path=[px.Constant(ws_name)] + path_cols,
+        values="GPU",
+        color=color_col,
+    )
+    if cont:
+        _col, scale, rng, mid = cont
+        plot_kwargs["color_continuous_scale"] = scale
+        if rng is None and color_col in gdf:
+            # 无固定区间（如运行时长）：按 95 分位截断，避免个别超长任务把色阶拉平
+            hi = float(gdf[color_col].quantile(0.95)) or float(gdf[color_col].max())
+            rng = [0, hi] if hi and hi > 0 else None
+        if rng is not None:
+            plot_kwargs["range_color"] = rng
+        if mid is not None:
+            plot_kwargs["color_continuous_midpoint"] = mid
+    else:
+        # 分类配色：优先级档用固定调色板；其它维度只固定「空闲」为灰
+        plot_kwargs["color_discrete_map"] = (
+            PRIORITY_COLORS if color_dim == "优先级档" else {FREE_LABEL: FREE_COLOR}
+        )
+    chart_fn = {"Treemap": px.treemap, "Sunburst": px.sunburst, "Icicle": px.icicle}[
+        view
+    ]
+    fig = chart_fn(gdf, **plot_kwargs)
+
+    # 为每个节点（含父级）计算干净的聚合明细，覆盖 customdata
+    # （px 对内部节点的非 values 列无法聚合，直接用会显示 NaN/(?)）
+    fig.data[0].customdata = _node_customdata(fig, gdf, path_cols, ws_name)
+    fig.update_traces(
+        root_color="lightgrey",
+        hovertemplate=(
+            "<b>%{label}</b><br>"
+            "GPU=%{value}（占上层 %{percentParent:.0%}）<br>"
+            "任务数=%{customdata[0]}｜类型=%{customdata[3]}<br>"
+            "平均利用率=%{customdata[1]:.0f}%｜最长运行=%{customdata[2]:.1f}h"
+            "<extra></extra>"
+        ),
+    )
+    fig.update_layout(margin=dict(t=30, l=0, r=0, b=0), height=680)
+    st.plotly_chart(fig, use_container_width=True)
+    st.caption(
+        "块面积 = GPU 数；点一块放大、点中心面包屑退回。"
+        "「计算组」= 机房级 logic_compute_group（经节点反查）；"
+        "「排队/未分配」= 尚未占用节点的任务；"
+        "勾选「叠加空闲 GPU」后，各计算组还剩多少卡以灰块显示。"
+    )
+
+    # ---- 叶子明细（次要，兜底看原始行 / 跳启智）----
+    with st.expander(
+        f"▸ 当前筛选下任务明细（{len(fdf)} 条 / {int(fdf['GPU'].sum())} GPU）"
+    ):
+        show_cols = [
+            "任务名",
+            "用户",
+            "项目",
+            "计算组",
+            "任务类型",
+            "优先级档",
+            "GPU",
+            "GPU利用率",
+            "状态",
+            "节点数",
+            "运行时长h",
+            "创建时间",
+            "job_url",
+        ]
+        st.dataframe(
+            fdf[show_cols].sort_values("GPU", ascending=False),
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "job_url": st.column_config.LinkColumn("详情", display_text="🔗 打开"),
+                "GPU利用率": st.column_config.NumberColumn("GPU利用率%", format="%.0f"),
+            },
+        )
+        st.download_button(
+            "⬇️ 导出当前筛选 CSV",
+            fdf[show_cols].to_csv(index=False).encode("utf-8-sig"),
+            file_name=f"{ws_name}_gpu_usage.csv",
+            mime="text/csv",
+        )
+
+
+if __name__ == "__main__":
+    main()

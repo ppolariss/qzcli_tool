@@ -1987,6 +1987,159 @@ def cmd_avail(args):
     return 0
 
 
+# ---------------------------------------------------------------------------
+# 使用情况数据层（cmd_usage 与 dashboard 共用；提供可测缝）
+# ---------------------------------------------------------------------------
+
+# 任务类型 -> 中文显示名（cmd_usage 与 dashboard 共用）
+TYPE_NAMES = {
+    "distributed_training": "分布式训练",
+    "interactive_modeling": "交互式建模",
+    "inference_serving_customize": "推理服务",
+    "inference_serving": "推理服务",
+    "training": "训练",
+}
+
+# 任务类型 -> 启智任务详情页路径段
+_JOB_DETAIL_PATH_BY_TYPE = {
+    "distributed_training": "distributedTrainingDetail",
+    "interactive_modeling": "interactiveModelingDetail",
+}
+
+
+def fetch_all_task_dimensions(api, workspace_id, cookie, page_size=200, max_workers=8):
+    """分页获取工作空间**当前在跑**任务的资源维度数据（list_task_dimension）。
+
+    第一页即返回 ``total``，据此算出总页数后并发拉取其余页（顺序无关，聚合/可视
+    化都不依赖任务顺序），避免逐页串行的高延迟。
+    """
+    first = api.list_task_dimension(
+        workspace_id, cookie, page_num=1, page_size=page_size
+    )
+    tasks = list(first.get("task_dimensions", []))
+    total = first.get("total", 0) or 0
+    if not tasks or len(tasks) >= total:
+        return tasks
+
+    # 服务端可能把 page_size 压到更小，用首页实际条数推导有效页大小
+    effective = len(tasks)
+    page_count = (total + effective - 1) // effective
+
+    def _fetch(page_num):
+        return api.list_task_dimension(
+            workspace_id, cookie, page_num=page_num, page_size=page_size
+        ).get("task_dimensions", [])
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        for batch in executor.map(_fetch, range(2, page_count + 1)):
+            tasks.extend(batch)
+    return tasks
+
+
+def _short_gpu_type(gpu_type):
+    """把 NVIDIA_H100_SXM_80G 之类的规格缩成 H100 / H200 / A100 等短名。"""
+    if not gpu_type:
+        return ""
+    match = re.search(r"[HAB]\d{2,3}", gpu_type)
+    return match.group(0) if match else gpu_type
+
+
+def build_node_to_lcg_map(api, workspace_id, cookie):
+    """反建 ``{node_name: {"lcg", "gpu_type", "cluster", "gpu_total", "gpu_used"}}``。
+
+    平台的 task/node 资源维度接口都不直接带 logic_compute_group（计算组/机房），
+    但 ``list_node_dimension`` 支持按 ``logic_compute_group_id`` 过滤，因此逐个
+    lcg 拉取其成员节点即可反建「节点 → 计算组」映射（``cmd_avail`` 同法）。
+    """
+    node_map = {}
+    cluster_info = api.get_cluster_basic_info(workspace_id, cookie)
+    lcgs = [
+        (
+            lcg["logic_compute_group_id"],
+            lcg.get("logic_compute_group_name") or lcg["logic_compute_group_id"],
+        )
+        for compute_group in cluster_info.get("compute_groups", [])
+        for lcg in compute_group.get("logic_compute_groups", [])
+        if lcg.get("logic_compute_group_id")
+    ]
+
+    def _fetch(item):
+        lcg_id, lcg_name = item
+        nodes = _fetch_all_node_dimensions(
+            api, workspace_id, cookie, logic_compute_group_id=lcg_id, page_size=1000
+        )
+        return lcg_name, nodes
+
+    # 各 lcg 的节点查询相互独立，并发拉取
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        for lcg_name, nodes in executor.map(_fetch, lcgs):
+            for node in nodes:
+                name = node.get("name")
+                if not name:
+                    continue
+                node_gpu = node.get("gpu") or {}
+                node_map[name] = {
+                    "lcg": lcg_name,
+                    "gpu_type": _short_gpu_type(node.get("gpu_type")),
+                    "cluster": node.get("cluster_name", ""),
+                    "gpu_total": node_gpu.get("total", 0) or 0,  # 该节点 GPU 容量
+                    "gpu_used": node_gpu.get("used", 0) or 0,  # 已占用
+                }
+    return node_map
+
+
+def _priority_band(priority):
+    """优先级数值 -> 高/中/低优档位。"""
+    if priority >= 6:
+        return "高优(≥6)"
+    if priority >= 4:
+        return "中优(4-5)"
+    return "低优(≤3)"
+
+
+def _job_detail_url(job_id, task_type, workspace_id):
+    """按任务类型构造启智任务详情页 URL（镜像 cmd_* 里的详情链接规则）。"""
+    if not job_id:
+        return ""
+    path = _JOB_DETAIL_PATH_BY_TYPE.get(task_type)
+    if path:
+        return f"https://qz.sii.edu.cn/jobs/{path}/{job_id}?spaceId={workspace_id}"
+    # 推理服务 / 未知类型 → 回退到空间概览
+    return f"https://qz.sii.edu.cn/jobs/spacesOverview?spaceId={workspace_id}"
+
+
+def task_dimension_to_row(task, node_map, workspace_id=""):
+    """把一条 list_task_dimension 记录拍平成 dashboard 用的一行（含计算组归属）。"""
+    gpu = task.get("gpu") or {}
+    gpu_total = gpu.get("total", 0) or 0
+    nodes_occupied = task.get("nodes_occupied") or {}
+    nodes = nodes_occupied.get("nodes") or []
+    node_info = node_map.get(nodes[0]) if nodes else None
+    priority = task.get("priority", 0) or 0
+    task_type = task.get("type", "unknown")
+    running_ms = int(task.get("running_time_ms") or 0)
+    return {
+        "任务名": task.get("name", ""),
+        "用户": (task.get("user") or {}).get("name", "未知"),
+        "项目": (task.get("project") or {}).get("name", "未知"),
+        "任务类型": TYPE_NAMES.get(task_type, task_type),
+        "优先级": priority,
+        "优先级档": _priority_band(priority),
+        "计算组": node_info["lcg"] if node_info else "排队/未分配",
+        "GPU类型": node_info["gpu_type"] if node_info else "",
+        "集群": node_info["cluster"] if node_info else "",
+        "GPU": gpu_total,
+        "GPU利用率": round((gpu.get("usage_rate") or 0) * 100, 1),
+        "状态": task.get("status", ""),
+        "节点数": nodes_occupied.get("count", 0),
+        "节点": ",".join(nodes),
+        "运行时长h": round(running_ms / 3_600_000, 1),
+        "创建时间": (task.get("created_at") or "")[:19],
+        "job_url": _job_detail_url(task.get("id"), task_type, workspace_id),
+        "id": task.get("id", ""),
+    }
+
+
 def cmd_usage(args):
     """统计工作空间的 GPU 使用分布"""
     display = get_display()
@@ -2036,20 +2189,7 @@ def cmd_usage(args):
 
         try:
             # 分页获取所有任务
-            tasks = []
-            page_num = 1
-            page_size = 200
-            while True:
-                data = api.list_task_dimension(
-                    workspace_id, cookie, page_num=page_num, page_size=page_size
-                )
-                page_tasks = data.get("task_dimensions", [])
-                total_count = data.get("total", 0)
-                tasks.extend(page_tasks)
-
-                if len(tasks) >= total_count or not page_tasks:
-                    break
-                page_num += 1
+            tasks = fetch_all_task_dimensions(api, workspace_id, cookie)
 
             if not tasks:
                 continue
@@ -2067,14 +2207,8 @@ def cmd_usage(args):
             total_gpu = 0
             total_tasks = len(tasks)
 
-            # 任务类型中文映射
-            type_names = {
-                "distributed_training": "分布式训练",
-                "interactive_modeling": "交互式建模",
-                "inference_serving_customize": "推理服务",
-                "inference_serving": "推理服务",
-                "training": "训练",
-            }
+            # 任务类型中文映射（模块级共享常量）
+            type_names = TYPE_NAMES
 
             # 提取项目信息用于更新 resources.json
             projects_found = {}
@@ -5850,6 +5984,64 @@ def _run_create_interactive(args, display, api) -> int:
     return 0
 
 
+def cmd_dashboard(args):
+    """启动 GPU 使用「成分下钻」可视化看板（Streamlit + treemap）。"""
+    display = get_display()
+
+    # 可选依赖检测
+    missing = []
+    for mod in ("streamlit", "plotly", "pandas"):
+        try:
+            __import__(mod)
+        except ImportError:
+            missing.append(mod)
+    if missing:
+        # 注意：display.print_error 走 rich，`[dashboard]` 会被当作 markup，需转义
+        display.print_error(
+            "看板需要额外依赖：" + ", ".join(missing) + "\n"
+            r"请安装：pip install 'qzcli\[dashboard]'"
+            "（或 pip install streamlit plotly pandas）"
+        )
+        return 1
+
+    # 解析 workspace（名称 -> ID），经环境变量传给 streamlit 子进程
+    ws_input = args.workspace or "分布式"
+    if ws_input.startswith("ws-"):
+        ws_id = ws_input
+    else:
+        ws_id = find_workspace_by_name(ws_input)
+        if not ws_id:
+            display.print_error(f"未找到工作空间 “{ws_input}”，请先运行: qzcli res -u")
+            return 1
+
+    import os
+    import subprocess
+
+    app_path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "dashboard_app.py"
+    )
+    cmd = [
+        sys.executable,
+        "-m",
+        "streamlit",
+        "run",
+        app_path,
+        "--server.port",
+        str(args.port),
+    ]
+    if args.no_browser:
+        cmd += ["--server.headless", "true"]
+
+    env = dict(os.environ, QZCLI_DASHBOARD_WS=ws_id)
+    display.print(
+        f"[dim]启动看板：workspace={ws_input} 端口={args.port}（Ctrl+C 退出）[/dim]"
+    )
+    try:
+        return subprocess.run(cmd, env=env).returncode
+    except KeyboardInterrupt:
+        return 0
+
+
 def cmd_create(args):
     """创建任务"""
     display = get_display()
@@ -6077,13 +6269,17 @@ def cmd_create(args):
             elif len(parts) == 1:
                 ds_id, ver_id = parts[0], "v1"
             else:
-                display.print_error(f"无效的数据集格式: {ds_spec}，应为 dataset_id:version_id")
+                display.print_error(
+                    f"无效的数据集格式: {ds_spec}，应为 dataset_id:version_id"
+                )
                 return 1
-            dataset_info.append({
-                "dataset_id": ds_id,
-                "path": f"rclone-worker-1/{ds_id}/{ver_id}",
-                "version_id": ver_id,
-            })
+            dataset_info.append(
+                {
+                    "dataset_id": ds_id,
+                    "path": f"rclone-worker-1/{ds_id}/{ver_id}",
+                    "version_id": ver_id,
+                }
+            )
         payload["dataset_info"] = dataset_info
         display.print(f"  挂载数据集: {len(dataset_info)} 个")
         for di in dataset_info:
@@ -7382,6 +7578,21 @@ def main():
         "--by-priority", "-r", action="store_true", help="按优先级统计"
     )
 
+    # dashboard 命令 - 成分下钻可视化看板
+    dashboard_parser = subparsers.add_parser(
+        "dashboard",
+        help="启动 GPU 使用成分下钻可视化看板（treemap，需 qzcli[dashboard]）",
+    )
+    dashboard_parser.add_argument(
+        "--workspace", "-w", default="分布式", help="工作空间 ID 或名称（默认：分布式）"
+    )
+    dashboard_parser.add_argument(
+        "--port", type=int, default=8520, help="Streamlit 端口（默认 8520）"
+    )
+    dashboard_parser.add_argument(
+        "--no-browser", action="store_true", help="不自动打开浏览器（headless）"
+    )
+
     # create 命令 - 创建任务
     create_parser = subparsers.add_parser(
         "create", aliases=["create-job"], help="创建并提交任务到启智平台"
@@ -7427,7 +7638,8 @@ def main():
         "--framework", help=f"框架类型（默认 {DEFAULT_CREATE_FRAMEWORK}）"
     )
     create_parser.add_argument(
-        "--dataset", "-d",
+        "--dataset",
+        "-d",
         action="append",
         metavar="ID:VERSION",
         help="挂载公共数据集，格式 dataset_id:version_id（可多次指定），如 --dataset open-p2p-full:v1 --dataset videogamebunny:v1",
@@ -7555,6 +7767,7 @@ def main():
         "avail": cmd_avail,
         "av": cmd_avail,
         "usage": cmd_usage,
+        "dashboard": cmd_dashboard,
         "create": cmd_create,
         "create-job": cmd_create,
         "hpc": cmd_hpc,

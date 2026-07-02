@@ -19,6 +19,14 @@ setup(
         "mcp>=1.0,<2.0",
         "PySocks>=1.7",
     ],
+    extras_require={
+        # 可视化看板（qzcli dashboard）依赖，不进核心 install_requires
+        "dashboard": [
+            "streamlit>=1.30",
+            "plotly>=5.0",
+            "pandas>=2.0",
+        ],
+    },
     entry_points={
         "console_scripts": [
             "qzcli=qzcli.cli:main",
