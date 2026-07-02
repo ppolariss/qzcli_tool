@@ -16,6 +16,7 @@
 - **一键登录**: `qzcli login` 通过 CAS 认证自动获取 cookie，无需手动复制
 - **资源发现**: `qzcli res -u` 调 `cluster_info` / `task_dimension` 聚合工作空间、计算组、项目并本地缓存（默认 quick 模式秒级返回；需要更新 specs 时加 `--full` 走全量历史任务扫描）
 - **节点查询**: `qzcli avail` 查询各计算组空余节点，支持低优任务统计和 cookie 失效自动刷新
+- **可视化看板**: `qzcli dashboard` 用 treemap 按「计算组→优先级→项目→用户→任务」逐层下钻 GPU 占用（需 `pip install 'qzcli[dashboard]'`）
 - **交互式提交**: `qzcli create -i` 提供层级式选择界面，缺少快照时按需预加载
 - **任务列表**: 美观的卡片式显示，完整 URL 方便点击
 - **日志查看**: `qzcli logs <job-id>` 直连平台日志接口，支持 tail、follow、raw/json 输出
@@ -271,6 +272,23 @@ qzcli avail -n 4 -e
 ```
 
 如果本地 cookie 已过期，但你已经通过 shell 环境变量、`QZCLI_ENV_FILE` 指向的 `.env`（默认 `~/.qzcli/.env`）或 `~/.qzcli/config.json` 保存了 CAS 凭据，`qzcli avail` 会自动刷新 cookie 后继续查询。
+
+### 可视化看板
+
+`qzcli dashboard` 启动一个 Streamlit + plotly treemap 看板，把工作空间**在跑**的 GPU 占用按「**计算组(机房) → 优先级档 → 项目 → 用户 → 任务**」逐层下钻：块面积 = GPU 数，点一块放大、点中心面包屑退回，一眼看清「各计算组里谁占最多、各自高低优」。配色可切 优先级 / 任务类型 / **GPU 利用率**（红 = 申请卡多却在空转）/ **运行时长**（越久越红）；顶部有「按任务类型占比」行（看交互式建模/训练/推理各占多少）与「已占用/空闲 GPU」；勾选「叠加空闲 GPU（灰块）」可把各计算组的**剩余容量**以灰块叠加。工作空间用下拉框选，悬停任意块给出干净明细（任务数/类型/平均利用率/最长运行）。数据分页并发拉取，分布式空间首屏约 5 秒。
+
+看板依赖为**可选 extra**（不装也不影响其它命令）：
+
+```bash
+pip install 'qzcli[dashboard]'      # 安装 streamlit / plotly / pandas
+
+qzcli login                          # 看板走 cookie 认证
+qzcli dashboard                      # 默认「分布式」，端口 8520，自动开浏览器
+qzcli dashboard -w 分布式 --port 8600  # 指定工作空间和端口
+qzcli dashboard --no-browser         # headless（远端/无 GUI 场景）
+```
+
+> 计算组归属：平台的任务/节点资源维度接口都不直接带 logic_compute_group，看板改为逐 lcg 用 `list_node_dimension(logic_compute_group_id=…)` 反建「节点 → 计算组」映射（与 `avail` 同法），再经任务占用节点挂回，实测全覆盖。「排队/未分配」表示尚未占到节点的任务。
 
 ### 任务列表
 
