@@ -230,13 +230,13 @@ class CreatePayloadTests(unittest.TestCase):
         self.assertEqual(0, rc)
         return calls
 
-    def test_plain_create_routes_v1(self):
-        # 零回归:普通 create 仍走已验证的 v1 路径。
+    def test_plain_create_routes_v2(self):
+        # 迁 v2:普通 create 走 v2 Console API(已真机验证)。
         calls = self._run_counting_routes(_build_args())
-        self.assertEqual((calls["v1"], calls["v2"]), (1, 0))
+        self.assertEqual((calls["v1"], calls["v2"]), (0, 1))
 
     def test_exclude_node_routes_v2(self):
-        # 用了 --exclude-node（需要 v2 的选项）→ 走 v2 Console API。
+        # 带 --exclude-node 也走 v2（exclude_nodes 是 v2 顶层选项）。
         calls = self._run_counting_routes(_build_args(exclude_node=["gpu-x"]))
         self.assertEqual((calls["v1"], calls["v2"]), (0, 1))
 

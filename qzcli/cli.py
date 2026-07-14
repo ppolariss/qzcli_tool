@@ -6356,18 +6356,16 @@ def cmd_create(args):
     display.print("")
 
     # --- Submit ---
-    # exclude_nodes 是 v2 Console API (/api/v2/train?Action=CreateJobConsole) 的选项，
-    # 平台 Web UI 已迁 v2；payload 结构与 v1 一致。为零回归：普通 create 仍走已验证的
-    # v1 create_job_with_cookie；仅当用了 --exclude-node 才走 v2（该特性需要 v2）。
-    # 待 v2 经真机作业验证后，可把默认路径整体切到 create_job_v2。
-    use_v2 = bool(payload.get("exclude_nodes"))
+    # 平台 Web UI 已把作业创建迁到 v2 Console API
+    # (/api/v2/train?Action=CreateJobConsole)，payload 结构与 v1 一致。已真机验证 v2
+    # create 可正常创建作业(job-1434c06e 提交并停止成功)，故默认走 create_job_v2；
+    # 老 v1 create_job_with_cookie 保留作回退。无 cookie 时退老 openapi token path。
+    # 注：exclude_nodes 需 workspace 级启用，未启用的空间平台会报
+    # "exclude_nodes not enable in workspace"(如 分布式训练空间)。
     try:
         cookie_data = get_cookie()
         if cookie_data and cookie_data.get("cookie"):
-            if use_v2:
-                result = api.create_job_v2(cookie_data["cookie"], payload)
-            else:
-                result = api.create_job_with_cookie(cookie_data["cookie"], payload)
+            result = api.create_job_v2(cookie_data["cookie"], payload)
         else:
             result = api.create_job(payload)
     except QzAPIError as e:
@@ -7701,7 +7699,8 @@ def main():
         metavar="NODE",
         help="排除某个 Ready 节点不参与本作业调度（可多次指定，非节点锁定）。"
         "配合碎卡治理：把碎卡节点排掉，逼平台把作业排到整节点。"
-        "如 --exclude-node qb-prod-gpu105 --exclude-node qb-prod-gpu418",
+        "如 --exclude-node qb-prod-gpu105 --exclude-node qb-prod-gpu418。"
+        "注：需 workspace 启用该能力，未启用时平台报 exclude_nodes not enable。",
     )
     create_parser.add_argument("--no-track", action="store_true", help="不自动追踪任务")
     create_parser.add_argument(
