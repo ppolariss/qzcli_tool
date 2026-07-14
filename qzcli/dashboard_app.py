@@ -230,6 +230,23 @@ def render_fragmentation(ws_options):
         ["碎片低优卡", "可凑整节点潜力"], ascending=False)
     st.dataframe(view1, use_container_width=True, hide_index=True)
 
+    # ---- 桥:选一个要提交的计算组 → 一键拿它的碎卡节点排除参数 ----
+    st.markdown("**🔧 提交时避开碎卡** — 选你要提交作业的计算组，把它"
+                "**有空卡的碎卡节点**排掉，逼调度器用整节点/空节点(避免作业被塞进碎片):")
+    frag_all = {"nodes": all_nodes}
+    lcg_opts = sorted({n["lcg"] for n in all_nodes
+                       if n.get("class") == fragmentation.FRAGMENTED and n.get("lcg")})
+    if lcg_opts:
+        pick = st.selectbox("计算组", lcg_opts, key="exclude_lcg")
+        names = fragmentation.fragmented_node_names(frag_all, lcg=pick, only_free=True)
+        if names:
+            st.caption(f"{pick}:{len(names)} 个有空卡的碎卡节点 → 粘到 `qzcli create` 后面")
+            st.code(fragmentation.format_exclude_args(names), language="bash")
+        else:
+            st.success(f"{pick} 没有「有空卡的碎卡节点」，无需排除 👍")
+    else:
+        st.caption("当前没有可排除的碎卡节点。")
+
     st.subheader("② 我的碎片分布(我的卡散在哪些节点)")
     users = sorted({r["用户"] for r in all_rows if r.get("用户")})
     if not users:

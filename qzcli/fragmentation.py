@@ -126,3 +126,30 @@ def compute_node_fragmentation(node_map, task_rows, low_pri_threshold: int = 3) 
         agg["util_pct"] = round(agg["used_gpus"] / tot * 100, 1) if tot else 0.0
 
     return {"nodes": nodes, "by_lcg": by_lcg}
+
+
+# ---- 碎卡 → --exclude-node 参数桥（把"看到碎卡"接到"提交时避开"）----
+
+def format_exclude_args(node_names) -> str:
+    """把节点名列表拼成可直接粘贴的 `--exclude-node A --exclude-node B`。
+    去空/strip/去重/排序,保证稳定可复现。"""
+    names = sorted({str(n).strip() for n in node_names if n and str(n).strip()})
+    return " ".join(f"--exclude-node {n}" for n in names)
+
+
+def fragmented_node_names(frag_result, lcg=None, only_free=False) -> list:
+    """从 compute_node_fragmentation 结果里挑碎卡节点名。
+
+    lcg 限定某计算组;only_free=True 只挑还有空卡的碎卡节点(0<free<total)——
+    这些正是新作业可能被"塞进去凑数"的节点,排掉它们逼调度器用整节点/空节点。
+    """
+    out = []
+    for n in frag_result.get("nodes", []):
+        if n.get("class") != FRAGMENTED:
+            continue
+        if lcg is not None and n.get("lcg") != lcg:
+            continue
+        if only_free and not (0 < n.get("free", 0) < n.get("total", 0)):
+            continue
+        out.append(n["node"])
+    return out

@@ -1537,6 +1537,7 @@ def cmd_avail(args):
             # （低优空余只数"整节点 100% 低优"，看不到这部分——就是看板里那些低优卡）
             fragmented_low_priority = 0
             fragmented_free = 0
+            fragmented_free_node_list = []  # 有空卡的碎卡节点(可 --exclude-node 避开)
 
             for node in nodes:
                 node_name = node.get("name", "")
@@ -1590,9 +1591,10 @@ def cmd_avail(args):
                     elif low_priority_gpu > 0:
                         # 低优没占满整节点 → 碎片低优卡(可抢占但凑不成整节点)
                         fragmented_low_priority += min(low_priority_gpu, gpu_used)
-                    # 空卡散在已被占用的节点上 → 碎片空卡
+                    # 空卡散在已被占用的节点上 → 碎片空卡;记下节点名供 --exclude-node
                     if 0 < gpu_free < gpu_total:
                         fragmented_free += gpu_free
+                        fragmented_free_node_list.append(node_name)
 
             workspace_results.append(
                 {
@@ -1608,6 +1610,7 @@ def cmd_avail(args):
                     "low_priority_free_node_list": low_priority_free_nodes,
                     "fragmented_low_priority_gpus": fragmented_low_priority,
                     "fragmented_free_gpus": fragmented_free,
+                    "fragmented_free_node_list": fragmented_free_node_list,
                     "total_gpus": total_gpus,
                     "total_free_gpus": total_free_gpus,
                     "gpu_free_distribution": gpu_free_distribution,
@@ -1718,6 +1721,16 @@ def cmd_avail(args):
             ):
                 lp_node_names = [n["name"] for n in r["low_priority_free_node_list"]]
                 display.print(f"  [dim]低优空余: {', '.join(lp_node_names)}[/dim]")
+            # 碎卡治理:有空卡的碎卡节点 → 可直接粘的 --exclude-node 串,
+            # 提交时排掉它们逼调度器用整节点/空节点。
+            if args.verbose and r.get("fragmented_free_node_list"):
+                from .fragmentation import format_exclude_args
+
+                excl = format_exclude_args(r["fragmented_free_node_list"])
+                if excl:
+                    display.print(
+                        f"  [dim]避开碎卡(粘到 qzcli create 后): {excl}[/dim]"
+                    )
 
         # 导出格式
         if args.export:
@@ -6278,6 +6291,20 @@ def cmd_create(args):
         ],
     }
 
+    # --- Exclude nodes（碎卡治理：排除碎卡节点，顶层 exclude_nodes，v2 选项）---
+    if getattr(args, "exclude_node", None):
+        seen = set()
+        exclude_nodes = []
+        for raw in args.exclude_node:
+            node = str(raw).strip()
+            if not node:
+                display.print_error("--exclude-node 不能为空节点名")
+                return 1
+            if node not in seen:
+                seen.add(node)
+                exclude_nodes.append(node)
+        payload["exclude_nodes"] = exclude_nodes
+
     # --- Dataset mounting ---
     if getattr(args, "dataset", None):
         dataset_info = []
@@ -6329,14 +6356,18 @@ def cmd_create(args):
     display.print("")
 
     # --- Submit ---
-    # 优先走 cookie auth (/api/v1/train_job/create)：它接受 framework_config[0]
-    # 顶层的 cpu/mem_gi 字段；老的 openapi 路径 (/openapi/v1/train_job/create)
-    # 用 protobuf 校验，会拒掉同样的字段。CAS 用户的 token path 也常因
-    # invalid_grant 失败，cookie path 是项目主推方向。
+    # exclude_nodes 是 v2 Console API (/api/v2/train?Action=CreateJobConsole) 的选项，
+    # 平台 Web UI 已迁 v2；payload 结构与 v1 一致。为零回归：普通 create 仍走已验证的
+    # v1 create_job_with_cookie；仅当用了 --exclude-node 才走 v2（该特性需要 v2）。
+    # 待 v2 经真机作业验证后，可把默认路径整体切到 create_job_v2。
+    use_v2 = bool(payload.get("exclude_nodes"))
     try:
         cookie_data = get_cookie()
         if cookie_data and cookie_data.get("cookie"):
-            result = api.create_job_with_cookie(cookie_data["cookie"], payload)
+            if use_v2:
+                result = api.create_job_v2(cookie_data["cookie"], payload)
+            else:
+                result = api.create_job_with_cookie(cookie_data["cookie"], payload)
         else:
             result = api.create_job(payload)
     except QzAPIError as e:
@@ -7662,6 +7693,15 @@ def main():
         action="append",
         metavar="ID:VERSION",
         help="挂载公共数据集，格式 dataset_id:version_id（可多次指定），如 --dataset open-p2p-full:v1 --dataset videogamebunny:v1",
+    )
+    create_parser.add_argument(
+        "--exclude-node",
+        dest="exclude_node",
+        action="append",
+        metavar="NODE",
+        help="排除某个 Ready 节点不参与本作业调度（可多次指定，非节点锁定）。"
+        "配合碎卡治理：把碎卡节点排掉，逼平台把作业排到整节点。"
+        "如 --exclude-node qb-prod-gpu105 --exclude-node qb-prod-gpu418",
     )
     create_parser.add_argument("--no-track", action="store_true", help="不自动追踪任务")
     create_parser.add_argument(
