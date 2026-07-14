@@ -28,16 +28,18 @@ from qzcli.config import (
 )
 
 # 可作为下钻层级 / 筛选的维度列（顺序即默认下钻顺序）
-HIERARCHY_DIMS = ["计算组", "GPU类型", "集群", "优先级档", "任务类型", "项目", "用户"]
+# 「节点」= 物理节点(host)，可下钻 计算组→节点→任务 看每个节点摞了谁。
+HIERARCHY_DIMS = ["计算组", "节点", "GPU类型", "集群", "优先级档", "任务类型", "项目", "用户"]
 DEFAULT_HIERARCHY = ["计算组", "优先级档", "项目", "用户"]
 COLOR_DIMS = [
     "优先级档",
+    "整节点/碎卡",
     "任务类型",
     "计算组",
     "GPU利用率(空占卡预警)",
     "运行时长(越久越红)",
 ]
-FILTER_DIMS = ["计算组", "优先级档", "任务类型", "项目", "用户", "状态"]
+FILTER_DIMS = ["计算组", "节点分类", "优先级档", "任务类型", "项目", "用户", "状态"]
 LEAF = "任务名"
 
 # 连续配色维度 -> (数据列, 色阶, 固定区间 or None, 中点 or None)
@@ -70,6 +72,19 @@ PRIORITY_COLORS = {
     FREE_LABEL: FREE_COLOR,
 }
 
+# 「整节点/碎卡」配色维度 → 数据列 别名 + 固定调色板（碎卡=红最扎眼）
+CARDING_COLOR_DIM = "整节点/碎卡"
+CARDING_COL = "节点分类"
+CARDING_COLORS = {
+    "碎卡": "#EF553B",          # 红：治理重点
+    "空整节点": "#00CC96",      # 绿：可直接排
+    "低优满占": "#F2C200",      # 黄：可整节点抢占
+    "高优满占": "#636EFA",      # 蓝：不可回收
+    "多节点混合": "#AB63FA",    # 紫：跨节点
+    "排队/未分配": "#c8c8c8",
+    FREE_LABEL: FREE_COLOR,
+}
+
 
 @st.cache_data(ttl=90, show_spinner="拉取任务与计算组映射中…")
 def load_df(ws_id, ws_name):
@@ -86,6 +101,21 @@ def load_df(ws_id, ws_name):
     node_map = cli.build_node_to_lcg_map(api, ws_id, cookie)
     tasks = cli.fetch_all_task_dimensions(api, ws_id, cookie)
     rows = [cli.task_dimension_to_row(t, node_map, ws_id) for t in tasks]
+
+    # 给每个任务标「节点分类」= 它所在物理节点的整节点/碎卡状态（零额外拉数，
+    # 复用碎卡聚合的 per-node class）。这样主 treemap 可直接按碎卡配色/下钻，
+    # 把"成分"和"碎卡治理"接到同一张图。
+    frag = fragmentation.compute_node_fragmentation(node_map, rows)
+    node_class = {n["node"]: n["class"] for n in frag["nodes"]}
+    for r in rows:
+        hosts = [h for h in str(r.get("节点", "") or "").split(",") if h]
+        classes = {node_class.get(h) for h in hosts if node_class.get(h)}
+        if not classes:
+            r["节点分类"] = "排队/未分配"
+        elif len(classes) == 1:
+            r["节点分类"] = next(iter(classes))
+        else:
+            r["节点分类"] = "多节点混合"
 
     # 每个计算组的空闲 GPU（按节点容量 − 已用聚合，去重到节点粒度）
     cap, used = {}, {}
@@ -267,6 +297,7 @@ def _free_rows(free_by_lcg, keep_lcgs):
                 "状态": FREE_LABEL,
                 "节点数": 0,
                 "节点": "",
+                "节点分类": FREE_LABEL,
                 "运行时长h": 0.0,
                 "创建时间": "",
                 "job_url": "",
@@ -462,7 +493,9 @@ def render_composition(df, free_by_lcg, ws_name):
         st.warning("当前筛选下没有占用 GPU 的任务。")
         return
     cont = CONTINUOUS_COLOR.get(color_dim)
-    color_col = cont[0] if cont else color_dim
+    # 「整节点/碎卡」配色映射到实际数据列「节点分类」
+    color_col = cont[0] if cont else (
+        CARDING_COL if color_dim == CARDING_COLOR_DIM else color_dim)
     path_cols = hierarchy + [LEAF]
     agg_map = {"GPU": ("GPU", "sum"), "任务数": (LEAF, "size")}
     agg_extra = [("GPU利用率", "mean"), ("运行时长h", "max"), ("任务类型", "first")]
@@ -494,10 +527,13 @@ def render_composition(df, free_by_lcg, ws_name):
         if mid is not None:
             plot_kwargs["color_continuous_midpoint"] = mid
     else:
-        # 分类配色：优先级档用固定调色板；其它维度只固定「空闲」为灰
-        plot_kwargs["color_discrete_map"] = (
-            PRIORITY_COLORS if color_dim == "优先级档" else {FREE_LABEL: FREE_COLOR}
-        )
+        # 分类配色：优先级档 / 整节点碎卡 用固定调色板；其它维度只固定「空闲」为灰
+        if color_dim == "优先级档":
+            plot_kwargs["color_discrete_map"] = PRIORITY_COLORS
+        elif color_dim == CARDING_COLOR_DIM:
+            plot_kwargs["color_discrete_map"] = CARDING_COLORS
+        else:
+            plot_kwargs["color_discrete_map"] = {FREE_LABEL: FREE_COLOR}
     chart_fn = {"Treemap": px.treemap, "Sunburst": px.sunburst, "Icicle": px.icicle}[
         view
     ]
