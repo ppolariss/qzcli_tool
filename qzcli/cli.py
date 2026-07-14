@@ -1533,6 +1533,10 @@ def cmd_avail(args):
             gpu_free_distribution = {}  # free_gpu_count -> node_count
             total_free_gpus = 0
             total_gpus = 0
+            # 碎卡:散在"非整块"节点上、凑不成整节点的可回收卡
+            # （低优空余只数"整节点 100% 低优"，看不到这部分——就是看板里那些低优卡）
+            fragmented_low_priority = 0
+            fragmented_free = 0
 
             for node in nodes:
                 node_name = node.get("name", "")
@@ -1583,6 +1587,12 @@ def cmd_avail(args):
                                 "gpu_total": gpu_total,
                             }
                         )
+                    elif low_priority_gpu > 0:
+                        # 低优没占满整节点 → 碎片低优卡(可抢占但凑不成整节点)
+                        fragmented_low_priority += min(low_priority_gpu, gpu_used)
+                    # 空卡散在已被占用的节点上 → 碎片空卡
+                    if 0 < gpu_free < gpu_total:
+                        fragmented_free += gpu_free
 
             workspace_results.append(
                 {
@@ -1596,6 +1606,8 @@ def cmd_avail(args):
                     "free_node_list": free_nodes,
                     "low_priority_free_nodes": len(low_priority_free_nodes),
                     "low_priority_free_node_list": low_priority_free_nodes,
+                    "fragmented_low_priority_gpus": fragmented_low_priority,
+                    "fragmented_free_gpus": fragmented_free,
                     "total_gpus": total_gpus,
                     "total_free_gpus": total_free_gpus,
                     "gpu_free_distribution": gpu_free_distribution,
@@ -1787,6 +1799,7 @@ def cmd_avail(args):
             table.add_column("空节点", justify="right")
             if args.low_priority:
                 table.add_column("低优空余", justify="right")
+                table.add_column("碎片低优", justify="right")
                 table.add_column("可用节点", justify="right")
             table.add_column("总节点", justify="right", style="dim")
             table.add_column("空GPU", justify="right")
@@ -1808,6 +1821,10 @@ def cmd_avail(args):
                     f"[yellow]{low_priority_free}[/yellow]"
                     if low_priority_free > 0
                     else "[dim]0[/dim]"
+                )
+                frag_lp = r.get("fragmented_low_priority_gpus", 0)
+                frag_lp_text = (
+                    f"[magenta]{frag_lp}[/magenta]" if frag_lp > 0 else "[dim]0[/dim]"
                 )
                 total_available_text = (
                     f"[green]{total_available}[/green]"
@@ -1835,7 +1852,7 @@ def cmd_avail(args):
                     free_nodes_text,
                 ]
                 if args.low_priority:
-                    row.extend([low_priority_text, total_available_text])
+                    row.extend([low_priority_text, frag_lp_text, total_available_text])
                 row.extend(
                     [
                         str(r.get("total_nodes", 0)),
@@ -1861,7 +1878,9 @@ def cmd_avail(args):
                 if args.low_priority:
                     low_priority_free = r.get("low_priority_free_nodes", 0)
                     row.extend(
-                        [low_priority_free, r.get("free_nodes", 0) + low_priority_free]
+                        [low_priority_free,
+                         r.get("fragmented_low_priority_gpus", 0),
+                         r.get("free_nodes", 0) + low_priority_free]
                     )
                 row.extend(
                     [
@@ -1877,9 +1896,9 @@ def cmd_avail(args):
             aligns = ["right", "left", "left", "right"]
             max_widths = [4, 24, 30, 6]
             if args.low_priority:
-                headers.extend(["低优空余", "可用节点"])
-                aligns.extend(["right", "right"])
-                max_widths.extend([8, 8])
+                headers.extend(["低优空余", "碎片低优", "可用节点"])
+                aligns.extend(["right", "right", "right"])
+                max_widths.extend([8, 8, 8])
             headers.extend(["总节点", "空GPU", "GPU利用率", "GPU类型"])
             aligns.extend(["right", "right", "right", "left"])
             max_widths.extend([6, 12, 9, 10])
