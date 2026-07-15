@@ -81,6 +81,7 @@ CARDING_COLORS = {
     "低优满占": "#F2C200",      # 黄：可整节点抢占
     "高优满占": "#636EFA",      # 蓝：不可回收
     "多节点混合": "#AB63FA",    # 紫：跨节点
+    "调度禁用": "#7f7f7f",      # 深灰：SchedulingDisabled/cordon，不可用
     "排队/未分配": "#c8c8c8",
     FREE_LABEL: FREE_COLOR,
 }
@@ -207,7 +208,12 @@ def render_fragmentation(ws_options):
     sdf = pd.DataFrame(all_lcg)
     sdf = sdf[sdf["total_nodes"] > 0]
 
-    k = st.columns(5)
+    # 兼容旧 payload:sched_disabled 字段可能缺(远程/旧缓存)
+    for col in ("sched_disabled_nodes", "sched_disabled_free_gpus"):
+        if col not in sdf.columns:
+            sdf[col] = 0
+
+    k = st.columns(6)
     k[0].metric("空整节点", int(sdf["empty_whole"].sum()))
     k[1].metric("低优满占整节点", int(sdf["lowpri_whole"].sum()))
     k[2].metric("碎片低优卡 🔧", int(sdf["frag_lowpri_cards"].sum()),
@@ -215,17 +221,22 @@ def render_fragmentation(ws_options):
                      "这正是 `qzcli avail --lp` 的「低优空余=0」看不到、但看板里能看到的那部分。")
     k[3].metric("碎片空卡", int(sdf["frag_free_cards"].sum()))
     k[4].metric("可凑整节点潜力", int(sdf["whole_node_potential"].sum()),
-                help="(空卡 + 碎片低优卡) // 每节点卡数，理想整合后能腾出的整节点数。")
+                help="(空卡 + 碎片低优卡) // 每节点卡数，理想整合后能腾出的整节点数。"
+                     "已剔除调度禁用节点。")
+    k[5].metric("调度禁用 ⛔", int(sdf["sched_disabled_nodes"].sum()),
+                help=f"SchedulingDisabled / cordon 节点（machine-migration / software-fault 等），"
+                     f"共 {int(sdf['sched_disabled_free_gpus'].sum())} 张空卡看着可用实则调度不上去，"
+                     "已从上面所有「可用/可凑」量里剔除。")
 
     st.subheader("① 全集群 · 各计算组：整节点 vs 碎卡")
     cols = ["workspace", "lcg", "gpu_type", "total_nodes", "empty_whole",
             "lowpri_whole", "frag_free_cards", "frag_lowpri_cards",
-            "whole_node_potential", "util_pct"]
+            "sched_disabled_nodes", "whole_node_potential", "util_pct"]
     ren = {"workspace": "工作空间", "lcg": "计算组", "gpu_type": "GPU类型",
            "total_nodes": "总节点", "empty_whole": "空整节点",
            "lowpri_whole": "低优满占整节点", "frag_free_cards": "碎片空卡",
-           "frag_lowpri_cards": "碎片低优卡", "whole_node_potential": "可凑整节点潜力",
-           "util_pct": "利用率%"}
+           "frag_lowpri_cards": "碎片低优卡", "sched_disabled_nodes": "调度禁用节点",
+           "whole_node_potential": "可凑整节点潜力", "util_pct": "利用率%"}
     view1 = sdf[cols].rename(columns=ren).sort_values(
         ["碎片低优卡", "可凑整节点潜力"], ascending=False)
     st.dataframe(view1, use_container_width=True, hide_index=True)

@@ -95,5 +95,55 @@ class FragmentationTests(unittest.TestCase):
         self.assertEqual(r["by_lcg"]["L"]["total_nodes"], 0)
 
 
+class SchedulingDisabledTests(unittest.TestCase):
+    """SchedulingDisabled / cordon 节点即便有空卡也调度不上去,必须从可用/碎卡剔除。"""
+
+    def _nm(self, **over):
+        # nA 空整(可调度) | nS 调度禁用但有空卡 | nS2 调度禁用整空
+        nm = {
+            "nA": {**_node(8, 0), "schedulable": True},
+            "nS": {**_node(8, 3), "schedulable": False,
+                   "status": "SchedulingDisabled", "cordon_type": "machine-migration"},
+            "nS2": {**_node(8, 0), "schedulable": False,
+                    "status": "SchedulingDisabled", "cordon_type": "sopa-software-fault"},
+        }
+        nm.update(over)
+        return nm
+
+    def test_disabled_node_classified_sched_disabled(self):
+        res = frag.compute_node_fragmentation(self._nm(), [])
+        cls = {n["node"]: n["class"] for n in res["nodes"]}
+        self.assertEqual(cls["nS"], frag.SCHED_DISABLED)
+        self.assertEqual(cls["nS2"], frag.SCHED_DISABLED)
+        self.assertEqual(cls["nA"], frag.EMPTY_WHOLE)
+
+    def test_disabled_excluded_from_available_counts(self):
+        a = frag.compute_node_fragmentation(self._nm(), [])["by_lcg"]["L"]
+        self.assertEqual(a["total_nodes"], 3)
+        self.assertEqual(a["sched_disabled_nodes"], 2)
+        # nS: total8 used3 → free5; nS2: total8 used0 → free8 → 合计 13
+        self.assertEqual(a["sched_disabled_free_gpus"], 5 + 8)
+        # 只有 nA 计入可用:空整1、free_total=8、碎片0
+        self.assertEqual(a["empty_whole"], 1)
+        self.assertEqual(a["frag_nodes"], 0)
+        self.assertEqual(a["free_total"], 8)          # 不含调度禁用的 13
+        self.assertEqual(a["frag_free_cards"], 0)
+        # 可凑潜力 = free_total(8) // node_size(8) = 1,不被 13 张幽灵空卡抬高
+        self.assertEqual(a["whole_node_potential"], 1)
+
+    def test_disabled_not_in_exclude_string(self):
+        res = frag.compute_node_fragmentation(self._nm(), [])
+        names = frag.fragmented_node_names(res)
+        self.assertNotIn("nS", names)
+        self.assertNotIn("nS2", names)
+
+    def test_missing_schedulable_defaults_true(self):
+        # 老数据/远程 collector 不带 schedulable → 当可调度(向后兼容)
+        nm = {"n": _node(8, 0)}   # 无 schedulable 键
+        res = frag.compute_node_fragmentation(nm, [])
+        self.assertEqual(res["nodes"][0]["class"], frag.EMPTY_WHOLE)
+        self.assertEqual(res["by_lcg"]["L"]["sched_disabled_nodes"], 0)
+
+
 if __name__ == "__main__":
     unittest.main()

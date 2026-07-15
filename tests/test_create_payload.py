@@ -54,6 +54,7 @@ def _build_args(**overrides):
         priority=None,
         framework=None,
         exclude_node=None,
+        include_node=None,
         no_track=True,
         dry_run=False,
         output_json=True,
@@ -203,6 +204,20 @@ class CreatePayloadTests(unittest.TestCase):
             rc, api = self._run_create(args)
         self.assertEqual(1, rc)  # 空节点名报错返回 1
         self.assertIsNone(api.last_payload)  # 未提交
+
+    def test_include_nodes_to_specified_nodes(self):
+        # --include-node → payload 顶层 specified_nodes(去重/strip);无 exclude_nodes
+        args = _build_args(include_node=["  n1 ", "n2", "n1"])
+        with redirect_stdout(io.StringIO()):
+            rc, api = self._run_create(args)
+        self.assertEqual(0, rc)
+        self.assertEqual(api.last_payload["specified_nodes"], ["n1", "n2"])
+        self.assertNotIn("exclude_nodes", api.last_payload)
+
+    def test_no_include_absent(self):
+        with redirect_stdout(io.StringIO()):
+            rc, api = self._run_create(_build_args())
+        self.assertNotIn("specified_nodes", api.last_payload)
 
     def _run_counting_routes(self, args):
         """跑 cmd_create，返回 {'v1':n,'v2':n} 路由计数。"""

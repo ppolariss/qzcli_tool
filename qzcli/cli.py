@@ -2110,12 +2110,20 @@ def build_node_to_lcg_map(api, workspace_id, cookie):
                 if not name:
                     continue
                 node_gpu = node.get("gpu") or {}
+                node_status = node.get("status", "")
+                cordon_type = str(node.get("cordon_type") or "").strip()
                 node_map[name] = {
                     "lcg": lcg_name,
                     "gpu_type": _short_gpu_type(node.get("gpu_type")),
                     "cluster": node.get("cluster_name", ""),
                     "gpu_total": node_gpu.get("total", 0) or 0,  # 该节点 GPU 容量
                     "gpu_used": node_gpu.get("used", 0) or 0,  # 已占用
+                    "status": node_status,
+                    "cordon_type": cordon_type,
+                    # 可调度 = Ready 且无 cordon(machine-migration/software-fault 等)。
+                    # 与 cmd_avail 的 is_schedulable 同口径:SchedulingDisabled 节点即便
+                    # 有空卡也调度不上去,碎卡计算必须排除。
+                    "schedulable": node_status == "Ready" and not cordon_type,
                 }
     return node_map
 
@@ -6291,19 +6299,30 @@ def cmd_create(args):
         ],
     }
 
-    # --- Exclude nodes（碎卡治理：排除碎卡节点，顶层 exclude_nodes，v2 选项）---
-    if getattr(args, "exclude_node", None):
+    # --- Exclude / include nodes（碎卡治理:顶层 exclude_nodes / specified_nodes，v2 选项）---
+    def _norm_nodes(raw_list, flag):
         seen = set()
-        exclude_nodes = []
-        for raw in args.exclude_node:
+        out = []
+        for raw in raw_list:
             node = str(raw).strip()
             if not node:
-                display.print_error("--exclude-node 不能为空节点名")
-                return 1
+                display.print_error(f"{flag} 不能为空节点名")
+                return None
             if node not in seen:
                 seen.add(node)
-                exclude_nodes.append(node)
-        payload["exclude_nodes"] = exclude_nodes
+                out.append(node)
+        return out
+
+    if getattr(args, "exclude_node", None):
+        vals = _norm_nodes(args.exclude_node, "--exclude-node")
+        if vals is None:
+            return 1
+        payload["exclude_nodes"] = vals
+    if getattr(args, "include_node", None):
+        vals = _norm_nodes(args.include_node, "--include-node")
+        if vals is None:
+            return 1
+        payload["specified_nodes"] = vals
 
     # --- Dataset mounting ---
     if getattr(args, "dataset", None):
@@ -7701,6 +7720,15 @@ def main():
         "配合碎卡治理：把碎卡节点排掉，逼平台把作业排到整节点。"
         "如 --exclude-node qb-prod-gpu105 --exclude-node qb-prod-gpu418。"
         "注：需 workspace 启用该能力，未启用时平台报 exclude_nodes not enable。",
+    )
+    create_parser.add_argument(
+        "--include-node",
+        dest="include_node",
+        action="append",
+        metavar="NODE",
+        help="把作业锁定到指定节点（node pinning，可多次指定 → 平台 specified_nodes）。"
+        "与 --exclude-node 相对。注：需 workspace 启用该能力，未启用时平台报 "
+        "specified_nodes not enable。",
     )
     create_parser.add_argument("--no-track", action="store_true", help="不自动追踪任务")
     create_parser.add_argument(

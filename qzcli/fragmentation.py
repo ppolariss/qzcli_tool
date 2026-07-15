@@ -22,6 +22,7 @@ EMPTY_WHOLE = "空整节点"      # 完全空闲,可直接排整节点
 LOWPRI_WHOLE = "低优满占"     # 整节点被低优占满,可整节点抢占(= avail 的"低优空余")
 FRAGMENTED = "碎卡"           # 有空卡但凑不满 / 高优+低优混合 —— 碎片来源
 HI_WHOLE = "高优满占"         # 整节点被高优占满,不可回收
+SCHED_DISABLED = "调度禁用"   # SchedulingDisabled / cordon:即便有空卡也调度不上去
 
 
 def node_low_priority_gpu(task_rows, low_pri_threshold: int = 3) -> dict:
@@ -44,7 +45,9 @@ def node_low_priority_gpu(task_rows, low_pri_threshold: int = 3) -> dict:
     return dict(low)
 
 
-def _classify(used: int, total: int, low_pri: int) -> str:
+def _classify(used: int, total: int, low_pri: int, schedulable: bool = True) -> str:
+    if not schedulable:
+        return SCHED_DISABLED    # 调度禁用:优先于其它,空卡也不可用
     if total <= 0:
         return HI_WHOLE          # 异常节点(gpu_total=0),不计入可用统计
     if used <= 0:
@@ -68,6 +71,8 @@ def compute_node_fragmentation(node_map, task_rows, low_pri_threshold: int = 3) 
         lp = min(int(low.get(name, 0) or 0), used)   # 摊出来的低优不会超过已用
         free = max(0, total - used)
         hp = max(0, used - lp)
+        # 老数据/远程 collector 可能不带 schedulable → 默认可调度(向后兼容)。
+        schedulable = info.get("schedulable", True)
         nodes.append({
             "node": name,
             "lcg": info.get("lcg", ""),
@@ -75,7 +80,10 @@ def compute_node_fragmentation(node_map, task_rows, low_pri_threshold: int = 3) 
             "cluster": info.get("cluster", ""),
             "total": total, "used": used, "free": free,
             "low_pri": lp, "high_pri": hp,
-            "class": _classify(used, total, lp),
+            "schedulable": schedulable,
+            "status": info.get("status", ""),
+            "cordon_type": info.get("cordon_type", ""),
+            "class": _classify(used, total, lp, schedulable),
         })
 
     by_lcg: dict = {}
@@ -95,6 +103,7 @@ def compute_node_fragmentation(node_map, task_rows, low_pri_threshold: int = 3) 
                 "hi_whole": 0, "frag_nodes": 0,
                 "frag_free_cards": 0, "frag_lowpri_cards": 0,
                 "free_total": 0, "total_gpus": 0, "used_gpus": 0,
+                "sched_disabled_nodes": 0, "sched_disabled_free_gpus": 0,
                 "node_size": size,
             }
         if n["total"] <= 0:
@@ -102,6 +111,12 @@ def compute_node_fragmentation(node_map, task_rows, low_pri_threshold: int = 3) 
         agg["total_nodes"] += 1
         agg["total_gpus"] += n["total"]
         agg["used_gpus"] += n["used"]
+        # 调度禁用节点:即便有空卡也调度不上去 → 单列出来,不计入任何"可用/可回收"量
+        # (free_total / 碎片卡 / 空整节点 / 可凑潜力 全不含它),避免高估容量。
+        if n["class"] == SCHED_DISABLED:
+            agg["sched_disabled_nodes"] += 1
+            agg["sched_disabled_free_gpus"] += n["free"]
+            continue
         agg["free_total"] += n["free"]
         cls = n["class"]
         if cls == EMPTY_WHOLE:
