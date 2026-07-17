@@ -180,6 +180,34 @@ def _curl_post(
     )
 
 
+def _unwrap_v2_result(data: Dict[str, Any]) -> Dict[str, Any]:
+    """解封装 v2 Console API 响应（AWS 风格 RPC）。
+
+    错误：`ResponseMetadata.Error`{Code,Message} 或 legacy `code not in (None,0)`。
+    成功：取 `Result`（dict），缺则回退 legacy `data`。与平台 Web UI 一致。
+    """
+    if not isinstance(data, dict):
+        return {}
+    meta = data.get("ResponseMetadata")
+    if isinstance(meta, dict):
+        err = meta.get("Error")
+        if isinstance(err, dict):
+            code = err.get("Code") or "Error"
+            message = err.get("Message") or "未知错误"
+            raise QzAPIError(f"API 请求失败: {code}: {message}")
+    elif data.get("code") not in (None, 0):
+        raise QzAPIError(
+            f"API 请求失败: {data.get('message', '未知错误')}", data.get("code")
+        )
+    result = data.get("Result")
+    if isinstance(result, dict):
+        return result
+    legacy = data.get("data")
+    if isinstance(legacy, dict):
+        return legacy
+    return {}
+
+
 def build_resource_spec_price(
     spec_obj: Dict[str, Any], compute_group_id: str
 ) -> Dict[str, Any]:
@@ -618,6 +646,33 @@ class QzAPI:
                 f"API 请求失败: {result.get('message', '未知错误')}", result.get("code")
             )
         return result.get("data", result)
+
+    def create_job_v2(self, cookie: str, config: Dict[str, Any]) -> Dict[str, Any]:
+        """创建任务（当前 Web UI v2 Console API）。
+
+        平台 Web UI 已把作业生命周期迁到 `/api/v2/train?Action=CreateJobConsole`
+        （AWS 风格 RPC）。payload 结构与 v1 `create_job_with_cookie` 相同（同顶层
+        key + framework_config[0] + 嵌套 resource_spec_price），差别只在 endpoint、
+        响应封装（ResponseMetadata/Result）和新增的 `exclude_nodes` 等 v2 选项。
+        """
+        url = f"{self.base_url}/api/v2/train?Action=CreateJobConsole"
+        workspace_id = config.get("workspace_id", "")
+        headers = {
+            "accept": "application/json, text/plain, */*",
+            "content-type": "application/json",
+            "cookie": cookie,
+            "origin": "https://qz.sii.edu.cn",
+            "referer": f"https://qz.sii.edu.cn/jobs/distributedTraining?spaceId={workspace_id}",
+            "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36",
+        }
+        response = _curl_post(url, json=config, headers=headers, timeout=60)
+        if response.status_code == 401:
+            raise QzAPIError("Cookie 已过期或无效，请重新获取", 401)
+        if response.status_code != 200:
+            raise QzAPIError(
+                f"请求失败: HTTP {response.status_code}", response.status_code
+            )
+        return _unwrap_v2_result(response.json())
 
     @with_auth_retry
     def create_hpc_job(

@@ -1533,6 +1533,11 @@ def cmd_avail(args):
             gpu_free_distribution = {}  # free_gpu_count -> node_count
             total_free_gpus = 0
             total_gpus = 0
+            # 碎卡:散在"非整块"节点上、凑不成整节点的可回收卡
+            # （低优空余只数"整节点 100% 低优"，看不到这部分——就是看板里那些低优卡）
+            fragmented_low_priority = 0
+            fragmented_free = 0
+            fragmented_free_node_list = []  # 有空卡的碎卡节点(可 --exclude-node 避开)
 
             for node in nodes:
                 node_name = node.get("name", "")
@@ -1583,6 +1588,13 @@ def cmd_avail(args):
                                 "gpu_total": gpu_total,
                             }
                         )
+                    elif low_priority_gpu > 0:
+                        # 低优没占满整节点 → 碎片低优卡(可抢占但凑不成整节点)
+                        fragmented_low_priority += min(low_priority_gpu, gpu_used)
+                    # 空卡散在已被占用的节点上 → 碎片空卡;记下节点名供 --exclude-node
+                    if 0 < gpu_free < gpu_total:
+                        fragmented_free += gpu_free
+                        fragmented_free_node_list.append(node_name)
 
             workspace_results.append(
                 {
@@ -1596,6 +1608,9 @@ def cmd_avail(args):
                     "free_node_list": free_nodes,
                     "low_priority_free_nodes": len(low_priority_free_nodes),
                     "low_priority_free_node_list": low_priority_free_nodes,
+                    "fragmented_low_priority_gpus": fragmented_low_priority,
+                    "fragmented_free_gpus": fragmented_free,
+                    "fragmented_free_node_list": fragmented_free_node_list,
                     "total_gpus": total_gpus,
                     "total_free_gpus": total_free_gpus,
                     "gpu_free_distribution": gpu_free_distribution,
@@ -1706,6 +1721,16 @@ def cmd_avail(args):
             ):
                 lp_node_names = [n["name"] for n in r["low_priority_free_node_list"]]
                 display.print(f"  [dim]低优空余: {', '.join(lp_node_names)}[/dim]")
+            # 碎卡治理:有空卡的碎卡节点 → 可直接粘的 --exclude-node 串,
+            # 提交时排掉它们逼调度器用整节点/空节点。
+            if args.verbose and r.get("fragmented_free_node_list"):
+                from .fragmentation import format_exclude_args
+
+                excl = format_exclude_args(r["fragmented_free_node_list"])
+                if excl:
+                    display.print(
+                        f"  [dim]避开碎卡(粘到 qzcli create 后): {excl}[/dim]"
+                    )
 
         # 导出格式
         if args.export:
@@ -1787,6 +1812,7 @@ def cmd_avail(args):
             table.add_column("空节点", justify="right")
             if args.low_priority:
                 table.add_column("低优空余", justify="right")
+                table.add_column("碎片低优", justify="right")
                 table.add_column("可用节点", justify="right")
             table.add_column("总节点", justify="right", style="dim")
             table.add_column("空GPU", justify="right")
@@ -1808,6 +1834,10 @@ def cmd_avail(args):
                     f"[yellow]{low_priority_free}[/yellow]"
                     if low_priority_free > 0
                     else "[dim]0[/dim]"
+                )
+                frag_lp = r.get("fragmented_low_priority_gpus", 0)
+                frag_lp_text = (
+                    f"[magenta]{frag_lp}[/magenta]" if frag_lp > 0 else "[dim]0[/dim]"
                 )
                 total_available_text = (
                     f"[green]{total_available}[/green]"
@@ -1835,7 +1865,7 @@ def cmd_avail(args):
                     free_nodes_text,
                 ]
                 if args.low_priority:
-                    row.extend([low_priority_text, total_available_text])
+                    row.extend([low_priority_text, frag_lp_text, total_available_text])
                 row.extend(
                     [
                         str(r.get("total_nodes", 0)),
@@ -1861,7 +1891,9 @@ def cmd_avail(args):
                 if args.low_priority:
                     low_priority_free = r.get("low_priority_free_nodes", 0)
                     row.extend(
-                        [low_priority_free, r.get("free_nodes", 0) + low_priority_free]
+                        [low_priority_free,
+                         r.get("fragmented_low_priority_gpus", 0),
+                         r.get("free_nodes", 0) + low_priority_free]
                     )
                 row.extend(
                     [
@@ -1877,9 +1909,9 @@ def cmd_avail(args):
             aligns = ["right", "left", "left", "right"]
             max_widths = [4, 24, 30, 6]
             if args.low_priority:
-                headers.extend(["低优空余", "可用节点"])
-                aligns.extend(["right", "right"])
-                max_widths.extend([8, 8])
+                headers.extend(["低优空余", "碎片低优", "可用节点"])
+                aligns.extend(["right", "right", "right"])
+                max_widths.extend([8, 8, 8])
             headers.extend(["总节点", "空GPU", "GPU利用率", "GPU类型"])
             aligns.extend(["right", "right", "right", "left"])
             max_widths.extend([6, 12, 9, 10])
@@ -2007,7 +2039,7 @@ _JOB_DETAIL_PATH_BY_TYPE = {
 }
 
 
-def fetch_all_task_dimensions(api, workspace_id, cookie, page_size=200, max_workers=8):
+def fetch_all_task_dimensions(api, workspace_id, cookie, page_size=200, max_workers=4):
     """分页获取工作空间**当前在跑**任务的资源维度数据（list_task_dimension）。
 
     第一页即返回 ``total``，据此算出总页数后并发拉取其余页（顺序无关，聚合/可视
@@ -2070,20 +2102,29 @@ def build_node_to_lcg_map(api, workspace_id, cookie):
         )
         return lcg_name, nodes
 
-    # 各 lcg 的节点查询相互独立，并发拉取
-    with ThreadPoolExecutor(max_workers=8) as executor:
+    # 各 lcg 的节点查询相互独立，并发拉取。内层并发压到 4 削平对启智的读取峰值 QPS
+    # (看板里外层 workspace 并发 × 此内层 = 峰值,见 dashboard load_all_frag)。
+    with ThreadPoolExecutor(max_workers=4) as executor:
         for lcg_name, nodes in executor.map(_fetch, lcgs):
             for node in nodes:
                 name = node.get("name")
                 if not name:
                     continue
                 node_gpu = node.get("gpu") or {}
+                node_status = node.get("status", "")
+                cordon_type = str(node.get("cordon_type") or "").strip()
                 node_map[name] = {
                     "lcg": lcg_name,
                     "gpu_type": _short_gpu_type(node.get("gpu_type")),
                     "cluster": node.get("cluster_name", ""),
                     "gpu_total": node_gpu.get("total", 0) or 0,  # 该节点 GPU 容量
                     "gpu_used": node_gpu.get("used", 0) or 0,  # 已占用
+                    "status": node_status,
+                    "cordon_type": cordon_type,
+                    # 可调度 = Ready 且无 cordon(machine-migration/software-fault 等)。
+                    # 与 cmd_avail 的 is_schedulable 同口径:SchedulingDisabled 节点即便
+                    # 有空卡也调度不上去,碎卡计算必须排除。
+                    "schedulable": node_status == "Ready" and not cordon_type,
                 }
     return node_map
 
@@ -6259,6 +6300,31 @@ def cmd_create(args):
         ],
     }
 
+    # --- Exclude / include nodes（碎卡治理:顶层 exclude_nodes / specified_nodes，v2 选项）---
+    def _norm_nodes(raw_list, flag):
+        seen = set()
+        out = []
+        for raw in raw_list:
+            node = str(raw).strip()
+            if not node:
+                display.print_error(f"{flag} 不能为空节点名")
+                return None
+            if node not in seen:
+                seen.add(node)
+                out.append(node)
+        return out
+
+    if getattr(args, "exclude_node", None):
+        vals = _norm_nodes(args.exclude_node, "--exclude-node")
+        if vals is None:
+            return 1
+        payload["exclude_nodes"] = vals
+    if getattr(args, "include_node", None):
+        vals = _norm_nodes(args.include_node, "--include-node")
+        if vals is None:
+            return 1
+        payload["specified_nodes"] = vals
+
     # --- Dataset mounting ---
     if getattr(args, "dataset", None):
         dataset_info = []
@@ -6310,14 +6376,16 @@ def cmd_create(args):
     display.print("")
 
     # --- Submit ---
-    # 优先走 cookie auth (/api/v1/train_job/create)：它接受 framework_config[0]
-    # 顶层的 cpu/mem_gi 字段；老的 openapi 路径 (/openapi/v1/train_job/create)
-    # 用 protobuf 校验，会拒掉同样的字段。CAS 用户的 token path 也常因
-    # invalid_grant 失败，cookie path 是项目主推方向。
+    # 平台 Web UI 已把作业创建迁到 v2 Console API
+    # (/api/v2/train?Action=CreateJobConsole)，payload 结构与 v1 一致。已真机验证 v2
+    # create 可正常创建作业(job-1434c06e 提交并停止成功)，故默认走 create_job_v2；
+    # 老 v1 create_job_with_cookie 保留作回退。无 cookie 时退老 openapi token path。
+    # 注：exclude_nodes 需 workspace 级启用，未启用的空间平台会报
+    # "exclude_nodes not enable in workspace"(如 分布式训练空间)。
     try:
         cookie_data = get_cookie()
         if cookie_data and cookie_data.get("cookie"):
-            result = api.create_job_with_cookie(cookie_data["cookie"], payload)
+            result = api.create_job_v2(cookie_data["cookie"], payload)
         else:
             result = api.create_job(payload)
     except QzAPIError as e:
@@ -7675,6 +7743,25 @@ def main():
         action="append",
         metavar="ID:VERSION",
         help="挂载公共数据集，格式 dataset_id:version_id（可多次指定），如 --dataset open-p2p-full:v1 --dataset videogamebunny:v1",
+    )
+    create_parser.add_argument(
+        "--exclude-node",
+        dest="exclude_node",
+        action="append",
+        metavar="NODE",
+        help="排除某个 Ready 节点不参与本作业调度（可多次指定，非节点锁定）。"
+        "配合碎卡治理：把碎卡节点排掉，逼平台把作业排到整节点。"
+        "如 --exclude-node qb-prod-gpu105 --exclude-node qb-prod-gpu418。"
+        "注：需 workspace 启用该能力，未启用时平台报 exclude_nodes not enable。",
+    )
+    create_parser.add_argument(
+        "--include-node",
+        dest="include_node",
+        action="append",
+        metavar="NODE",
+        help="把作业锁定到指定节点（node pinning，可多次指定 → 平台 specified_nodes）。"
+        "与 --exclude-node 相对。注：需 workspace 启用该能力，未启用时平台报 "
+        "specified_nodes not enable。",
     )
     create_parser.add_argument("--no-track", action="store_true", help="不自动追踪任务")
     create_parser.add_argument(

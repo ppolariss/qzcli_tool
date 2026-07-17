@@ -9,7 +9,7 @@ import argparse
 import io
 import json
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
 
 from qzcli import cli
@@ -26,6 +26,11 @@ class _FakeAPI:
         return {"job_id": "job-fake-1", "workspace_id": "ws-test"}
 
     def create_job_with_cookie(self, cookie, payload):
+        self.last_payload = payload
+        return {"job_id": "job-fake-1", "workspace_id": "ws-test"}
+
+    def create_job_v2(self, cookie, payload):
+        # cmd_create 现在主走 v2 Console API；捕获同一个 payload。
         self.last_payload = payload
         return {"job_id": "job-fake-1", "workspace_id": "ws-test"}
 
@@ -48,6 +53,8 @@ def _build_args(**overrides):
         shm=None,
         priority=None,
         framework=None,
+        exclude_node=None,
+        include_node=None,
         no_track=True,
         dry_run=False,
         output_json=True,
@@ -83,9 +90,10 @@ _FAKE_RESOURCES = {
 
 
 class CreatePayloadTests(unittest.TestCase):
-    def _run_create(self):
+    def _run_create(self, args=None):
         api = _FakeAPI()
-        args = _build_args()
+        if args is None:
+            args = _build_args()
 
         # Patch the singletons cmd_create reaches for, plus the resource-cache
         # accessors it uses to resolve names → ids. We feed everything from
@@ -173,6 +181,79 @@ class CreatePayloadTests(unittest.TestCase):
         self.assertEqual(28, fc["cpu"])
         self.assertEqual(240, fc["mem_gi"])
         self.assertEqual(1, fc["gpu_count"])
+
+    # ---- exclude_nodes (碎卡治理，v2 顶层选项) ----
+
+    def test_no_exclude_node_absent_from_payload(self):
+        with redirect_stdout(io.StringIO()):
+            rc, api = self._run_create(_build_args())
+        self.assertEqual(0, rc)
+        self.assertNotIn("exclude_nodes", api.last_payload)
+
+    def test_exclude_nodes_dedup_and_strip(self):
+        args = _build_args(exclude_node=["  gpu-a ", "gpu-b", "gpu-a"])
+        with redirect_stdout(io.StringIO()):
+            rc, api = self._run_create(args)
+        self.assertEqual(0, rc)
+        # 顶层、去重、strip、保序
+        self.assertEqual(api.last_payload["exclude_nodes"], ["gpu-a", "gpu-b"])
+
+    def test_exclude_empty_name_rejected(self):
+        args = _build_args(exclude_node=["gpu-a", "   "])
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            rc, api = self._run_create(args)
+        self.assertEqual(1, rc)  # 空节点名报错返回 1
+        self.assertIsNone(api.last_payload)  # 未提交
+
+    def test_include_nodes_to_specified_nodes(self):
+        # --include-node → payload 顶层 specified_nodes(去重/strip);无 exclude_nodes
+        args = _build_args(include_node=["  n1 ", "n2", "n1"])
+        with redirect_stdout(io.StringIO()):
+            rc, api = self._run_create(args)
+        self.assertEqual(0, rc)
+        self.assertEqual(api.last_payload["specified_nodes"], ["n1", "n2"])
+        self.assertNotIn("exclude_nodes", api.last_payload)
+
+    def test_no_include_absent(self):
+        with redirect_stdout(io.StringIO()):
+            rc, api = self._run_create(_build_args())
+        self.assertNotIn("specified_nodes", api.last_payload)
+
+    def _run_counting_routes(self, args):
+        """跑 cmd_create，返回 {'v1':n,'v2':n} 路由计数。"""
+        api = _FakeAPI()
+        calls = {"v1": 0, "v2": 0}
+        _v1 = api.create_job_with_cookie
+        _v2 = api.create_job_v2
+        api.create_job_with_cookie = lambda c, p: calls.__setitem__("v1", calls["v1"] + 1) or _v1(c, p)
+        api.create_job_v2 = lambda c, p: calls.__setitem__("v2", calls["v2"] + 1) or _v2(c, p)
+        patches = [
+            mock.patch("qzcli.cli.get_api", return_value=api),
+            mock.patch("qzcli.cli.get_store", return_value=mock.MagicMock(add_job=lambda *_: None)),
+            mock.patch("qzcli.cli.get_workspace_resources", side_effect=lambda w: _FAKE_RESOURCES.get(w)),
+            mock.patch("qzcli.cli.find_workspace_by_name", return_value="ws-test"),
+            mock.patch("qzcli.cli.get_cookie", return_value={"cookie": "fake"}),
+            mock.patch("qzcli.cli._auto_select_resource", return_value=("project-test", "p")),
+            mock.patch("qzcli.cli._validate_cached_resource_membership", return_value=True),
+            mock.patch("qzcli.cli._validate_cached_spec_membership", return_value=True),
+        ]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+        with redirect_stdout(io.StringIO()):
+            rc = cli.cmd_create(args)
+        self.assertEqual(0, rc)
+        return calls
+
+    def test_plain_create_routes_v2(self):
+        # 迁 v2:普通 create 走 v2 Console API(已真机验证)。
+        calls = self._run_counting_routes(_build_args())
+        self.assertEqual((calls["v1"], calls["v2"]), (0, 1))
+
+    def test_exclude_node_routes_v2(self):
+        # 带 --exclude-node 也走 v2（exclude_nodes 是 v2 顶层选项）。
+        calls = self._run_counting_routes(_build_args(exclude_node=["gpu-x"]))
+        self.assertEqual((calls["v1"], calls["v2"]), (0, 1))
 
 
 if __name__ == "__main__":

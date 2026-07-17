@@ -11,12 +11,14 @@ treemap/sunburst：块面积 = GPU 数，默认自顶向下按
 """
 
 import os
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 
 import pandas as pd
 import plotly.express as px
 import streamlit as st
 
-from qzcli import cli
+from qzcli import cli, fragmentation
 from qzcli.api import QzAPIError, get_api
 from qzcli.config import (
     find_workspace_by_name,
@@ -26,16 +28,18 @@ from qzcli.config import (
 )
 
 # 可作为下钻层级 / 筛选的维度列（顺序即默认下钻顺序）
-HIERARCHY_DIMS = ["计算组", "GPU类型", "集群", "优先级档", "任务类型", "项目", "用户"]
+# 「节点」= 物理节点(host)，可下钻 计算组→节点→任务 看每个节点摞了谁。
+HIERARCHY_DIMS = ["计算组", "节点", "GPU类型", "集群", "优先级档", "任务类型", "项目", "用户"]
 DEFAULT_HIERARCHY = ["计算组", "优先级档", "项目", "用户"]
 COLOR_DIMS = [
     "优先级档",
+    "整节点/碎卡",
     "任务类型",
     "计算组",
     "GPU利用率(空占卡预警)",
     "运行时长(越久越红)",
 ]
-FILTER_DIMS = ["计算组", "优先级档", "任务类型", "项目", "用户", "状态"]
+FILTER_DIMS = ["计算组", "节点分类", "优先级档", "任务类型", "项目", "用户", "状态"]
 LEAF = "任务名"
 
 # 连续配色维度 -> (数据列, 色阶, 固定区间 or None, 中点 or None)
@@ -68,8 +72,22 @@ PRIORITY_COLORS = {
     FREE_LABEL: FREE_COLOR,
 }
 
+# 「整节点/碎卡」配色维度 → 数据列 别名 + 固定调色板（碎卡=红最扎眼）
+CARDING_COLOR_DIM = "整节点/碎卡"
+CARDING_COL = "节点分类"
+CARDING_COLORS = {
+    "碎卡": "#EF553B",          # 红：治理重点
+    "空整节点": "#00CC96",      # 绿：可直接排
+    "低优满占": "#F2C200",      # 黄：可整节点抢占
+    "高优满占": "#636EFA",      # 蓝：不可回收
+    "多节点混合": "#AB63FA",    # 紫：跨节点
+    "调度禁用": "#7f7f7f",      # 深灰：SchedulingDisabled/cordon，不可用
+    "排队/未分配": "#c8c8c8",
+    FREE_LABEL: FREE_COLOR,
+}
 
-@st.cache_data(ttl=90, show_spinner="拉取任务与计算组映射中…")
+
+@st.cache_data(ttl=300, show_spinner="拉取任务与计算组映射中…")
 def load_df(ws_id, ws_name):
     """拉取在跑任务 + 计算组映射。
 
@@ -85,6 +103,21 @@ def load_df(ws_id, ws_name):
     tasks = cli.fetch_all_task_dimensions(api, ws_id, cookie)
     rows = [cli.task_dimension_to_row(t, node_map, ws_id) for t in tasks]
 
+    # 给每个任务标「节点分类」= 它所在物理节点的整节点/碎卡状态（零额外拉数，
+    # 复用碎卡聚合的 per-node class）。这样主 treemap 可直接按碎卡配色/下钻，
+    # 把"成分"和"碎卡治理"接到同一张图。
+    frag = fragmentation.compute_node_fragmentation(node_map, rows)
+    node_class = {n["node"]: n["class"] for n in frag["nodes"]}
+    for r in rows:
+        hosts = [h for h in str(r.get("节点", "") or "").split(",") if h]
+        classes = {node_class.get(h) for h in hosts if node_class.get(h)}
+        if not classes:
+            r["节点分类"] = "排队/未分配"
+        elif len(classes) == 1:
+            r["节点分类"] = next(iter(classes))
+        else:
+            r["节点分类"] = "多节点混合"
+
     # 每个计算组的空闲 GPU（按节点容量 − 已用聚合，去重到节点粒度）
     cap, used = {}, {}
     for info in node_map.values():
@@ -93,6 +126,183 @@ def load_df(ws_id, ws_name):
         used[lcg] = used.get(lcg, 0) + info.get("gpu_used", 0)
     free_by_lcg = {lcg: max(cap[lcg] - used.get(lcg, 0), 0) for lcg in cap}
     return pd.DataFrame(rows), free_by_lcg
+
+
+def _frag_one(ws_id):
+    """单个 workspace 的节点碎卡聚合(复用与 load_df 相同的数据源)。无 streamlit,
+    可在线程里调。"""
+    api = get_api()
+    cookie_data = get_cookie()
+    if not cookie_data or not cookie_data.get("cookie"):
+        raise QzAPIError("未设置 cookie，请先运行: qzcli login")
+    cookie = cookie_data["cookie"]
+    node_map = cli.build_node_to_lcg_map(api, ws_id, cookie)
+    tasks = cli.fetch_all_task_dimensions(api, ws_id, cookie)
+    rows = [cli.task_dimension_to_row(t, node_map, ws_id) for t in tasks]
+    res = fragmentation.compute_node_fragmentation(node_map, rows)
+    # 只保留「我的碎片分布」需要的最小行,避免 payload 膨胀
+    res["rows"] = [
+        {"用户": r.get("用户", ""), "节点": r.get("节点", ""),
+         "GPU": r.get("GPU", 0), "优先级": r.get("优先级", 10)}
+        for r in rows
+    ]
+    return res
+
+
+@st.cache_data(ttl=300, show_spinner="拉取全集群节点占用中…")
+def load_all_frag(ws_items):
+    """跨所有 workspace 并行拉取 + 合并。ws_items = ((ws_id, ws_name), ...)(元组以便缓存)。
+    返回 (all_lcg, all_nodes, all_rows),每条带 workspace 标签。"""
+    all_lcg, all_nodes, all_rows = [], [], []
+
+    def work(item):
+        wid, wname = item
+        try:
+            return wname, _frag_one(wid)
+        except Exception:
+            return wname, None
+
+    # 外层 workspace 并发。与 build_node_to_lcg_map 的内层 LCG 并发相乘 = 峰值并发,
+    # 故压到 4：4×4=16 并发,削平对启智的读取峰值 QPS(实测 76→~16)。
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        for wname, fr in ex.map(work, ws_items):
+            if not fr:
+                continue
+            for a in fr["by_lcg"].values():
+                r = dict(a)
+                r["workspace"] = wname
+                all_lcg.append(r)
+            for nd in fr["nodes"]:
+                d = dict(nd)
+                d["workspace"] = wname
+                all_nodes.append(d)
+            for r in fr["rows"]:
+                r2 = dict(r)
+                r2["workspace"] = wname
+                all_rows.append(r2)
+    return all_lcg, all_nodes, all_rows
+
+
+# 猜测「我」是谁(用于「我的碎片分布」默认选中)
+_ME_HINTS = ("梁天一", "liangtianyi", "253208120278")
+
+
+def _guess_me(users):
+    for u in users:
+        if any(h in str(u) for h in _ME_HINTS):
+            return u
+    return users[0] if users else None
+
+
+def render_fragmentation(ws_options):
+    """跨所有 workspace 的「整节点 / 碎卡治理」视图。"""
+    st.markdown(
+        "整节点 = **空整节点**(可直接排) + **低优满占**(可整节点抢占)；"
+        "碎卡 = 散在混合节点上的**空卡** + **可回收低优卡**，凑不成整节点。"
+        "跨所有 workspace 聚合。"
+    )
+    all_lcg, all_nodes, all_rows = load_all_frag(tuple(ws_options))
+
+    if not all_lcg:
+        st.info("没拉到节点数据。先在终端 `qzcli login` + `qzcli res -u`，再点上方「🔄 刷新数据」。")
+        return
+
+    sdf = pd.DataFrame(all_lcg)
+    sdf = sdf[sdf["total_nodes"] > 0]
+
+    # 兼容旧 payload:sched_disabled 字段可能缺(远程/旧缓存)
+    for col in ("sched_disabled_nodes", "sched_disabled_free_gpus"):
+        if col not in sdf.columns:
+            sdf[col] = 0
+
+    k = st.columns(6)
+    k[0].metric("空整节点", int(sdf["empty_whole"].sum()))
+    k[1].metric("低优满占整节点", int(sdf["lowpri_whole"].sum()))
+    k[2].metric("碎片低优卡 🔧", int(sdf["frag_lowpri_cards"].sum()),
+                help="散在高低优混合节点上的低优卡，可抢占但凑不成整节点——治理重点；"
+                     "这正是 `qzcli avail --lp` 的「低优空余=0」看不到、但看板里能看到的那部分。")
+    k[3].metric("碎片空卡", int(sdf["frag_free_cards"].sum()))
+    k[4].metric("可凑整节点潜力", int(sdf["whole_node_potential"].sum()),
+                help="(空卡 + 碎片低优卡) // 每节点卡数，理想整合后能腾出的整节点数。"
+                     "已剔除调度禁用节点。")
+    k[5].metric("调度禁用 ⛔", int(sdf["sched_disabled_nodes"].sum()),
+                help=f"SchedulingDisabled / cordon 节点（machine-migration / software-fault 等），"
+                     f"共 {int(sdf['sched_disabled_free_gpus'].sum())} 张空卡看着可用实则调度不上去，"
+                     "已从上面所有「可用/可凑」量里剔除。")
+
+    st.subheader("① 全集群 · 各计算组：整节点 vs 碎卡")
+    cols = ["workspace", "lcg", "gpu_type", "total_nodes", "empty_whole",
+            "lowpri_whole", "frag_free_cards", "frag_lowpri_cards",
+            "sched_disabled_nodes", "whole_node_potential", "util_pct"]
+    ren = {"workspace": "工作空间", "lcg": "计算组", "gpu_type": "GPU类型",
+           "total_nodes": "总节点", "empty_whole": "空整节点",
+           "lowpri_whole": "低优满占整节点", "frag_free_cards": "碎片空卡",
+           "frag_lowpri_cards": "碎片低优卡", "sched_disabled_nodes": "调度禁用节点",
+           "whole_node_potential": "可凑整节点潜力", "util_pct": "利用率%"}
+    view1 = sdf[cols].rename(columns=ren).sort_values(
+        ["碎片低优卡", "可凑整节点潜力"], ascending=False)
+    st.dataframe(view1, use_container_width=True, hide_index=True)
+
+    # ---- 桥:选一个要提交的计算组 → 一键拿它的碎卡节点排除参数 ----
+    st.markdown("**🔧 提交时避开碎卡** — 选你要提交作业的计算组，把它"
+                "**有空卡的碎卡节点**排掉，逼调度器用整节点/空节点(避免作业被塞进碎片):")
+    frag_all = {"nodes": all_nodes}
+    lcg_opts = sorted({n["lcg"] for n in all_nodes
+                       if n.get("class") == fragmentation.FRAGMENTED and n.get("lcg")})
+    if lcg_opts:
+        pick = st.selectbox("计算组", lcg_opts, key="exclude_lcg")
+        names = fragmentation.fragmented_node_names(frag_all, lcg=pick, only_free=True)
+        if names:
+            st.caption(f"{pick}:{len(names)} 个有空卡的碎卡节点 → 粘到 `qzcli create` 后面")
+            st.code(fragmentation.format_exclude_args(names), language="bash")
+        else:
+            st.success(f"{pick} 没有「有空卡的碎卡节点」，无需排除 👍")
+    else:
+        st.caption("当前没有可排除的碎卡节点。")
+
+    st.subheader("② 我的碎片分布(我的卡散在哪些节点)")
+    users = sorted({r["用户"] for r in all_rows if r.get("用户")})
+    if not users:
+        st.info("当前无在跑任务。")
+        return
+    mc1, mc2 = st.columns([3, 1])
+    me_default = _guess_me(users)
+    with mc1:
+        me = st.selectbox("用户", users,
+                          index=users.index(me_default) if me_default in users else 0)
+    with mc2:
+        only_frag = st.checkbox("只看碎卡节点", value=True)
+    my_by_node = defaultdict(int)
+    for r in all_rows:
+        if r.get("用户") != me:
+            continue
+        nodes = [x for x in str(r.get("节点", "") or "").split(",") if x]
+        g = int(r.get("GPU", 0) or 0)
+        if not nodes or g <= 0:
+            continue
+        per = g // len(nodes) if len(nodes) > 1 else g
+        for x in nodes:
+            my_by_node[x] += per
+    rec = {d["node"]: d for d in all_nodes}
+    myrows = []
+    for node, mycards in sorted(my_by_node.items(), key=lambda kv: -kv[1]):
+        d = rec.get(node, {})
+        myrows.append({"节点": node, "工作空间": d.get("workspace", ""),
+                       "计算组": d.get("lcg", ""), "总卡": d.get("total", 0),
+                       "已用": d.get("used", 0), "空闲": d.get("free", 0),
+                       "我的卡": mycards, "节点低优卡": d.get("low_pri", 0),
+                       "分类": d.get("class", "")})
+    if not myrows:
+        st.info(f"{me} 当前无占卡任务。")
+        return
+    frag_cnt = sum(1 for r in myrows if r["分类"] == fragmentation.FRAGMENTED)
+    st.caption(f"**{me}** 的卡分散在 **{len(myrows)}** 个节点，其中 **{frag_cnt}** 个是碎卡节点"
+               "(整节点没占满 / 高低优混合)——把这些迁走或凑整能少占节点。")
+    shown = [r for r in myrows if r["分类"] == fragmentation.FRAGMENTED] if only_frag else myrows
+    if not shown:
+        st.success("我没有碎卡节点 👍(卡都落在整节点上)。取消勾选可看全部。")
+        return
+    st.dataframe(pd.DataFrame(shown), use_container_width=True, hide_index=True)
 
 
 def _free_rows(free_by_lcg, keep_lcgs):
@@ -117,6 +327,7 @@ def _free_rows(free_by_lcg, keep_lcgs):
                 "状态": FREE_LABEL,
                 "节点数": 0,
                 "节点": "",
+                "节点分类": FREE_LABEL,
                 "运行时长h": 0.0,
                 "创建时间": "",
                 "job_url": "",
@@ -130,7 +341,8 @@ def _node_customdata(fig, gdf, path_cols, root):
     """为 treemap 每个节点（含内部节点）算聚合明细。
 
     px 只能把 `values`(GPU) 沿树求和，其它列在内部节点会变 NaN/(?)；这里按节点
-    的完整路径匹配 gdf 叶子行，自己算：[任务数, GPU 加权平均利用率, 最长运行h, 类型]。
+    的完整路径匹配 gdf 叶子行，自己算：
+    [任务数, GPU 加权平均利用率, 最长运行h, 类型, 占用节点数(去重 host)]。
     """
     sep = "/"
     fp = gdf[path_cols].astype(str).agg(sep.join, axis=1)
@@ -139,6 +351,7 @@ def _node_customdata(fig, gdf, path_cols, root):
     rt = gdf["运行时长h"].to_numpy()
     cnt = gdf["任务数"].to_numpy()
     types = gdf["任务类型"].astype(str).to_numpy()
+    node_cells = gdf["节点"].astype(str).to_numpy() if "节点" in gdf else None
     out = []
     for nid in fig.data[0].ids:
         if nid == root:
@@ -152,7 +365,16 @@ def _node_customdata(fig, gdf, path_cols, root):
         mrt = float(rt[mask].max()) if len(g) else 0.0
         uniq = set(types[mask].tolist())
         tstr = next(iter(uniq)) if len(uniq) == 1 else f"{len(uniq)}类混合"
-        out.append([int(cnt[mask].sum()), wutil, mrt, tstr])
+        # 去重的 host 名 → 该子树实际占用的物理节点数（共享节点只算一次）
+        nnodes = 0
+        if node_cells is not None:
+            hosts = set()
+            for cell in node_cells[mask]:
+                for h in cell.split(","):
+                    if h:
+                        hosts.add(h)
+            nnodes = len(hosts)
+        out.append([int(cnt[mask].sum()), wutil, mrt, tstr, nnodes])
     return out
 
 
@@ -222,10 +444,18 @@ def main():
         st.error(f"{e}\n\n请在终端运行 `qzcli login` 后点上方「🔄 刷新数据」。")
         st.stop()
 
-    if df.empty:
-        st.info("当前没有在跑任务。")
-        st.stop()
+    tab_comp, tab_frag = st.tabs(["📊 成分下钻（treemap）", "🧱 整节点 / 碎卡治理"])
+    with tab_comp:
+        if df.empty:
+            st.info("当前没有在跑任务。")
+        else:
+            render_composition(df, free_by_lcg, ws_name)
+    with tab_frag:
+        render_fragmentation(ws_options)
 
+
+def render_composition(df, free_by_lcg, ws_name):
+    """原「成分下钻」treemap 视图(单一 workspace)。"""
     # ---- Sidebar 筛选 ----
     st.sidebar.header("筛选")
     selections = {}
@@ -277,11 +507,11 @@ def main():
 
     if not hierarchy:
         st.warning("请至少选择一个下钻层级。")
-        st.stop()
+        return
 
     if fdf.empty:
         st.warning("当前筛选下没有任务。")
-        st.stop()
+        return
 
     # ---- 预聚合到叶子粒度 ----
     # 同名 clone 任务若不先聚合，px 会把它们并成一个叶子且逐行数值字段丢成 NaN；
@@ -291,9 +521,11 @@ def main():
     plot_df = pdf[pdf["GPU"] > 0]
     if plot_df.empty:
         st.warning("当前筛选下没有占用 GPU 的任务。")
-        st.stop()
+        return
     cont = CONTINUOUS_COLOR.get(color_dim)
-    color_col = cont[0] if cont else color_dim
+    # 「整节点/碎卡」配色映射到实际数据列「节点分类」
+    color_col = cont[0] if cont else (
+        CARDING_COL if color_dim == CARDING_COLOR_DIM else color_dim)
     path_cols = hierarchy + [LEAF]
     agg_map = {"GPU": ("GPU", "sum"), "任务数": (LEAF, "size")}
     agg_extra = [("GPU利用率", "mean"), ("运行时长h", "max"), ("任务类型", "first")]
@@ -302,6 +534,9 @@ def main():
     for col, fn in agg_extra:
         if col not in path_cols and col not in agg_map:
             agg_map[col] = (col, fn)
+    # 把节点名 join 进来（悬停按去重 host 名算「占用节点数」，共享节点不重复计）
+    if "节点" in plot_df.columns and "节点" not in path_cols:
+        agg_map["节点"] = ("节点", lambda s: ",".join(x for x in s.astype(str) if x))
     gdf = plot_df.groupby(path_cols, as_index=False, sort=False).agg(**agg_map)
 
     # ---- 主视图：treemap / sunburst / icicle ----
@@ -322,10 +557,13 @@ def main():
         if mid is not None:
             plot_kwargs["color_continuous_midpoint"] = mid
     else:
-        # 分类配色：优先级档用固定调色板；其它维度只固定「空闲」为灰
-        plot_kwargs["color_discrete_map"] = (
-            PRIORITY_COLORS if color_dim == "优先级档" else {FREE_LABEL: FREE_COLOR}
-        )
+        # 分类配色：优先级档 / 整节点碎卡 用固定调色板；其它维度只固定「空闲」为灰
+        if color_dim == "优先级档":
+            plot_kwargs["color_discrete_map"] = PRIORITY_COLORS
+        elif color_dim == CARDING_COLOR_DIM:
+            plot_kwargs["color_discrete_map"] = CARDING_COLORS
+        else:
+            plot_kwargs["color_discrete_map"] = {FREE_LABEL: FREE_COLOR}
     chart_fn = {"Treemap": px.treemap, "Sunburst": px.sunburst, "Icicle": px.icicle}[
         view
     ]
@@ -338,7 +576,7 @@ def main():
         root_color="lightgrey",
         hovertemplate=(
             "<b>%{label}</b><br>"
-            "GPU=%{value}（占上层 %{percentParent:.0%}）<br>"
+            "GPU=%{value}（占上层 %{percentParent:.0%}）｜占用节点=%{customdata[4]}<br>"
             "任务数=%{customdata[0]}｜类型=%{customdata[3]}<br>"
             "平均利用率=%{customdata[1]:.0f}%｜最长运行=%{customdata[2]:.1f}h"
             "<extra></extra>"
