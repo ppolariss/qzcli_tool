@@ -2039,7 +2039,7 @@ _JOB_DETAIL_PATH_BY_TYPE = {
 }
 
 
-def fetch_all_task_dimensions(api, workspace_id, cookie, page_size=200, max_workers=8):
+def fetch_all_task_dimensions(api, workspace_id, cookie, page_size=200, max_workers=4):
     """分页获取工作空间**当前在跑**任务的资源维度数据（list_task_dimension）。
 
     第一页即返回 ``total``，据此算出总页数后并发拉取其余页（顺序无关，聚合/可视
@@ -2102,8 +2102,9 @@ def build_node_to_lcg_map(api, workspace_id, cookie):
         )
         return lcg_name, nodes
 
-    # 各 lcg 的节点查询相互独立，并发拉取
-    with ThreadPoolExecutor(max_workers=8) as executor:
+    # 各 lcg 的节点查询相互独立，并发拉取。内层并发压到 4 削平对启智的读取峰值 QPS
+    # (看板里外层 workspace 并发 × 此内层 = 峰值,见 dashboard load_all_frag)。
+    with ThreadPoolExecutor(max_workers=4) as executor:
         for lcg_name, nodes in executor.map(_fetch, lcgs):
             for node in nodes:
                 name = node.get("name")

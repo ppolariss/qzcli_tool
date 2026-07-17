@@ -87,7 +87,7 @@ CARDING_COLORS = {
 }
 
 
-@st.cache_data(ttl=90, show_spinner="拉取任务与计算组映射中…")
+@st.cache_data(ttl=300, show_spinner="拉取任务与计算组映射中…")
 def load_df(ws_id, ws_name):
     """拉取在跑任务 + 计算组映射。
 
@@ -149,7 +149,7 @@ def _frag_one(ws_id):
     return res
 
 
-@st.cache_data(ttl=90, show_spinner="拉取全集群节点占用中…")
+@st.cache_data(ttl=300, show_spinner="拉取全集群节点占用中…")
 def load_all_frag(ws_items):
     """跨所有 workspace 并行拉取 + 合并。ws_items = ((ws_id, ws_name), ...)(元组以便缓存)。
     返回 (all_lcg, all_nodes, all_rows),每条带 workspace 标签。"""
@@ -162,7 +162,9 @@ def load_all_frag(ws_items):
         except Exception:
             return wname, None
 
-    with ThreadPoolExecutor(max_workers=8) as ex:
+    # 外层 workspace 并发。与 build_node_to_lcg_map 的内层 LCG 并发相乘 = 峰值并发,
+    # 故压到 4：4×4=16 并发,削平对启智的读取峰值 QPS(实测 76→~16)。
+    with ThreadPoolExecutor(max_workers=4) as ex:
         for wname, fr in ex.map(work, ws_items):
             if not fr:
                 continue
