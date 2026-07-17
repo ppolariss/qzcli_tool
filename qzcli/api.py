@@ -476,6 +476,100 @@ class QzAPI:
             )
         return result.get("data", {})
 
+    def _events_headers(self, job_id: str, cookie: str) -> Dict[str, str]:
+        """浏览器风格 headers（复用 detail 那套，referer 指向任务详情页）。"""
+        return {
+            "accept": "application/json, text/plain, */*",
+            "accept-language": "en-US,en;q=0.9",
+            "cache-control": "no-cache",
+            "content-type": "application/json",
+            "cookie": cookie,
+            "origin": "https://qz.sii.edu.cn",
+            "pragma": "no-cache",
+            "referer": f"https://qz.sii.edu.cn/jobs/distributedTrainingDetail/{job_id}",
+            "sec-ch-ua": '"Not(A:Brand";v="8", "Chromium";v="144"',
+            "sec-ch-ua-mobile": "?0",
+            "sec-ch-ua-platform": '"macOS"',
+            "sec-fetch-dest": "empty",
+            "sec-fetch-mode": "cors",
+            "sec-fetch-site": "same-origin",
+            "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36",
+        }
+
+    def _get_events_with_cookie(
+        self,
+        job_id: str,
+        cookie: str,
+        object_type: str,
+        object_ids: List[str],
+        page_size: int = 200,
+    ) -> List[Dict[str, Any]]:
+        """统一的事件查询（内部 API）。
+
+        平台端点 ``POST /api/v1/train_job/events/list``，按 ``filter.object_type``
+        区分 job / instance 两个视角（已真机验证 2026-07）。返回 ``data.events``。
+        每条事件含 ``type``(Normal/Warning)、``reason``、``message``、
+        ``first_timestamp``、``last_timestamp``、``age``、``from``、``object_id``。
+        """
+        url = f"{self.base_url}/api/v1/train_job/events/list"
+        payload = {
+            "page_num": 1,
+            "page_size": page_size,
+            "filter": {"object_type": object_type, "object_ids": list(object_ids)},
+        }
+        response = _curl_post(
+            url, json=payload, headers=self._events_headers(job_id, cookie), timeout=60
+        )
+        if response.status_code == 401:
+            raise QzAPIError("Cookie 已过期或无效，请重新获取", 401)
+        if response.status_code != 200:
+            raise QzAPIError(
+                f"请求失败: HTTP {response.status_code}", response.status_code
+            )
+        try:
+            result = response.json()
+        except Exception:
+            raise QzAPIError("响应不是有效的 JSON，请检查 cookie 是否正确")
+        if result.get("code") != 0:
+            raise QzAPIError(
+                f"API 请求失败: {result.get('message', '未知错误')}",
+                result.get("code"),
+            )
+        data = result.get("data") or {}
+        events = data.get("events")
+        return events if isinstance(events, list) else []
+
+    def get_job_events_with_cookie(
+        self, job_id: str, cookie: str, page_size: int = 200
+    ) -> List[Dict[str, Any]]:
+        """任务（控制器）级事件：调度、创建/删除 Pod、抢占、失败等。
+
+        含 ``Unschedulable`` —— 排队排不上时的真因（如 "0/680 nodes are
+        unavailable: ..."）就在这里。
+        """
+        return self._get_events_with_cookie(
+            job_id, cookie, "job", [job_id], page_size=page_size
+        )
+
+    def get_job_instance_events_with_cookie(
+        self,
+        job_id: str,
+        cookie: str,
+        pod_names: Optional[List[str]] = None,
+        page_size: int = 200,
+    ) -> List[Dict[str, Any]]:
+        """Pod（实例）级事件：``FailedScheduling`` / ``Scheduled`` / ``Pulled`` /
+        ``Started`` / ``Evict`` / ``Preempted`` —— 比 job 级更细，含被高优抢占
+        （碎卡低优卡的典型场景）。pod_names 缺省时按平台命名规则推断。
+        """
+        if pod_names is None:
+            pod_names = self._resolve_pod_names(job_id)
+        if not pod_names:
+            return []
+        return self._get_events_with_cookie(
+            job_id, cookie, "instance", pod_names, page_size=page_size
+        )
+
     def _resolve_pod_names(
         self, job_id: str, n_instances: Optional[int] = None
     ) -> List[str]:
@@ -1515,8 +1609,11 @@ class QzAPI:
         proxy = get_proxy()
         if proxy:
             session.trust_env = False
-            proxy_url = proxy.replace("socks5h://", "socks5://")
-            session.proxies = {"http": proxy_url, "https": proxy_url}
+            # 直接用原始 proxy —— 不要把 socks5h:// 降级成 socks5://。
+            # socks5h 让 DNS 解析走代理；在只能靠代理解析 qz.sii.edu.cn 的
+            # 环境（WSL/VPN）里降级会导致本机解析失败、登录连不上（#35）。
+            # requests（依赖 PySocks，本仓硬依赖）原生支持 socks5h://。
+            session.proxies = {"http": proxy, "https": proxy}
 
         # 设置浏览器 User-Agent
         headers = {
