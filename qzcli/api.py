@@ -6,6 +6,7 @@ import functools
 import inspect
 import json as _json
 import random
+import sys
 import threading
 import time as _time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -208,6 +209,44 @@ def _unwrap_v2_result(data: Dict[str, Any]) -> Dict[str, Any]:
     return {}
 
 
+# 已经就某个端点提示过"v2 不可用、已回落 v1"的集合，用来避免刷屏：
+# `qzcli avail` 这类命令会对十几个工作空间循环调同一个端点。
+_V2_FALLBACK_WARNED: set = set()
+
+# 触发回落 v1 的 HTTP 状态码。这些表示"v2 这条路由不通"，重试没意义：
+#   404 网关未注册该 Action  405 方法不允许  501 未实现  502/503/504 网关侧挂了
+# 刻意**不含** 401/403 —— 401 由 `with_auth_retry` 重登处理，403 是权限问题，
+# 回落 v1 也一样会被拒，静默降级只会掩盖真实原因。
+_V2_FALLBACK_STATUS = frozenset({404, 405, 501, 502, 503, 504})
+
+
+def _v2_then_v1(name: str, v2_call, v1_call, *, logger=None):
+    """先打 v2，只在"v2 这条路不通"时回落 v1。
+
+    迁移期的核心保护：平台正在把 /api/v1 逐步下线（``/openapi/v1/specs/list``
+    已经 404），但也有 v2 反而更严的情况（``project ListProjects`` 对普通用户是
+    ``AccessForbidden``，v1 却正常）。两边都可能先坏，所以两条腿都留着。
+
+    **只有** ``_V2_FALLBACK_STATUS`` 里的状态码、或"返回非 JSON"（APISIX 把请求
+    302 到了 Keycloak）才回落。业务错误（``AccessForbidden`` / ``InvalidParameter``）
+    直接抛 —— 那说明 v2 通了但参数或权限不对，回落 v1 会把 bug 藏起来。
+    """
+    try:
+        return v2_call()
+    except QzAPIError as exc:
+        fallback_worthy = exc.code in _V2_FALLBACK_STATUS or "非 JSON" in str(exc)
+        if not fallback_worthy:
+            raise
+        if name not in _V2_FALLBACK_WARNED:
+            _V2_FALLBACK_WARNED.add(name)
+            msg = f"[qzcli] v2 接口 {name} 不可用（{exc}），本次回落 v1。"
+            if logger:
+                logger(msg)
+            else:
+                print(msg, file=sys.stderr)
+        return v1_call()
+
+
 def build_resource_spec_price(
     spec_obj: Dict[str, Any], compute_group_id: str
 ) -> Dict[str, Any]:
@@ -361,17 +400,27 @@ class QzAPI:
         service: str,
         action: str,
         body: Dict[str, Any],
+        cookie: Optional[str] = None,
+        referer_path: str = "/jobs",
+        raw: bool = False,
     ) -> Dict[str, Any]:
         """POST 到 /api/v2/{service}?Action={action}。
 
         与 /openapi/v1 不同：
-          - 响应不带 {code:0, data:...} 信封，直接返回业务字段
+          - 响应是 AWS 风格信封 ``{"ResponseMetadata": ..., "Result": ...}``
           - APISIX 网关要求 ``x-inspire-client-source`` 头，否则 302 到 Keycloak
           - 认证走 cookie（同 /api/v1/）：Bearer 在这条路径下不被接受
-        缺 cookie 时给出明确的 ``qzcli login`` 提示。
+
+        默认返回**已解封装的** ``Result``（见 ``_unwrap_v2_result``）；调用方不需要
+        再自己剥一层。需要看原始信封时传 ``raw=True``。
+
+        ``cookie`` 显式传入时优先于磁盘上的（``create_job_v2`` 这类已经在上层拿好
+        cookie 的调用点用得到）；不传则从 ``~/.qzcli/.cookie`` 读，配合
+        ``with_auth_retry`` 在 401 时自动重登后读到新 cookie。
         """
-        cookie_data = get_cookie()
-        cookie = cookie_data.get("cookie") if cookie_data else None
+        if not cookie:
+            cookie_data = get_cookie()
+            cookie = cookie_data.get("cookie") if cookie_data else None
         if not cookie:
             raise QzAPIError(
                 "v2 API 需要 cookie 认证，但本地没有有效 cookie。"
@@ -384,7 +433,7 @@ class QzAPI:
             "content-type": "application/json",
             "cookie": cookie,
             "origin": self.base_url,
-            "referer": f"{self.base_url}/jobs",
+            "referer": f"{self.base_url}{referer_path}",
             "user-agent": V2_BROWSER_UA,
             "x-inspire-client-source": V2_CLIENT_SOURCE,
         }
@@ -400,6 +449,15 @@ class QzAPI:
             raise QzAPIError(
                 "Cookie 已过期或无效，请运行 `qzcli login` 重新获取",
                 401,
+            )
+
+        # 网关对未注册路由回的是 `404 page not found`（text/plain），要和
+        # 「认证失败被 302 到 Keycloak 的 HTML」区分开 —— 前者该回落 v1，
+        # 后者重新登录才有用。
+        if response.status_code == 404:
+            raise QzAPIError(
+                f"v2 网关上没有 /api/v2/{service}?Action={action} 这条路由（404）。",
+                404,
             )
 
         ctype = response.headers.get("Content-Type", "")
@@ -422,7 +480,7 @@ class QzAPI:
                 f"v2 API 请求失败 ({response.status_code}): {result}",
                 response.status_code,
             )
-        return result
+        return result if raw else _unwrap_v2_result(result)
 
     def get_job_detail(self, job_id: str) -> Dict[str, Any]:
         """查询任务详情（使用 cookie 认证，优先于 token）"""
@@ -447,9 +505,9 @@ class QzAPI:
             "cache-control": "no-cache",
             "content-type": "application/json",
             "cookie": cookie,
-            "origin": "https://qz.sii.edu.cn",
+            "origin": self.base_url,
             "pragma": "no-cache",
-            "referer": f"https://qz.sii.edu.cn/jobs/distributedTrainingDetail/{job_id}",
+            "referer": f"{self.base_url}/jobs/distributedTrainingDetail/{job_id}",
             "sec-ch-ua": '"Not(A:Brand";v="8", "Chromium";v="144"',
             "sec-ch-ua-mobile": "?0",
             "sec-ch-ua-platform": '"macOS"',
@@ -532,10 +590,8 @@ class QzAPI:
         if end_timestamp_ms is not None:
             body["filter"]["end_timestamp_ms"] = str(end_timestamp_ms)
 
-        result = self._request_v2("train", "GetJobLog", body)
-        if isinstance(result.get("Result"), dict):
-            result = result["Result"]
-        return result
+        # `_request_v2` 已经剥掉 ResponseMetadata/Result 信封了
+        return self._request_v2("train", "GetJobLog", body)
 
     def get_jobs_detail(
         self, job_ids: List[str], max_workers: int = 5
@@ -584,9 +640,9 @@ class QzAPI:
             "cache-control": "no-cache",
             "content-type": "application/json",
             "cookie": cookie,
-            "origin": "https://qz.sii.edu.cn",
+            "origin": self.base_url,
             "pragma": "no-cache",
-            "referer": f"https://qz.sii.edu.cn/jobs/distributedTrainingDetail/{job_id}",
+            "referer": f"{self.base_url}/jobs/distributedTrainingDetail/{job_id}",
             "sec-ch-ua": '"Not(A:Brand";v="8", "Chromium";v="144"',
             "sec-ch-ua-mobile": "?0",
             "sec-ch-ua-platform": '"macOS"',
@@ -629,8 +685,8 @@ class QzAPI:
             "accept": "application/json, text/plain, */*",
             "content-type": "application/json",
             "cookie": cookie,
-            "origin": "https://qz.sii.edu.cn",
-            "referer": f"https://qz.sii.edu.cn/jobs/distributedTraining?spaceId={workspace_id}",
+            "origin": self.base_url,
+            "referer": f"{self.base_url}/jobs/distributedTraining?spaceId={workspace_id}",
             "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36",
         }
         response = _curl_post(url, json=config, headers=headers, timeout=60)
@@ -655,24 +711,14 @@ class QzAPI:
         key + framework_config[0] + 嵌套 resource_spec_price），差别只在 endpoint、
         响应封装（ResponseMetadata/Result）和新增的 `exclude_nodes` 等 v2 选项。
         """
-        url = f"{self.base_url}/api/v2/train?Action=CreateJobConsole"
         workspace_id = config.get("workspace_id", "")
-        headers = {
-            "accept": "application/json, text/plain, */*",
-            "content-type": "application/json",
-            "cookie": cookie,
-            "origin": "https://qz.sii.edu.cn",
-            "referer": f"https://qz.sii.edu.cn/jobs/distributedTraining?spaceId={workspace_id}",
-            "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36",
-        }
-        response = _curl_post(url, json=config, headers=headers, timeout=60)
-        if response.status_code == 401:
-            raise QzAPIError("Cookie 已过期或无效，请重新获取", 401)
-        if response.status_code != 200:
-            raise QzAPIError(
-                f"请求失败: HTTP {response.status_code}", response.status_code
-            )
-        return _unwrap_v2_result(response.json())
+        return self._request_v2(
+            "train",
+            "CreateJobConsole",
+            config,
+            cookie=cookie,
+            referer_path=f"/jobs/distributedTraining?spaceId={workspace_id}",
+        )
 
     @with_auth_retry
     def create_hpc_job(
@@ -741,8 +787,8 @@ class QzAPI:
             "accept": "application/json, text/plain, */*",
             "content-type": "application/json",
             "cookie": cookie,
-            "origin": "https://qz.sii.edu.cn",
-            "referer": f"https://qz.sii.edu.cn/jobs/hpc?spaceId={workspace_id}",
+            "origin": self.base_url,
+            "referer": f"{self.base_url}/jobs/hpc?spaceId={workspace_id}",
             "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
         }
         response = _curl_post(url, json=payload, headers=headers, timeout=60)
@@ -763,70 +809,36 @@ class QzAPI:
             )
         return result.get("data", {})
 
-    @with_auth_retry
     def list_hpc_jobs(
         self,
         workspace_id: str,
-        cookie: str,
+        cookie: Optional[str] = None,
         status: Optional[str] = None,
         page_num: int = 1,
         page_size: int = 100,
     ) -> Dict[str, Any]:
-        """
-        列出 HPC 任务（使用 cookie 认证，POST /api/v1/hpc_jobs/list）
+        """列出 HPC 任务（v2 ``hpc ListJobs``）。
 
-        Args:
-            workspace_id: 工作空间 ID
-            cookie: 浏览器 cookie 字符串
-            status: 状态过滤，如 'RUNNING'、'QUEUEING'，None 表示不过滤
-            page_num: 页码
-            page_size: 每页数量
+        原来的实现打 ``/api/v1/hpc_jobs/list``，且仓库里零调用者。这里没有直接删掉，
+        而是换成 v2 实现 —— 真机验证过返回 ``Result.jobs[]`` + ``Result.total``，
+        和 v1 的 ``data.jobs`` 形状一致，所以调用方感知不到差别。
 
-        Returns:
-            包含 jobs 列表和 total 的字典
+        ``cookie`` 参数保留只为兼容旧签名，实际由 ``_request_v2`` 从磁盘读。
         """
-        url = f"{self.base_url}/api/v1/hpc_jobs/list"
-        payload: Dict[str, Any] = {
+        body: Dict[str, Any] = {
             "workspace_id": workspace_id,
             "page_num": page_num,
             "page_size": page_size,
         }
         if status:
-            payload["status"] = status
-        headers = {
-            "accept": "application/json, text/plain, */*",
-            "accept-language": "en-US,en;q=0.9",
-            "cache-control": "no-cache",
-            "content-type": "application/json",
-            "cookie": cookie,
-            "origin": "https://qz.sii.edu.cn",
-            "pragma": "no-cache",
-            "referer": f"https://qz.sii.edu.cn/jobs/hpc?spaceId={workspace_id}",
-            "sec-ch-ua": '"Not(A:Brand";v="8", "Chromium";v="144"',
-            "sec-ch-ua-mobile": "?0",
-            "sec-ch-ua-platform": '"macOS"',
-            "sec-fetch-dest": "empty",
-            "sec-fetch-mode": "cors",
-            "sec-fetch-site": "same-origin",
-            "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36",
-        }
-        response = _curl_post(url, json=payload, headers=headers, timeout=60)
-        if response.status_code == 401:
-            raise QzAPIError("Cookie 已过期或无效，请重新获取", 401)
-        if response.status_code != 200:
-            raise QzAPIError(
-                f"请求失败: HTTP {response.status_code}", response.status_code
-            )
-        try:
-            result = response.json()
-        except Exception:
-            raise QzAPIError("响应不是有效的 JSON，请检查 cookie 是否正确")
-        if result.get("code") != 0:
-            raise QzAPIError(
-                f"API 请求失败: {result.get('message', '未知错误')}",
-                result.get("code"),
-            )
-        return result.get("data", {})
+            body["status"] = status
+        return self._request_v2(
+            "hpc",
+            "ListJobs",
+            body,
+            cookie=cookie,
+            referer_path=f"/jobs/hpc?spaceId={workspace_id}",
+        )
 
     def test_connection(self) -> bool:
         """测试连接"""
@@ -873,8 +885,8 @@ class QzAPI:
             "accept": "application/json, text/plain, */*",
             "content-type": "application/json",
             "cookie": cookie,
-            "origin": "https://qz.sii.edu.cn",
-            "referer": f"https://qz.sii.edu.cn/jobs/spacesOverview?spaceId={workspace_id}",
+            "origin": self.base_url,
+            "referer": f"{self.base_url}/jobs/spacesOverview?spaceId={workspace_id}",
             "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36",
         }
 
@@ -946,9 +958,9 @@ class QzAPI:
             "cache-control": "no-cache",
             "content-type": "application/json",
             "cookie": cookie,
-            "origin": "https://qz.sii.edu.cn",
+            "origin": self.base_url,
             "pragma": "no-cache",
-            "referer": f"https://qz.sii.edu.cn/jobs/distributedTraining?spaceId={workspace_id}",
+            "referer": f"{self.base_url}/jobs/distributedTraining?spaceId={workspace_id}",
             "sec-ch-ua": '"Not(A:Brand";v="8", "Chromium";v="144"',
             "sec-ch-ua-mobile": "?0",
             "sec-ch-ua-platform": '"macOS"',
@@ -1029,8 +1041,8 @@ class QzAPI:
             "accept": "application/json, text/plain, */*",
             "content-type": "application/json",
             "cookie": cookie,
-            "origin": "https://qz.sii.edu.cn",
-            "referer": f"https://qz.sii.edu.cn/jobs/interactiveModeling?spaceId={workspace_id}",
+            "origin": self.base_url,
+            "referer": f"{self.base_url}/jobs/interactiveModeling?spaceId={workspace_id}",
             "sec-ch-ua": '"Not(A:Brand";v="8", "Chromium";v="144"',
             "sec-ch-ua-mobile": "?0",
             "sec-ch-ua-platform": '"macOS"',
@@ -1209,9 +1221,9 @@ class QzAPI:
             "cache-control": "no-cache",
             "content-type": "application/json",
             "cookie": cookie,
-            "origin": "https://qz.sii.edu.cn",
+            "origin": self.base_url,
             "pragma": "no-cache",
-            "referer": f"https://qz.sii.edu.cn/jobs/spacesOverview?spaceId={workspace_id}",
+            "referer": f"{self.base_url}/jobs/spacesOverview?spaceId={workspace_id}",
             "sec-ch-ua": '"Not(A:Brand";v="8", "Chromium";v="144"',
             "sec-ch-ua-mobile": "?0",
             "sec-ch-ua-platform": '"macOS"',
@@ -1288,9 +1300,9 @@ class QzAPI:
             "cache-control": "no-cache",
             "content-type": "application/json",
             "cookie": cookie,
-            "origin": "https://qz.sii.edu.cn",
+            "origin": self.base_url,
             "pragma": "no-cache",
-            "referer": f"https://qz.sii.edu.cn/jobs/spacesOverview?spaceId={workspace_id}",
+            "referer": f"{self.base_url}/jobs/spacesOverview?spaceId={workspace_id}",
             "sec-ch-ua": '"Not(A:Brand";v="8", "Chromium";v="144"',
             "sec-ch-ua-mobile": "?0",
             "sec-ch-ua-platform": '"macOS"',
@@ -1349,9 +1361,9 @@ class QzAPI:
             "cache-control": "no-cache",
             "content-type": "application/json",
             "cookie": cookie,
-            "origin": "https://qz.sii.edu.cn",
+            "origin": self.base_url,
             "pragma": "no-cache",
-            "referer": f"https://qz.sii.edu.cn/jobs/spacesOverview?spaceId={workspace_id}",
+            "referer": f"{self.base_url}/jobs/spacesOverview?spaceId={workspace_id}",
             "sec-ch-ua": '"Not(A:Brand";v="8", "Chromium";v="144"',
             "sec-ch-ua-mobile": "?0",
             "sec-ch-ua-platform": '"macOS"',
@@ -1412,9 +1424,9 @@ class QzAPI:
             "cache-control": "no-cache",
             "content-type": "application/json",
             "cookie": cookie,
-            "origin": "https://qz.sii.edu.cn",
+            "origin": self.base_url,
             "pragma": "no-cache",
-            "referer": "https://qz.sii.edu.cn/operations/projects",
+            "referer": f"{self.base_url}/operations/projects",
             "sec-ch-ua": '"Not(A:Brand";v="8", "Chromium";v="144"',
             "sec-ch-ua-mobile": "?0",
             "sec-ch-ua-platform": '"macOS"',
