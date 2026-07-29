@@ -1891,11 +1891,9 @@ def cmd_avail(args):
                 if args.low_priority:
                     low_priority_free = r.get("low_priority_free_nodes", 0)
                     row.extend(
-                        [
-                            low_priority_free,
-                            r.get("fragmented_low_priority_gpus", 0),
-                            r.get("free_nodes", 0) + low_priority_free,
-                        ]
+                        [low_priority_free,
+                         r.get("fragmented_low_priority_gpus", 0),
+                         r.get("free_nodes", 0) + low_priority_free]
                     )
                 row.extend(
                     [
@@ -6910,7 +6908,9 @@ def _resolve_notebook_id_by_name(target, cookie, display):
     # 2. 前缀模糊：notebook_id 以 target 开头。
     if target:
         prefix_hits = [
-            nb for nb in notebooks if str(nb.get("notebook_id", "")).startswith(target)
+            nb
+            for nb in notebooks
+            if str(nb.get("notebook_id", "")).startswith(target)
         ]
         if len(prefix_hits) == 1:
             return prefix_hits[0].get("notebook_id")

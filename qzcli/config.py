@@ -32,7 +32,6 @@ def get_proxy() -> str:
         return proxy
     return os.environ.get("ALL_PROXY") or os.environ.get("HTTPS_PROXY", "")
 
-
 # 配置目录
 CONFIG_DIR = Path.home() / ".qzcli"
 CONFIG_FILE = CONFIG_DIR / "config.json"

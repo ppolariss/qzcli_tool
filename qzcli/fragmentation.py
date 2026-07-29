@@ -13,17 +13,16 @@ job 排不上。`qzcli avail --lp` 只数"整节点 100% 被低优占"的节点(
 口径与 cmd_avail 一致(cli.py:1425-1438, 1578):低优 = 优先级<=阈值;多节点任务把
 GPU 平均摊到各节点;"低优满占整节点" = 节点上低优卡数 >= 该节点总卡数。
 """
-
 from __future__ import annotations
 
 from collections import Counter, defaultdict
 
 # 节点分类
-EMPTY_WHOLE = "空整节点"  # 完全空闲,可直接排整节点
-LOWPRI_WHOLE = "低优满占"  # 整节点被低优占满,可整节点抢占(= avail 的"低优空余")
-FRAGMENTED = "碎卡"  # 有空卡但凑不满 / 高优+低优混合 —— 碎片来源
-HI_WHOLE = "高优满占"  # 整节点被高优占满,不可回收
-SCHED_DISABLED = "调度禁用"  # SchedulingDisabled / cordon:即便有空卡也调度不上去
+EMPTY_WHOLE = "空整节点"      # 完全空闲,可直接排整节点
+LOWPRI_WHOLE = "低优满占"     # 整节点被低优占满,可整节点抢占(= avail 的"低优空余")
+FRAGMENTED = "碎卡"           # 有空卡但凑不满 / 高优+低优混合 —— 碎片来源
+HI_WHOLE = "高优满占"         # 整节点被高优占满,不可回收
+SCHED_DISABLED = "调度禁用"   # SchedulingDisabled / cordon:即便有空卡也调度不上去
 
 
 def node_low_priority_gpu(task_rows, low_pri_threshold: int = 3) -> dict:
@@ -48,9 +47,9 @@ def node_low_priority_gpu(task_rows, low_pri_threshold: int = 3) -> dict:
 
 def _classify(used: int, total: int, low_pri: int, schedulable: bool = True) -> str:
     if not schedulable:
-        return SCHED_DISABLED  # 调度禁用:优先于其它,空卡也不可用
+        return SCHED_DISABLED    # 调度禁用:优先于其它,空卡也不可用
     if total <= 0:
-        return HI_WHOLE  # 异常节点(gpu_total=0),不计入可用统计
+        return HI_WHOLE          # 异常节点(gpu_total=0),不计入可用统计
     if used <= 0:
         return EMPTY_WHOLE
     if low_pri >= total:
@@ -58,7 +57,7 @@ def _classify(used: int, total: int, low_pri: int, schedulable: bool = True) -> 
     free = total - used
     if free == 0 and low_pri == 0:
         return HI_WHOLE
-    return FRAGMENTED  # 有空卡 或 高低优混合 → 碎片来源
+    return FRAGMENTED            # 有空卡 或 高低优混合 → 碎片来源
 
 
 def compute_node_fragmentation(node_map, task_rows, low_pri_threshold: int = 3) -> dict:
@@ -69,31 +68,26 @@ def compute_node_fragmentation(node_map, task_rows, low_pri_threshold: int = 3) 
     for name, info in node_map.items():
         total = int(info.get("gpu_total", 0) or 0)
         used = int(info.get("gpu_used", 0) or 0)
-        lp = min(int(low.get(name, 0) or 0), used)  # 摊出来的低优不会超过已用
+        lp = min(int(low.get(name, 0) or 0), used)   # 摊出来的低优不会超过已用
         free = max(0, total - used)
         hp = max(0, used - lp)
         # 老数据/远程 collector 可能不带 schedulable → 默认可调度(向后兼容)。
         schedulable = info.get("schedulable", True)
-        nodes.append(
-            {
-                "node": name,
-                "lcg": info.get("lcg", ""),
-                "gpu_type": info.get("gpu_type", ""),
-                "cluster": info.get("cluster", ""),
-                "total": total,
-                "used": used,
-                "free": free,
-                "low_pri": lp,
-                "high_pri": hp,
-                "schedulable": schedulable,
-                "status": info.get("status", ""),
-                "cordon_type": info.get("cordon_type", ""),
-                "class": _classify(used, total, lp, schedulable),
-            }
-        )
+        nodes.append({
+            "node": name,
+            "lcg": info.get("lcg", ""),
+            "gpu_type": info.get("gpu_type", ""),
+            "cluster": info.get("cluster", ""),
+            "total": total, "used": used, "free": free,
+            "low_pri": lp, "high_pri": hp,
+            "schedulable": schedulable,
+            "status": info.get("status", ""),
+            "cordon_type": info.get("cordon_type", ""),
+            "class": _classify(used, total, lp, schedulable),
+        })
 
     by_lcg: dict = {}
-    lcg_sizes = defaultdict(Counter)  # lcg -> Counter(gpu_total) 求众数当"节点卡数"
+    lcg_sizes = defaultdict(Counter)   # lcg -> Counter(gpu_total) 求众数当"节点卡数"
     for n in nodes:
         if n["total"] > 0:
             lcg_sizes[n["lcg"]][n["total"]] += 1
@@ -104,25 +98,16 @@ def compute_node_fragmentation(node_map, task_rows, low_pri_threshold: int = 3) 
         if agg is None:
             size = lcg_sizes[lcg].most_common(1)[0][0] if lcg_sizes[lcg] else 8
             agg = by_lcg[lcg] = {
-                "lcg": lcg,
-                "gpu_type": n["gpu_type"],
-                "cluster": n["cluster"],
-                "total_nodes": 0,
-                "empty_whole": 0,
-                "lowpri_whole": 0,
-                "hi_whole": 0,
-                "frag_nodes": 0,
-                "frag_free_cards": 0,
-                "frag_lowpri_cards": 0,
-                "free_total": 0,
-                "total_gpus": 0,
-                "used_gpus": 0,
-                "sched_disabled_nodes": 0,
-                "sched_disabled_free_gpus": 0,
+                "lcg": lcg, "gpu_type": n["gpu_type"], "cluster": n["cluster"],
+                "total_nodes": 0, "empty_whole": 0, "lowpri_whole": 0,
+                "hi_whole": 0, "frag_nodes": 0,
+                "frag_free_cards": 0, "frag_lowpri_cards": 0,
+                "free_total": 0, "total_gpus": 0, "used_gpus": 0,
+                "sched_disabled_nodes": 0, "sched_disabled_free_gpus": 0,
                 "node_size": size,
             }
         if n["total"] <= 0:
-            continue  # 跳过异常节点
+            continue                     # 跳过异常节点
         agg["total_nodes"] += 1
         agg["total_gpus"] += n["total"]
         agg["used_gpus"] += n["used"]
@@ -159,7 +144,6 @@ def compute_node_fragmentation(node_map, task_rows, low_pri_threshold: int = 3) 
 
 
 # ---- 碎卡 → --exclude-node 参数桥（把"看到碎卡"接到"提交时避开"）----
-
 
 def format_exclude_args(node_names) -> str:
     """把节点名列表拼成可直接粘贴的 `--exclude-node A --exclude-node B`。

@@ -1,12 +1,12 @@
 def hex2int(hex_string):
     hex_string = hex_string.strip()
-    if hex_string.startswith(("0x", "0X")):
+    if hex_string.startswith(('0x', '0X')):
         hex_string = hex_string[2:]
     return int(hex_string, 16)
 
 
 def int2hex(number, min_length=0):
-    hex_str = format(number, "x")
+    hex_str = format(number, 'x')
     if min_length > 0:
         hex_str = hex_str.zfill(min_length)
     return hex_str
@@ -62,7 +62,7 @@ class CustomRSA:
             hex_str = int2hex(encrypted, self.ciphertext_hex_length)
             result_parts.append(hex_str)
 
-        return " ".join(result_parts)
+        return ' '.join(result_parts)
 
 
 class PasswordEncryptor:
@@ -77,12 +77,11 @@ class PasswordEncryptor:
             return password
 
         encrypted = self.rsa.encrypt_string(password)
-        return encrypted.replace(" ", "")
+        return encrypted.replace(' ', '')
 
     def is_encrypted(self, password):
-        return 254 <= len(password) <= 256 and all(
-            c in "0123456789abcdefABCDEF" for c in password
-        )
+        return (254 <= len(password) <= 256 and
+                all(c in '0123456789abcdefABCDEF' for c in password))
 
 
 def encrypt_password(password):
