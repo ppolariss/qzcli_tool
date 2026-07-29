@@ -652,9 +652,34 @@ class QzAPI:
         except QzAPIError:
             return False
 
-    @with_auth_retry
     def stop_job_with_cookie(self, job_id: str, cookie: str) -> bool:
-        """使用 cookie 停止任务（内部 API）"""
+        """停止任务：优先 v2 ``train StopJob``，v2 路由不通时回落 v1。
+
+        唯一迁到 v2 的**写**操作。回落判据依旧只认"路由不通"
+        （404/405/50x/非 JSON）—— 业务错误（任务已结束、无权限）会直接抛给用户，
+        绝不会因为回落而变成"停了两次"。
+        """
+        return _v2_then_v1(
+            "train_job/stop",
+            lambda: self._stop_job_v2(job_id, cookie),
+            lambda: self._stop_job_v1(job_id, cookie),
+        )
+
+    def _stop_job_v2(self, job_id: str, cookie: Optional[str] = None) -> bool:
+        """``POST /api/v2/train?Action=StopJob``。"""
+        self._request_v2(
+            "train",
+            "StopJob",
+            {"job_id": job_id},
+            cookie=cookie,
+            referer_path=f"/jobs/distributedTrainingDetail/{job_id}",
+        )
+        # 成功即无 Error 信封；_request_v2 已在失败时抛异常
+        return True
+
+    @with_auth_retry
+    def _stop_job_v1(self, job_id: str, cookie: str) -> bool:
+        """遗留路径 ``POST /api/v1/train_job/stop``。"""
         url = f"{self.base_url}/api/v1/train_job/stop"
         payload = {"job_id": job_id}
         headers = {
@@ -1296,20 +1321,119 @@ class QzAPI:
             "specs": list(specs.values()),
         }
 
-    def list_specs(self, compute_group_id: str) -> List[Dict[str, Any]]:
-        """
-        获取计算组可用的规格列表（使用 OpenAPI）
+    def list_specs(
+        self, compute_group_id: str, workspace_id: str = ""
+    ) -> List[Dict[str, Any]]:
+        """获取计算组可用的规格列表。
+
+        这是整个迁移里最麻烦的一个：**v2 没有任何 action 返回 spec_id**。
+        把 144 个 action 的 schema 全 grep 过 —— ``spec_id`` 只作为**请求**字段
+        存在（``train.CreateJob.framework_config[]`` / ``hpc.CreateJob`` /
+        ``inference-serving.CreateServing``）。``workspace GetWorkspaceNodeSpecs``
+        和 ``GetLogicComputeGroupNodeSpecs`` 返回的 ``node_specs[]`` 只有硬件参数
+        （cpu/gpu/内存/型号），**没有 id**，拿来当 spec 用会被
+        ``_normalize_spec_item`` 直接丢掉。
+
+        而老的 ``/openapi/v1/specs/list`` **平台上已经 404 了**。
+
+        所以这里走两级：
+
+        1. 老 OpenAPI（唯一的"规格清单"语义来源，还活着就用）
+        2. v2 ``train ListJobs`` 的历史任务：
+           ``framework_config[].instance_spec_price_info`` 里带 ``quota_id``，
+           而 quota_id 就是 spec_id，同时还带全套 cpu/gpu/内存/gpu_type。
+           这是目前**唯一能从 v2 拿到真实 spec id 的路径**。
+
+        再往上还有第三级（``~/.qzcli/resources.json`` 本地缓存），由调用方兜。
 
         Args:
-            compute_group_id: 计算组 ID
-
-        Returns:
-            规格列表
+            compute_group_id: 逻辑计算组 ID
+            workspace_id: 工作空间 ID。留空则跳过第 2 级 —— 历史任务必须按
+                工作空间查。
         """
-        result = self._request(
-            "/openapi/v1/specs/list", {"logic_compute_group_id": compute_group_id}
+        try:
+            result = self._request(
+                "/openapi/v1/specs/list", {"logic_compute_group_id": compute_group_id}
+            )
+            specs = result.get("data", {}).get("specs", [])
+            if specs:
+                return specs
+        except QzAPIError:
+            # 404 / invalid_grant 都算这一级不可用，静默降级到历史任务推断
+            pass
+
+        if not workspace_id:
+            return []
+        return self._specs_from_job_history(compute_group_id, workspace_id)
+
+    def _specs_from_job_history(
+        self, compute_group_id: str, workspace_id: str, page_size: int = 200
+    ) -> List[Dict[str, Any]]:
+        """从历史任务里反推规格（v2 ``train ListJobs``）。
+
+        平台不提供"某计算组有哪些规格"的 v2 查询，但**跑过的任务里带着它用的
+        规格**，所以按 quota_id 去重就能还原出一份可用规格表。
+        字段名对齐 ``_normalize_spec_item`` 认识的那几个别名。
+        """
+        try:
+            data = self.list_jobs_with_cookie(
+                workspace_id, "", page_num=1, page_size=page_size
+            )
+        except QzAPIError:
+            return []
+
+        specs: Dict[str, Dict[str, Any]] = {}
+        for job in data.get("jobs") or []:
+            lcg_id = job.get("logic_compute_group_id", "")
+            if compute_group_id and lcg_id != compute_group_id:
+                continue
+            for fc in job.get("framework_config") or []:
+                info = fc.get("instance_spec_price_info") or {}
+                quota_id = info.get("quota_id")
+                if not quota_id or quota_id in specs:
+                    continue
+                gpu_info = info.get("gpu_info") or {}
+                specs[quota_id] = {
+                    "id": quota_id,
+                    "quota_id": quota_id,
+                    "gpu_count": info.get("gpu_count") or fc.get("gpu_count") or 0,
+                    "cpu_count": info.get("cpu_count") or fc.get("cpu") or 0,
+                    "memory_size_gib": info.get("memory_size_gib")
+                    or fc.get("mem_gi")
+                    or 0,
+                    # gpu_type 平台校验时要**完整串**（NVIDIA_H200_SXM_141G），
+                    # 不是简称，所以直接用响应里的原值
+                    "gpu_type": gpu_info.get("gpu_type") or "",
+                    "gpu_info": gpu_info,
+                    "logic_compute_group_ids": [lcg_id] if lcg_id else [],
+                }
+        return list(specs.values())
+
+    def list_node_specs(
+        self, workspace_id: str, logic_compute_group_id: str = ""
+    ) -> List[Dict[str, Any]]:
+        """计算组/工作空间的**硬件规格**（v2）。
+
+        注意这**不是** ``list_specs`` 的替代品 —— 返回的 ``node_specs[]`` 里
+        没有 spec_id，不能拿去提任务，只能用于展示"这个组有什么样的机器"。
+        ``logic_compute_group_id`` 留空则查整个工作空间。
+        """
+        if logic_compute_group_id:
+            body = {
+                "workspace_id": workspace_id,
+                "logic_compute_group_id": logic_compute_group_id,
+            }
+            action = "GetLogicComputeGroupNodeSpecs"
+        else:
+            body = {"workspace_id": workspace_id}
+            action = "GetWorkspaceNodeSpecs"
+        result = self._request_v2(
+            "workspace",
+            action,
+            body,
+            referer_path=f"/jobs/spacesOverview?spaceId={workspace_id}",
         )
-        return result.get("data", {}).get("specs", [])
+        return result.get("node_specs") or []
 
     @staticmethod
     def _dimension_body(

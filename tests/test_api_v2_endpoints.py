@@ -122,6 +122,115 @@ class V2EndpointShapeTests(unittest.TestCase):
         self.assertEqual(call["params"], {"Action": "ListJobs"})
 
 
+class StopJobTests(unittest.TestCase):
+    def setUp(self):
+        api._V2_FALLBACK_WARNED.clear()
+
+    def test_stop_hits_train_StopJob(self):
+        seen = {}
+
+        def fake_post(url, *, json=None, params=None, **_):
+            seen.update(url=url, params=params, body=json)
+            return _Resp(200, {"Result": {}})
+
+        with mock.patch.object(api, "_curl_post", side_effect=fake_post):
+            self.assertTrue(_client().stop_job_with_cookie("job-7", "ck"))
+        self.assertEqual(seen["url"], "https://qz.example/api/v2/train")
+        self.assertEqual(seen["params"], {"Action": "StopJob"})
+        self.assertEqual(seen["body"], {"job_id": "job-7"})
+
+    def test_business_error_never_double_stops(self):
+        """唯一迁到 v2 的写操作。业务错误（任务已结束/无权限）必须直接抛，
+        绝不能回落 v1 导致停两次。"""
+        calls = []
+
+        def fake_post(url, **_):
+            calls.append(url)
+            return _Resp(
+                200,
+                {
+                    "ResponseMetadata": {
+                        "Error": {"Code": "InvalidStatus", "Message": "已结束"}
+                    }
+                },
+            )
+
+        with mock.patch.object(api, "_curl_post", side_effect=fake_post):
+            with self.assertRaises(QzAPIError):
+                _client().stop_job_with_cookie("job-7", "ck")
+        self.assertEqual(len(calls), 1)
+
+
+class ListSpecsTests(unittest.TestCase):
+    """/openapi/v1/specs/list 平台上已 404，规格只能从历史任务反推。"""
+
+    def test_recovers_spec_ids_from_job_history(self):
+        job = {
+            "logic_compute_group_id": "lcg-1",
+            "framework_config": [
+                {
+                    "gpu_count": 8,
+                    "cpu": 180,
+                    "mem_gi": 1800,
+                    "instance_spec_price_info": {
+                        "quota_id": "quota-abc",
+                        "gpu_count": 8,
+                        "cpu_count": 180,
+                        "memory_size_gib": 1800,
+                        "gpu_info": {"gpu_type": "NVIDIA_H200_SXM_141G"},
+                    },
+                }
+            ],
+        }
+        client = _client()
+        with mock.patch.object(
+            client, "_request", side_effect=QzAPIError("404", 404)
+        ), mock.patch.object(
+            client, "list_jobs_with_cookie", return_value={"jobs": [job]}
+        ):
+            specs = client.list_specs("lcg-1", "ws-1")
+
+        self.assertEqual(len(specs), 1)
+        self.assertEqual(specs[0]["id"], "quota-abc")
+        self.assertEqual(specs[0]["gpu_count"], 8)
+        # gpu_type 必须是完整串，平台校验不认简称 "H200"
+        self.assertEqual(specs[0]["gpu_type"], "NVIDIA_H200_SXM_141G")
+        self.assertEqual(specs[0]["logic_compute_group_ids"], ["lcg-1"])
+
+    def test_filters_out_other_compute_groups(self):
+        jobs = [
+            {
+                "logic_compute_group_id": "lcg-other",
+                "framework_config": [
+                    {"instance_spec_price_info": {"quota_id": "quota-x"}}
+                ],
+            }
+        ]
+        client = _client()
+        with mock.patch.object(
+            client, "_request", side_effect=QzAPIError("404", 404)
+        ), mock.patch.object(
+            client, "list_jobs_with_cookie", return_value={"jobs": jobs}
+        ):
+            self.assertEqual(client.list_specs("lcg-1", "ws-1"), [])
+
+    def test_without_workspace_id_returns_empty(self):
+        """没有 workspace 就翻不了历史任务 —— 老实返回空，别硬编。"""
+        client = _client()
+        with mock.patch.object(client, "_request", side_effect=QzAPIError("404", 404)):
+            self.assertEqual(client.list_specs("lcg-1"), [])
+
+    def test_legacy_endpoint_wins_when_alive(self):
+        """老接口还活着就用它 —— 它才是"规格清单"的权威来源，
+        历史任务反推只能看到跑过的那些。"""
+        client = _client()
+        with mock.patch.object(
+            client, "_request", return_value={"data": {"specs": [{"id": "s-1"}]}}
+        ), mock.patch.object(client, "list_jobs_with_cookie") as hist:
+            self.assertEqual(client.list_specs("lcg-1", "ws-1"), [{"id": "s-1"}])
+        hist.assert_not_called()
+
+
 class V2FallbackToV1Tests(unittest.TestCase):
     """v2 路由 404 时，公开方法要透明回落到 v1 并返回同样形状的数据。"""
 

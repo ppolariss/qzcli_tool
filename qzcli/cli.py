@@ -4028,7 +4028,9 @@ def _load_specs_for_create_result(
     try:
         fetched_specs = [
             normalized
-            for spec in api.list_specs(compute_group_id)
+            # 带上 workspace_id：/openapi/v1/specs/list 已 404，第二级要按
+            # 工作空间翻历史任务才能反推出 spec
+            for spec in api.list_specs(compute_group_id, workspace_id)
             for normalized in [_normalize_spec_item(spec, compute_group_id)]
             if normalized
         ]
