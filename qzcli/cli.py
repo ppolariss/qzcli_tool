@@ -1891,9 +1891,11 @@ def cmd_avail(args):
                 if args.low_priority:
                     low_priority_free = r.get("low_priority_free_nodes", 0)
                     row.extend(
-                        [low_priority_free,
-                         r.get("fragmented_low_priority_gpus", 0),
-                         r.get("free_nodes", 0) + low_priority_free]
+                        [
+                            low_priority_free,
+                            r.get("fragmented_low_priority_gpus", 0),
+                            r.get("free_nodes", 0) + low_priority_free,
+                        ]
                     )
                 row.extend(
                     [
@@ -2427,6 +2429,17 @@ def cmd_workspace(args):
 
     cookie = cookie_data["cookie"]
     workspace_id = args.workspace or cookie_data.get("workspace_id", "")
+
+    # `-w` 允许传名字（其他子命令都支持），这里必须解析成 ws-<uuid>。
+    # 不解析的话名字会原样拼进 referer 头，中文字符触发
+    # `'latin-1' codec can't encode` —— 请求根本发不出去。
+    if workspace_id and not workspace_id.startswith("ws-"):
+        resolved, ws_name = _resolve_workspace_value(api, display, workspace_id)
+        if not resolved:
+            display.print_error(f"未找到工作空间: {workspace_id}")
+            return 1
+        display.print(f"[dim]匹配到工作空间: {ws_name} -> {resolved}[/dim]")
+        workspace_id = resolved
 
     # 如果没有指定 workspace，列出可用的 workspace 供选择
     if not workspace_id:
@@ -6895,9 +6908,7 @@ def _resolve_notebook_id_by_name(target, cookie, display):
     # 2. 前缀模糊：notebook_id 以 target 开头。
     if target:
         prefix_hits = [
-            nb
-            for nb in notebooks
-            if str(nb.get("notebook_id", "")).startswith(target)
+            nb for nb in notebooks if str(nb.get("notebook_id", "")).startswith(target)
         ]
         if len(prefix_hits) == 1:
             return prefix_hits[0].get("notebook_id")
