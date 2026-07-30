@@ -1610,10 +1610,22 @@ class _CollectingDisplay:
     )
 )
 def qz_exec(
-    target: str, command: str, timeout: int = 120, detach: bool = False
+    target: str,
+    command: str,
+    timeout: int = 120,
+    detach: bool = False,
+    session: str = "",
 ) -> dict[str, Any]:
     _require_cookie()
+    import os
+
     from .cli import _exec_launch, _exec_poll, _find_notebook_jupyter_info
+
+    # 多个 agent 共用一台开发机时，各自的输出靠 session 隔离到不同目录。
+    # 走 stdio 时一个 agent 就是一个 server 进程，自动生成的 session 已经够用；
+    # 这个参数留给"想把多次调用显式钉在同一个 session"的场景。
+    if session:
+        os.environ["QZCLI_SESSION_ID"] = session
 
     display = _CollectingDisplay()
     info = _find_notebook_jupyter_info(target, display)

@@ -144,9 +144,7 @@ class ResolveNotebookIdByNameTests(unittest.TestCase):
 
     def test_finds_by_exact_notebook_id(self):
         """粘贴完整 notebook_id（名字不匹配时）也能解析。"""
-        api = self._fake_api(
-            {WS_ID: [{"name": "some-dev", "notebook_id": UUID_REAL}]}
-        )
+        api = self._fake_api({WS_ID: [{"name": "some-dev", "notebook_id": UUID_REAL}]})
         with patch("qzcli.cli.get_api", return_value=api), patch(
             "qzcli.cli.load_all_resources", return_value={WS_ID: {"name": "ws"}}
         ):
@@ -160,7 +158,10 @@ class ResolveNotebookIdByNameTests(unittest.TestCase):
             {
                 WS_ID: [
                     {"name": "dev-a", "notebook_id": UUID_REAL},
-                    {"name": "dev-b", "notebook_id": "9ced1457-1111-2222-3333-444455556666"},
+                    {
+                        "name": "dev-b",
+                        "notebook_id": "9ced1457-1111-2222-3333-444455556666",
+                    },
                 ]
             }
         )
@@ -177,8 +178,14 @@ class ResolveNotebookIdByNameTests(unittest.TestCase):
         api = self._fake_api(
             {
                 WS_ID: [
-                    {"name": "dev-a", "notebook_id": f"{shared}-aaaa-484a-898c-695596b0877b"},
-                    {"name": "dev-b", "notebook_id": f"{shared}-bbbb-484a-898c-695596b0877b"},
+                    {
+                        "name": "dev-a",
+                        "notebook_id": f"{shared}-aaaa-484a-898c-695596b0877b",
+                    },
+                    {
+                        "name": "dev-b",
+                        "notebook_id": f"{shared}-bbbb-484a-898c-695596b0877b",
+                    },
                 ]
             }
         )
@@ -352,10 +359,6 @@ class FindNotebookJupyterInfoTests(unittest.TestCase):
         display.print_error.assert_called_once()
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class ExecConcurrencyTests(unittest.TestCase):
     """多 agent 并发 exec 同一台开发机时的隔离性。
 
@@ -447,3 +450,170 @@ class ExecConcurrencyTests(unittest.TestCase):
         payload = sent[0]
         self.assertIn("setsid", payload)
         self.assertIn("nohup", payload)
+
+
+class SessionIdTests(unittest.TestCase):
+    """QZCLI_SESSION_ID 的三级阶梯 + 自动兜底。"""
+
+    def setUp(self):
+        from qzcli import config
+
+        config._AUTO_SESSION_ID = None
+        self.addCleanup(setattr, config, "_AUTO_SESSION_ID", None)
+
+    def _get(self, env=None, env_file=None, cfg=None):
+        from qzcli import config
+
+        with patch.dict("os.environ", env or {}, clear=False), patch.object(
+            config, "load_env_file", return_value=env_file or {}
+        ), patch.object(config, "load_config", return_value=cfg or {}):
+            return config.get_session_id()
+
+    def test_env_wins(self):
+        got = self._get(
+            env={"QZCLI_SESSION_ID": "from-env"},
+            env_file={"QZCLI_SESSION_ID": "from-file"},
+            cfg={"session_id": "from-cfg"},
+        )
+        self.assertEqual(got, "from-env")
+
+    def test_env_file_beats_config(self):
+        got = self._get(
+            env_file={"QZCLI_SESSION_ID": "from-file"}, cfg={"session_id": "from-cfg"}
+        )
+        self.assertEqual(got, "from-file")
+
+    def test_auto_when_unset_and_stable_within_process(self):
+        """同一进程内必须稳定 —— 否则一个 agent 的多次 exec 会落到不同 session，
+        attach/list 就串不起来。"""
+        import os
+
+        env = {k: v for k, v in os.environ.items() if k != "QZCLI_SESSION_ID"}
+        with patch.dict("os.environ", env, clear=True):
+            a = self._get()
+            b = self._get()
+        self.assertEqual(a, b)
+        self.assertRegex(a, r"^[0-9a-f]{8}$")
+
+    def test_unsafe_chars_are_sanitized(self):
+        """session 会进目录名和 job_id，不能带 / 和空格。"""
+        got = self._get(env={"QZCLI_SESSION_ID": "my agent/01"})
+        self.assertNotIn("/", got)
+        self.assertNotIn(" ", got)
+
+    def test_all_unsafe_input_still_distinct(self):
+        """纯中文之类全非法字符的 session 名，不能被清成空串然后静默退回自动值 ——
+        那样用户显式设的 session 会被无视，且两个不同的名字会撞成同一个。"""
+        a = self._get(env={"QZCLI_SESSION_ID": "我的会话"})
+        b = self._get(env={"QZCLI_SESSION_ID": "另一个会话"})
+        self.assertTrue(a)
+        self.assertNotEqual(a, b)
+
+
+class SessionPathTests(unittest.TestCase):
+    """job_id ↔ session ↔ 远端路径的互推，含老格式回落。"""
+
+    def test_new_format_carries_session(self):
+        from qzcli.cli import _session_of
+
+        self.assertEqual(_session_of("qzcli_abc12345_1785400000_deadbeef"), "abc12345")
+        self.assertEqual(
+            _session_of("qzcli_my-agent-01_1785400000_deadbeef"), "my-agent-01"
+        )
+
+    def test_legacy_formats_have_no_session(self):
+        """升级前发出去的 job_id 必须还能认出来，否则老任务 attach 不回来。"""
+        from qzcli.cli import _session_of
+
+        self.assertEqual(_session_of("qzcli_1785400000"), "")
+        self.assertEqual(_session_of("qzcli_1785400000_deadbeef"), "")
+        self.assertEqual(_session_of(""), "")
+
+    def test_paths_are_namespaced_by_session(self):
+        from qzcli.cli import _exec_paths
+
+        out, exit_ = _exec_paths("qzcli_sess1_1785400000_deadbeef")
+        self.assertEqual(out, "_qzcli/sess1/qzcli_sess1_1785400000_deadbeef_out")
+        self.assertEqual(exit_, "_qzcli/sess1/qzcli_sess1_1785400000_deadbeef_exit")
+
+    def test_legacy_paths_stay_flat(self):
+        from qzcli.cli import _exec_paths
+
+        out, _ = _exec_paths("qzcli_1785400000")
+        self.assertEqual(out, "_qzcli/qzcli_1785400000_out")
+
+
+class ExecShellCommandTests(unittest.TestCase):
+    """下发到远端终端的那条 shell 命令的形状。"""
+
+    def _sent(self, session="sess1"):
+        from qzcli import cli
+
+        sent = []
+
+        class _R:
+            status_code = 200
+
+            def __init__(self, p=None):
+                self._p = p or {"name": "t1"}
+
+            def json(self):
+                return self._p
+
+        class _WS:
+            def settimeout(self, *_a):
+                pass
+
+            def recv(self):
+                raise RuntimeError("drain")
+
+            def send(self, payload):
+                sent.append(payload)
+
+            def close(self):
+                pass
+
+        with patch("requests.post", return_value=_R()), patch(
+            "requests.get", return_value=_R([])
+        ), patch("requests.delete", return_value=_R()), patch(
+            "requests.put", return_value=_R()
+        ), patch(
+            "websocket.create_connection", return_value=_WS()
+        ), patch(
+            "time.sleep"
+        ), patch.object(
+            cli, "get_session_id", return_value=session
+        ):
+            cli._exec_launch(
+                {"base_url": "https://nb.example/x", "token": "tk"},
+                "echo hi",
+                MagicMock(),
+            )
+        return sent[0]
+
+    def test_output_goes_into_session_dir(self):
+        payload = self._sent()
+        self.assertIn("/tmp/.qzcli/sess1/", payload)
+
+    def test_symlink_no_longer_uses_rm_rf(self):
+        """老实现是 `rm -rf "$PWD/_qzcli" && ln -sf`，并发下可能把别的 exec
+        正在读的目录删掉。"""
+        payload = self._sent()
+        self.assertNotIn('rm -rf "$PWD', payload)
+        self.assertIn("ln -sfn", payload)
+
+    def test_ttl_prune_is_included(self):
+        """不清理的话 /tmp/.qzcli 是永久泄漏：没 attach 的、崩的、超时的
+        输出文件全留着。"""
+        payload = self._sent()
+        self.assertIn("-mtime +", payload)
+        self.assertIn("find /tmp/.qzcli", payload)
+
+    def test_still_detached(self):
+        payload = self._sent()
+        self.assertIn("setsid", payload)
+        self.assertIn("nohup", payload)
+
+
+if __name__ == "__main__":
+    unittest.main()

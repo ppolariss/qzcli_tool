@@ -23,6 +23,7 @@ from .config import (
     find_workspace_by_name,
     get_cookie,
     get_credentials,
+    get_session_id,
     get_workspace_resources,
     init_config,
     list_cached_workspaces,
@@ -2030,9 +2031,11 @@ def cmd_avail(args):
                 if args.low_priority:
                     low_priority_free = r.get("low_priority_free_nodes", 0)
                     row.extend(
-                        [low_priority_free,
-                         r.get("fragmented_low_priority_gpus", 0),
-                         r.get("free_nodes", 0) + low_priority_free]
+                        [
+                            low_priority_free,
+                            r.get("fragmented_low_priority_gpus", 0),
+                            r.get("free_nodes", 0) + low_priority_free,
+                        ]
                     )
                 row.extend(
                     [
@@ -7048,9 +7051,7 @@ def _resolve_notebook_id_by_name(target, cookie, display):
     # 2. 前缀模糊：notebook_id 以 target 开头。
     if target:
         prefix_hits = [
-            nb
-            for nb in notebooks
-            if str(nb.get("notebook_id", "")).startswith(target)
+            nb for nb in notebooks if str(nb.get("notebook_id", "")).startswith(target)
         ]
         if len(prefix_hits) == 1:
             return prefix_hits[0].get("notebook_id")
@@ -7164,6 +7165,35 @@ def _find_notebook_jupyter_info(target, display):
     return info
 
 
+# 远端 /tmp/.qzcli/<session>/ 目录的保留天数。超过就在下次 launch 时清掉。
+EXEC_SESSION_TTL_DAYS = 7
+
+# 新格式 job_id：qzcli_<session>_<秒级时间戳>_<8位随机>
+_JOB_ID_RE = re.compile(
+    r"^qzcli_(?P<session>[A-Za-z0-9_-]+?)_(?P<ts>\d{9,})_[0-9a-f]{8}$"
+)
+
+
+def _session_of(job_id):
+    """从 job_id 反推它属于哪个 session；老格式返回 ``""``。
+
+    老格式是 ``qzcli_<ts>`` 或 ``qzcli_<ts>_<rand>``，文件平铺在 ``/tmp/.qzcli/`` 下。
+    **必须能识别并回落到平铺路径** —— 否则升级前 `--detach` 拿到的 job_id
+    升级后就 attach 不回来了。
+    """
+    if not job_id:
+        return ""
+    m = _JOB_ID_RE.match(job_id)
+    return m.group("session") if m else ""
+
+
+def _exec_paths(job_id):
+    """返回 (out, exit) 两个 Contents API 相对路径。"""
+    session = _session_of(job_id)
+    base = f"_qzcli/{session}" if session else "_qzcli"
+    return f"{base}/{job_id}_out", f"{base}/{job_id}_exit"
+
+
 def _exec_launch(jupyter_info, cmd_str, display, job_id=None):
     """发起 fire-and-forget 执行：建好 Contents API 中转目录，再通过 Terminal 写入
     一条复合命令（输出落到 /tmp/.qzcli/<job_id>_out、退出码落到 _exit）。
@@ -7190,12 +7220,20 @@ def _exec_launch(jupyter_info, cmd_str, display, job_id=None):
     headers = {"authorization": f"token {token}", "content-type": "application/json"}
 
     if job_id is None:
-        # 必须带随机后缀。原来只有秒级时间戳，**同一秒内起的多个 exec 会拿到
-        # 完全相同的 job_id**，于是共用同一个 /tmp/.qzcli/<job_id>_out —— 多个
-        # agent 并发时互相覆盖输出、互相读到对方的结果（实测 3 路并发时，第 3 路
-        # 收到的是第 2 路的输出，第 1 路什么都没收到）。
-        job_id = f"qzcli_{int(_time.time())}_{uuid.uuid4().hex[:8]}"
-    tmp_dir = "/tmp/.qzcli"
+        # job_id 由三段构成：session + 秒级时间戳 + 随机后缀。
+        #
+        # - **随机后缀**：原来只有时间戳，同一秒内起的多个 exec 会拿到完全相同的
+        #   job_id，共用一个输出文件、互相覆盖（实测 3 路并发时第 3 路收到的是
+        #   第 2 路的输出，第 1 路什么都没收到）。
+        # - **session 段**：让任务可归属。多个 agent 同时用同一台开发机时，
+        #   `exec --list` 靠它只列自己的，TTL 清理也按 session 整体删。
+        #   编在 job_id 里而不是单独传参，是为了让 `exec-attach <job_id>`
+        #   的 CLI 契约完全不用改 —— 从 id 就能反推出目录。
+        job_id = f"qzcli_{get_session_id()}_{int(_time.time())}_{uuid.uuid4().hex[:8]}"
+
+    session = _session_of(job_id)
+    tmp_root = "/tmp/.qzcli"
+    tmp_dir = f"{tmp_root}/{session}" if session else tmp_root
     # Contents API 通过 symlink 读取 /tmp/.qzcli
     api_dir = "_qzcli"
 
@@ -7211,16 +7249,29 @@ def _exec_launch(jupyter_info, cmd_str, display, job_id=None):
         pass
 
     # 2. 通过 Terminal 发送一条复合命令（fire-and-forget）
-    #    输出写到 /tmp/.qzcli/，通过 symlink 让 Contents API 可读
+    #    输出写到 /tmp/.qzcli/<session>/，通过 symlink 让 Contents API 可读
     # 用 setsid 把命令从这个终端会话里摘出去：终端一关（我们随后会主动删掉它），
     # 命令仍在服务端跑完。没有 setsid 的镜像回退到 nohup。
     inner = (
         f"( {cmd_str} ) > {tmp_dir}/{job_id}_out 2>&1; "
         f"echo $? > {tmp_dir}/{job_id}_exit"
     )
+    # symlink 用 `ln -sfn` 幂等重建，**不再先 rm -rf**：原来的
+    # `rm -rf "$PWD/_qzcli" && ln -sf` 在并发下可能把别的 exec 正在读的目录删掉。
+    # `-n` 是关键，否则当 _qzcli 已是指向目录的 symlink 时，`ln -sf` 会把新链接
+    # 建到目录**里面**去（变成 _qzcli/.qzcli），而不是替换它。
+    #
+    # 顺带清理超过 TTL 的旧 session 目录 —— 这是目前唯一的泄漏出口：
+    # `--detach` 后没 attach 的、Ctrl-C 的、超时的输出文件本来会永久留着。
+    # 只删 tmp_root 下一层的目录，且失败不影响主流程。
+    prune = (
+        f"find {tmp_root} -mindepth 1 -maxdepth 1 -type d "
+        f"-mtime +{EXEC_SESSION_TTL_DAYS} -exec rm -rf {{}} + 2>/dev/null || true"
+    )
     shell_cmd = (
         f"mkdir -p {tmp_dir} && "
-        f'{{ [ -L "$PWD/{api_dir}" ] || {{ rm -rf "$PWD/{api_dir}" && ln -sf {tmp_dir} "$PWD/{api_dir}"; }}; }} && '
+        f'ln -sfn {tmp_root} "$PWD/{api_dir}" && '
+        f"{{ {prune}; }}; "
         f"{{ command -v setsid >/dev/null && setsid bash -c {shlex.quote(inner)} "
         f"|| nohup bash -c {shlex.quote(inner)}; }} >/dev/null 2>&1 &"
     )
@@ -7300,9 +7351,9 @@ def _exec_poll(jupyter_info, job_id, display, timeout=120, cleanup_on_done=True)
     base_http = jupyter_info["base_url"]
     token = jupyter_info["token"]
     headers = {"authorization": f"token {token}", "content-type": "application/json"}
-    api_dir = "_qzcli"
-    api_out = f"{api_dir}/{job_id}_out"
-    api_exit = f"{api_dir}/{job_id}_exit"
+    # 路径由 job_id 反推（新格式带 session 段 → <session>/ 子目录；
+    # 老格式回落到平铺，保证升级前发出的 job_id 仍能 attach）
+    api_out, api_exit = _exec_paths(job_id)
 
     def cleanup():
         # Contents API 删除会同时删掉 /tmp 里的文件（因为 symlink）
@@ -7368,6 +7419,72 @@ def _exec_via_jupyter(jupyter_info, cmd_str, display, timeout=120):
     return exit_code, output
 
 
+def _exec_list(jupyter_info, display, show_all=False):
+    """列出开发机上 qzcli 留下的 exec 任务。
+
+    默认只列**本 session** 的 —— 多个 agent 共用一台开发机时，别人的任务不该
+    出现在你的列表里。``--all`` 看全部（含老格式的平铺文件）。
+    """
+    import requests as _requests
+
+    base_http = jupyter_info["base_url"]
+    headers = {"authorization": f"token {jupyter_info['token']}"}
+    mine = get_session_id()
+
+    def ls(path):
+        try:
+            r = _requests.get(
+                f"{base_http}/api/contents/{path}", headers=headers, timeout=15
+            )
+            if r.status_code != 200:
+                return []
+            return r.json().get("content") or []
+        except Exception:
+            return []
+
+    rows = []  # (session, job_id, 是否完成, 修改时间)
+    for entry in ls("_qzcli"):
+        if entry.get("type") == "directory":
+            session = entry.get("name", "")
+            if not show_all and session != mine:
+                continue
+            listing = ls(f"_qzcli/{session}")
+        else:
+            # 老格式：文件直接平铺在 _qzcli/ 下，没有 session 归属
+            session, listing = "", [entry]
+            if not show_all:
+                continue
+
+        names = {c.get("name", "") for c in listing}
+        for c in listing:
+            name = c.get("name", "")
+            if not name.endswith("_out"):
+                continue
+            job_id = name[: -len("_out")]
+            rows.append(
+                (
+                    session or "(老格式)",
+                    job_id,
+                    f"{job_id}_exit" in names,
+                    c.get("last_modified", ""),
+                )
+            )
+
+    if not rows:
+        scope = "全部" if show_all else f"session {mine}"
+        display.print(f"没有找到 exec 任务（范围：{scope}）")
+        return 0
+
+    rows.sort(key=lambda r: r[3], reverse=True)
+    display.print(f"[bold]{'SESSION':<14} {'状态':<6} {'JOB ID':<46} 最后更新[/bold]")
+    for session, job_id, done, mtime in rows:
+        state = "已完成" if done else "运行中"
+        display.print(f"{session:<14} {state:<6} {job_id:<46} {mtime}")
+    display.print("")
+    display.print("[dim]拉取输出: qzcli exec-attach <开发机> <JOB ID>[/dim]")
+    return 0
+
+
 def cmd_exec(args):
     """在开发机上执行命令（通过 Jupyter terminal API）"""
     display = get_display()
@@ -7375,6 +7492,12 @@ def cmd_exec(args):
     cmd_parts = args.remote_cmd
     timeout = getattr(args, "timeout", 120)
     detach = getattr(args, "detach", False)
+
+    if getattr(args, "list_jobs", False):
+        jupyter_info = _find_notebook_jupyter_info(target, display)
+        if jupyter_info is None:
+            return 1
+        return _exec_list(jupyter_info, display, show_all=getattr(args, "all", False))
 
     if not cmd_parts:
         display.print_error("请指定要执行的命令")
@@ -7757,6 +7880,18 @@ def main():
         help="后台启动后立即返回 job_id，不等待结果；之后用 `qzcli exec-attach` 拉取输出。",
     )
     exec_parser.add_argument(
+        "--list",
+        dest="list_jobs",
+        action="store_true",
+        help="列出该开发机上的 exec 任务（默认只列本 session），不执行命令。"
+        " 用于找回 `--detach` 之后忘记记录的 job_id。",
+    )
+    exec_parser.add_argument(
+        "--all",
+        action="store_true",
+        help="配合 --list：列出所有 session 的任务，不只是本 session。",
+    )
+    exec_parser.add_argument(
         "host",
         metavar="target",
         help="开发机标识：name (如 blender-rl) / notebook_id (UUID 或前缀) / "
@@ -7782,7 +7917,9 @@ def main():
         help="开发机标识：name / notebook_id (UUID 或前缀) / 完整 URL（同 exec）",
     )
     exec_attach_parser.add_argument(
-        "job_id", help="exec --detach 返回的 job_id（如 qzcli_1700000000）"
+        "job_id",
+        help="exec --detach 返回的 job_id（如 qzcli_a1b2c3d4_1785400000_deadbeef）。"
+        "忘了可以用 `qzcli exec --list <开发机>` 查",
     )
 
     # workspace 命令

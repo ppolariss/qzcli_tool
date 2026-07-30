@@ -604,17 +604,40 @@ class QzAPI:
     ) -> List[Dict[str, Any]]:
         """统一的事件查询（内部 API）。
 
-        平台端点 ``POST /api/v1/train_job/events/list``，按 ``filter.object_type``
-        区分 job / instance 两个视角（已真机验证 2026-07）。返回 ``data.events``。
+        按 ``filter.object_type`` 区分 job / instance 两个视角（已真机验证 2026-07）。
         每条事件含 ``type``(Normal/Warning)、``reason``、``message``、
         ``first_timestamp``、``last_timestamp``、``age``、``from``、``object_id``。
+
+        优先 v2 ``train ListJobEvents``，路由不通时回落
+        ``POST /api/v1/train_job/events/list``。两边请求体一致、返回都是
+        ``events`` 列表（v2 在 ``Result.events``，v1 在 ``data.events``）。
         """
-        url = f"{self.base_url}/api/v1/train_job/events/list"
         payload = {
             "page_num": 1,
             "page_size": page_size,
             "filter": {"object_type": object_type, "object_ids": list(object_ids)},
         }
+        return _v2_then_v1(
+            "train_job/events/list",
+            lambda: (
+                self._request_v2(
+                    "train",
+                    "ListJobEvents",
+                    payload,
+                    cookie=cookie,
+                    referer_path=f"/jobs/distributedTrainingDetail/{job_id}",
+                ).get("events")
+                or []
+            ),
+            lambda: self._get_events_v1(job_id, cookie, payload),
+        )
+
+    @with_auth_retry
+    def _get_events_v1(
+        self, job_id: str, cookie: str, payload: Dict[str, Any]
+    ) -> List[Dict[str, Any]]:
+        """遗留路径 ``POST /api/v1/train_job/events/list``。"""
+        url = f"{self.base_url}/api/v1/train_job/events/list"
         response = _curl_post(
             url, json=payload, headers=self._events_headers(job_id, cookie), timeout=60
         )
