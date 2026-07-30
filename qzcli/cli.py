@@ -500,6 +500,129 @@ def cmd_list(args):
     return 0
 
 
+# ---- 调度诊断（events）共享工具 ----
+
+_WAITING_STATUS_TOKENS = ("queue", "queued", "queuing", "pending", "waiting")
+# 排不上：调度器直接判定无可用节点。
+_SCHED_PROBLEM_REASONS = ("unschedulable", "failedscheduling")
+# 被抢占：低优/碎卡卡被高优任务挤掉（碎卡治理的典型信号）。
+_PREEMPT_REASONS = ("evict", "preempted")
+
+
+def _status_is_waiting(status: Optional[str]) -> bool:
+    """任务是否处于排队/等待态。"""
+    s = (status or "").lower()
+    return any(tok in s for tok in _WAITING_STATUS_TOKENS)
+
+
+def _fmt_event_ts(ms) -> str:
+    """毫秒 epoch → 本地 'MM-DD HH:MM:SS'。"""
+    try:
+        from datetime import datetime
+
+        return datetime.fromtimestamp(int(ms) / 1000).strftime("%m-%d %H:%M:%S")
+    except Exception:
+        return "-"
+
+
+def _event_sort_key(e: Dict[str, Any]):
+    return int(e.get("last_timestamp") or e.get("first_timestamp") or 0)
+
+
+def _pick_scheduling_reason(events) -> Optional[tuple]:
+    """从事件里挑最能解释「排不上 / 被抢占」的一条。
+
+    优先返回 Unschedulable/FailedScheduling（真·排不上），其次 Evict/Preempted
+    （被高优抢占）。返回 ``(reason, message)`` 或 None。
+    """
+    problem, preempt = [], []
+    for e in events:
+        rl = (e.get("reason") or "").lower()
+        if any(k in rl for k in _SCHED_PROBLEM_REASONS):
+            problem.append(e)
+        elif any(k in rl for k in _PREEMPT_REASONS):
+            preempt.append(e)
+    pool = problem or preempt
+    if not pool:
+        return None
+    pool.sort(key=_event_sort_key)
+    latest = pool[-1]
+    return (latest.get("reason") or "", (latest.get("message") or "").strip())
+
+
+def cmd_events(args):
+    """查看任务的平台事件（调度 / 抢占 / 拉镜像 / 失败诊断）。
+
+    默认拉任务（控制器）级事件——排队排不上的真因（``Unschedulable``：
+    "0/N nodes are unavailable..."）就在这里。``--all-instances`` 追加 Pod 级
+    事件（``FailedScheduling`` / ``Scheduled`` / ``Evict`` / ``Preempted``，更细）。
+    """
+    display = get_display()
+    api = get_api()
+    job_id = args.job_id
+
+    cookie = _get_cookie_value()
+    if not cookie:
+        display.print_error("未找到有效 cookie，请先 `qzcli login`")
+        return 1
+
+    source = {}
+    try:
+        events = list(api.get_job_events_with_cookie(job_id, cookie))
+        for e in events:
+            source[id(e)] = "job"
+        if getattr(args, "all_instances", False):
+            iev = api.get_job_instance_events_with_cookie(job_id, cookie)
+            for e in iev:
+                source[id(e)] = "pod"
+            events += iev
+    except QzAPIError as e:
+        display.print_error(f"查询事件失败: {e}")
+        return 1
+
+    # 过滤：--reason 子串（大小写不敏感），--type 精确（Normal/Warning）
+    if getattr(args, "reason", None):
+        rq = args.reason.lower()
+        events = [e for e in events if rq in (e.get("reason") or "").lower()]
+    if getattr(args, "type", None):
+        tq = args.type.lower()
+        events = [e for e in events if (e.get("type") or "").lower() == tq]
+
+    events.sort(key=_event_sort_key)
+    if getattr(args, "tail", None):
+        events = events[-args.tail :]
+
+    if getattr(args, "output_json", False):
+        import json
+
+        print(json.dumps(events, indent=2, ensure_ascii=False))
+        return 0
+
+    if not events:
+        display.print("[dim]无匹配事件[/dim]")
+        return 0
+
+    for e in events:
+        etype = (e.get("type") or "").strip()
+        reason = (e.get("reason") or "").strip()
+        msg = (e.get("message") or "").strip()
+        ts = _fmt_event_ts(e.get("last_timestamp") or e.get("first_timestamp"))
+        scope = source.get(id(e)) or (e.get("object_type") or "")
+        color = "yellow" if etype.lower() == "warning" else "green"
+        display.print(
+            f"[dim]{ts}[/dim] [{color}]{etype:<7}[/{color}] "
+            f"[bold]{reason}[/bold] [dim]({scope})[/dim]"
+        )
+        if msg:
+            display.print(f"    {msg}")
+
+    sched = _pick_scheduling_reason(events)
+    if sched:
+        r, m = sched
+        display.print(f"\n[yellow]⚠ 调度诊断[/yellow]: {r} — {m}")
+    return 0
+
+
 def cmd_status(args):
     """查看任务状态"""
     display = get_display()
@@ -513,6 +636,20 @@ def cmd_status(args):
         api_data = api.get_job_detail(job_id)
         job = store.update_from_api(job_id, api_data)
         display.print_job_detail(job, api_data)
+
+        # 排队/等待态时，best-effort 补一行「为什么排不上」——接碎卡闭环：
+        # 看碎卡 → exclude → 提交 → 若还排队，这里直接给真因。
+        if _status_is_waiting(api_data.get("status")):
+            try:
+                cookie = _get_cookie_value()
+                if cookie:
+                    events = api.get_job_events_with_cookie(job_id, cookie)
+                    sched = _pick_scheduling_reason(events)
+                    if sched:
+                        r, m = sched
+                        display.print(f"[yellow]排队原因[/yellow]: {r} — {m}")
+            except Exception:
+                pass  # 诊断是附加信息，绝不打断 status 主流程
 
         if args.json:
             import json
@@ -7468,6 +7605,28 @@ def main():
         "--json", dest="output_json", action="store_true", help="原始 JSON 输出"
     )
 
+    # events 命令（调度/抢占诊断）
+    events_parser = subparsers.add_parser(
+        "events", aliases=["ev"], help="查看任务平台事件（排队/调度/抢占诊断）"
+    )
+    events_parser.add_argument("job_id", help="任务 ID")
+    events_parser.add_argument(
+        "--reason", help="按 reason 子串过滤（大小写不敏感，如 Unschedulable）"
+    )
+    events_parser.add_argument(
+        "--type", choices=["Normal", "Warning"], help="按事件类型过滤"
+    )
+    events_parser.add_argument("--tail", "-n", type=int, help="只看末 N 条（过滤后）")
+    events_parser.add_argument(
+        "--all-instances",
+        dest="all_instances",
+        action="store_true",
+        help="追加 Pod 级事件（FailedScheduling/Evict/Preempted，更细）",
+    )
+    events_parser.add_argument(
+        "--json", dest="output_json", action="store_true", help="原始 JSON 输出"
+    )
+
     # watch 命令
     watch_parser = subparsers.add_parser("watch", aliases=["w"], help="实时监控")
     watch_parser.add_argument(
@@ -7866,6 +8025,8 @@ def main():
         "st": cmd_status,
         "stop": cmd_stop,
         "logs": cmd_logs,
+        "events": cmd_events,
+        "ev": cmd_events,
         "watch": cmd_watch,
         "w": cmd_watch,
         "track": cmd_track,
