@@ -302,9 +302,71 @@ class V2FallbackToV1Tests(unittest.TestCase):
         self.assertTrue(calls[0].endswith("/api/v2/train"))
         self.assertTrue(calls[1].endswith("/api/v1/train_job/list"))
 
-    def test_business_error_surfaces_instead_of_falling_back(self):
-        """v2 通了但报 AccessForbidden —— 应该抛出去，不能偷偷用 v1 顶上，
-        否则权限问题会被永久掩盖。"""
+    def _forbidden_then_v1(self, api_code="AccessForbidden"):
+        """v2 回权限错误、v1 正常 —— 真机上「拟人多模态大任务」空间就是这样。"""
+        calls = []
+
+        def fake_post(url, **_):
+            calls.append(url)
+            if "/api/v2/" in url:
+                return _Resp(
+                    200,
+                    {
+                        "ResponseMetadata": {
+                            "Error": {"Code": api_code, "Message": "Access denied"}
+                        }
+                    },
+                )
+            return _Resp(
+                200,
+                {
+                    "code": 0,
+                    "data": {
+                        "clusters": [],
+                        "compute_groups": [{"id": "cg-1"}],
+                        "resource_types": [],
+                    },
+                },
+            )
+
+        return calls, fake_post
+
+    def test_permission_error_falls_back_to_v1(self):
+        """权限没开必须回落 —— 否则该工作空间从「能用」直接变「报错」，
+        是纯退化。实测有工作空间 v2 全 AccessForbidden 而 v1 完全正常。"""
+        calls, fake_post = self._forbidden_then_v1()
+        msgs = []
+
+        with mock.patch.object(
+            api, "_curl_post", side_effect=fake_post
+        ), mock.patch.object(api, "print", side_effect=lambda m, **_: msgs.append(m)):
+            out = _client().get_cluster_basic_info("ws-1", "ck")
+
+        self.assertEqual(out["compute_groups"], [{"id": "cg-1"}])
+        self.assertIn("/api/v2/", calls[0])
+        self.assertIn("/api/v1/", calls[1])
+
+    def test_permission_fallback_warns_loudly_once(self):
+        """回落了要说出来，且说明是平台侧待授权 —— 但每个端点只提示一次，
+        `avail` 会对十几个工作空间循环调同一端点。"""
+        msgs = []
+
+        def forbidden():
+            raise QzAPIError(
+                "API 请求失败: AccessForbidden: denied", api_code="AccessForbidden"
+            )
+
+        for _ in range(3):
+            out = api._v2_then_v1("t", forbidden, lambda: {"ok": 1}, logger=msgs.append)
+            self.assertEqual(out, {"ok": 1})  # 每次都回落成功，不是只有第一次
+
+        self.assertEqual(len(msgs), 1, f"提示重复了: {msgs}")
+        self.assertIn("权限未开通", msgs[0])
+        self.assertIn("平台侧待授权", msgs[0])
+
+    def test_invalid_parameter_still_raises(self):
+        """参数错是**我们自己写错了**，回落 v1 会让它永远不被发现。
+        这条线不能和权限回落混为一谈。"""
         calls = []
 
         def fake_post(url, **_):
@@ -313,7 +375,39 @@ class V2FallbackToV1Tests(unittest.TestCase):
                 200,
                 {
                     "ResponseMetadata": {
+                        "Error": {"Code": "InvalidParameter", "Message": "bad arg"}
+                    }
+                },
+            )
+
+        with mock.patch.object(api, "_curl_post", side_effect=fake_post):
+            with self.assertRaises(QzAPIError):
+                _client().get_cluster_basic_info("ws-1", "ck")
+        self.assertEqual(len(calls), 1)  # 没有第二次（v1）调用
+
+    def test_api_code_is_attached_to_exception(self):
+        """按结构判断错误类型，不要去抠错误文案 —— 平台改个措辞就失效。"""
+        with self.assertRaises(QzAPIError) as cm:
+            api._unwrap_v2_result(
+                {
+                    "ResponseMetadata": {
                         "Error": {"Code": "AccessForbidden", "Message": "denied"}
+                    }
+                }
+            )
+        self.assertEqual(cm.exception.api_code, "AccessForbidden")
+
+    def test_unknown_business_error_surfaces(self):
+        """没在白名单里的业务错误照旧直接抛。"""
+        calls = []
+
+        def fake_post(url, **_):
+            calls.append(url)
+            return _Resp(
+                200,
+                {
+                    "ResponseMetadata": {
+                        "Error": {"Code": "InvalidStatus", "Message": "已结束"}
                     }
                 },
             )

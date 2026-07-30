@@ -43,11 +43,24 @@ V2_BROWSER_UA = (
 
 
 class QzAPIError(Exception):
-    """API 错误"""
+    """API 错误。
 
-    def __init__(self, message: str, code: Optional[int] = None):
+    ``code``     —— HTTP 状态码（如 401/404），没有则 None。
+    ``api_code`` —— v2 信封里 ``ResponseMetadata.Error.Code`` 的原值
+                    （如 ``AccessForbidden`` / ``InvalidParameter``）。
+                    有了它，下游就能**按结构**判断错误类型，而不是去抠错误文案 ——
+                    平台改一个字的措辞就会让 substring 匹配失效。
+    """
+
+    def __init__(
+        self,
+        message: str,
+        code: Optional[int] = None,
+        api_code: Optional[str] = None,
+    ):
         super().__init__(message)
         self.code = code
+        self.api_code = api_code
 
 
 class QzTransientError(QzAPIError):
@@ -195,7 +208,7 @@ def _unwrap_v2_result(data: Dict[str, Any]) -> Dict[str, Any]:
         if isinstance(err, dict):
             code = err.get("Code") or "Error"
             message = err.get("Message") or "未知错误"
-            raise QzAPIError(f"API 请求失败: {code}: {message}")
+            raise QzAPIError(f"API 请求失败: {code}: {message}", api_code=str(code))
     elif data.get("code") not in (None, 0):
         raise QzAPIError(
             f"API 请求失败: {data.get('message', '未知错误')}", data.get("code")
@@ -215,31 +228,54 @@ _V2_FALLBACK_WARNED: set = set()
 
 # 触发回落 v1 的 HTTP 状态码。这些表示"v2 这条路由不通"，重试没意义：
 #   404 网关未注册该 Action  405 方法不允许  501 未实现  502/503/504 网关侧挂了
-# 刻意**不含** 401/403 —— 401 由 `with_auth_retry` 重登处理，403 是权限问题，
-# 回落 v1 也一样会被拒，静默降级只会掩盖真实原因。
+# 刻意**不含** 401 —— 那由 `with_auth_retry` 重登处理。
 _V2_FALLBACK_STATUS = frozenset({404, 405, 501, 502, 503, 504})
+
+# 权限类业务错误：v2 通了、认证也过了，但这个账号/工作空间在 v2 侧没被授权。
+# 这类**必须回落 v1**，否则就是纯退化 —— 实测「拟人多模态大任务」工作空间在 v2 上
+# basic/node/jobs 三个接口全是 AccessForbidden，而 v1 完全正常；不回落的话该空间
+# 的 `qzcli list / avail / res` 会从"能用"变成"直接报错"。
+# 平台把 v2 权限补齐之前，这就是常态，不是偶发。
+_V2_FALLBACK_API_CODES = frozenset(
+    {"AccessForbidden", "Forbidden", "PermissionDenied", "NoPermission", "Unauthorized"}
+)
 
 
 def _v2_then_v1(name: str, v2_call, v1_call, *, logger=None):
-    """先打 v2，只在"v2 这条路不通"时回落 v1。
+    """先打 v2，只在"v2 走不通"时回落 v1。
 
     迁移期的核心保护：平台正在把 /api/v1 逐步下线（``/openapi/v1/specs/list``
-    已经 404），但也有 v2 反而更严的情况（``project ListProjects`` 对普通用户是
-    ``AccessForbidden``，v1 却正常）。两边都可能先坏，所以两条腿都留着。
+    已经 404），但也有 v2 反而更严的情况（部分工作空间 v2 权限还没开）。
+    两边都可能先坏，所以两条腿都留着。
 
-    **只有** ``_V2_FALLBACK_STATUS`` 里的状态码、或"返回非 JSON"（APISIX 把请求
-    302 到了 Keycloak）才回落。业务错误（``AccessForbidden`` / ``InvalidParameter``）
-    直接抛 —— 那说明 v2 通了但参数或权限不对，回落 v1 会把 bug 藏起来。
+    **回落的两类**：
+
+    1. 路由不通 —— ``_V2_FALLBACK_STATUS`` 里的状态码，或响应非 JSON
+       （APISIX 把请求 302 到了 Keycloak）
+    2. 权限没开 —— ``_V2_FALLBACK_API_CODES`` 里的 Error Code
+
+    **不回落的**：其他一切业务错误，尤其是 ``InvalidParameter`` ——
+    那是**我们自己请求写错了**，回落 v1 会让它一直不被发现。
+    这条线别顺手放开：权限问题回落是"平台还没准备好"，参数问题回落是"把 bug 藏起来"，
+    两件事性质完全不同。
     """
     try:
         return v2_call()
     except QzAPIError as exc:
-        fallback_worthy = exc.code in _V2_FALLBACK_STATUS or "非 JSON" in str(exc)
-        if not fallback_worthy:
+        is_perm = exc.api_code in _V2_FALLBACK_API_CODES
+        is_route = exc.code in _V2_FALLBACK_STATUS or "非 JSON" in str(exc)
+        if not (is_perm or is_route):
             raise
         if name not in _V2_FALLBACK_WARNED:
             _V2_FALLBACK_WARNED.add(name)
-            msg = f"[qzcli] v2 接口 {name} 不可用（{exc}），本次回落 v1。"
+            if is_perm:
+                msg = (
+                    f"[qzcli] v2 接口 {name} 权限未开通（{exc.api_code}），本次已回落 v1。"
+                    f" 功能不受影响，但这是平台侧待授权项 —— v1 下线后该接口会不可用，"
+                    f"请找平台开通对应工作空间的 v2 权限。"
+                )
+            else:
+                msg = f"[qzcli] v2 接口 {name} 不可用（{exc}），本次回落 v1。"
             if logger:
                 logger(msg)
             else:
