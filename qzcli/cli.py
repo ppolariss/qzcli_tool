@@ -5,9 +5,11 @@ qzcli - 启智平台任务管理 CLI
 
 import argparse
 import re
+import shlex
 import sys
 import time
 import unicodedata
+import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -7051,7 +7053,11 @@ def _exec_launch(jupyter_info, cmd_str, display, job_id=None):
     headers = {"authorization": f"token {token}", "content-type": "application/json"}
 
     if job_id is None:
-        job_id = f"qzcli_{int(_time.time())}"
+        # 必须带随机后缀。原来只有秒级时间戳，**同一秒内起的多个 exec 会拿到
+        # 完全相同的 job_id**，于是共用同一个 /tmp/.qzcli/<job_id>_out —— 多个
+        # agent 并发时互相覆盖输出、互相读到对方的结果（实测 3 路并发时，第 3 路
+        # 收到的是第 2 路的输出，第 1 路什么都没收到）。
+        job_id = f"qzcli_{int(_time.time())}_{uuid.uuid4().hex[:8]}"
     tmp_dir = "/tmp/.qzcli"
     # Contents API 通过 symlink 读取 /tmp/.qzcli
     api_dir = "_qzcli"
@@ -7069,26 +7075,30 @@ def _exec_launch(jupyter_info, cmd_str, display, job_id=None):
 
     # 2. 通过 Terminal 发送一条复合命令（fire-and-forget）
     #    输出写到 /tmp/.qzcli/，通过 symlink 让 Contents API 可读
-    shell_cmd = (
-        f"mkdir -p {tmp_dir} && "
-        f'{{ [ -L "$PWD/{api_dir}" ] || {{ rm -rf "$PWD/{api_dir}" && ln -sf {tmp_dir} "$PWD/{api_dir}"; }}; }} && '
+    # 用 setsid 把命令从这个终端会话里摘出去：终端一关（我们随后会主动删掉它），
+    # 命令仍在服务端跑完。没有 setsid 的镜像回退到 nohup。
+    inner = (
         f"( {cmd_str} ) > {tmp_dir}/{job_id}_out 2>&1; "
         f"echo $? > {tmp_dir}/{job_id}_exit"
     )
+    shell_cmd = (
+        f"mkdir -p {tmp_dir} && "
+        f'{{ [ -L "$PWD/{api_dir}" ] || {{ rm -rf "$PWD/{api_dir}" && ln -sf {tmp_dir} "$PWD/{api_dir}"; }}; }} && '
+        f"{{ command -v setsid >/dev/null && setsid bash -c {shlex.quote(inner)} "
+        f"|| nohup bash -c {shlex.quote(inner)}; }} >/dev/null 2>&1 &"
+    )
 
     for attempt in range(3):
+        term_name = None
         try:
-            resp_t = _requests.get(
+            # **每次都开自己的终端，绝不复用已有的。**
+            # 老实现是 `terms[0]`：不但两个并发 exec 会抢同一个终端、命令字符
+            # 交错，还会直接往别人开着的交互式会话里打字（实测有开发机上躺着
+            # 4 个两天前的人工终端，exec 会挑中第一个）。
+            resp_t = _requests.post(
                 f"{base_http}/api/terminals", headers=headers, timeout=10
             )
-            terms = resp_t.json() if resp_t.status_code == 200 else []
-            if terms:
-                term_name = terms[0]["name"]
-            else:
-                resp_t = _requests.post(
-                    f"{base_http}/api/terminals", headers=headers, timeout=10
-                )
-                term_name = resp_t.json()["name"]
+            term_name = resp_t.json()["name"]
 
             ws = websocket.create_connection(
                 f"{base_ws}/terminals/websocket/{term_name}?token={token}",
@@ -7103,10 +7113,14 @@ def _exec_launch(jupyter_info, cmd_str, display, job_id=None):
                     break
 
             ws.send(_json.dumps(["stdin", shell_cmd + "\r"]))
-            _time.sleep(0.5)
+            # 给 setsid/nohup 一点时间把子进程摘出去，再关终端
+            _time.sleep(1.0)
             ws.close()
+            _delete_terminal(base_http, headers, term_name)
             return job_id
         except Exception as e:
+            # 建了终端但没走完，别留垃圾
+            _delete_terminal(base_http, headers, term_name)
             if attempt < 2:
                 display.print_warning(f"连接失败，重试中... ({attempt + 1}/3)")
                 _time.sleep(2)
@@ -7115,6 +7129,25 @@ def _exec_launch(jupyter_info, cmd_str, display, job_id=None):
                 return None
 
     return None
+
+
+def _delete_terminal(base_http, headers, term_name):
+    """删掉本次 exec 自建的终端。
+
+    不删的话每跑一次 exec 就在开发机上留一个终端，久了会攒一堆（实测已经见过
+    单机 4 个残留）。命令本身用 setsid 摘出去了，删终端不会把它带走。
+    删除失败不影响主流程 —— 命令已经在跑了。
+    """
+    if not term_name:
+        return
+    import requests as _requests
+
+    try:
+        _requests.delete(
+            f"{base_http}/api/terminals/{term_name}", headers=headers, timeout=10
+        )
+    except Exception:
+        pass
 
 
 def _exec_poll(jupyter_info, job_id, display, timeout=120, cleanup_on_done=True):
