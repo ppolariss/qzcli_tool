@@ -163,7 +163,10 @@ def main() -> int:
 
     _detail()
 
-    @check("任务调度事件", "qzcli events")
+    # 注意：`qzcli events` 子命令**不在 master**，在未合并的 PR #39 里。
+    # 这里验的是平台侧 Action 可用（给 PR #39 合并后直接写 v2 铺路），
+    # 不是在验 qzcli 现有代码路径。
+    @check("任务调度事件（平台侧）", "train ListJobEvents")
     def _events():
         jid = state["job_id"]
         r = a._request_v2(
@@ -489,6 +492,60 @@ def main() -> int:
                 return f"已发停止指令，当前 status={d.get('status')}"
 
             _stop()
+
+        # ---- HPC：这条路**没有**迁 v2，仍走 /api/v1/hpc_jobs。
+        # 正因为没迁才更要测：确认 v1 这条腿在本次改动后依然是通的。
+        @check("提交 HPC 任务", "qzcli hpc（仍走 v1）")
+        def _hpc_create():
+            # 规格从历史 HPC 任务反推，不写死 —— 换工作空间也能跑
+            hist = a.list_hpc_jobs(ws, page_size=20).get("jobs") or []
+            sample = next(
+                (
+                    j
+                    for j in hist
+                    if (j.get("slurm_cluster_spec") or {}).get("predef_quota_id")
+                ),
+                None,
+            )
+            assert_true(sample, "历史 HPC 任务里找不到可复用的规格")
+            sp = sample["slurm_cluster_spec"]
+            state["hpc_lcg"] = sample["logic_compute_group_id"]
+            r = a.create_hpc_job(
+                cookie=cookie,
+                job_name=f"qzcli-v2-smoke-hpc-{int(time.time())}",
+                workspace_id=ws,
+                project_id=sample["project_id"],
+                logic_compute_group_id=sample["logic_compute_group_id"],
+                entrypoint="echo QZCLI_V2_SMOKE_HPC_OK",
+                image=sp["image"],
+                predef_quota_id=sp["predef_quota_id"],
+                cpu=sp["cpu"],
+                mem_gi=sp["mem_gi"],
+                instances=1,
+                image_type=sp.get("image_type", "SOURCE_PRIVATE"),
+                # 兜底：万一 entrypoint 没退出，20 分钟后平台自己收
+                max_running_time_minutes=20,
+            )
+            jid = r.get("job_id")
+            assert_true(jid, f"响应里没有 job_id: {r}")
+            state["hpc_job"] = jid
+            return f"job_id={jid} cpu={sp['cpu']} mem={sp['mem_gi']}Gi（v1 路径）"
+
+        _hpc_create()
+
+        if state.get("hpc_job"):
+
+            @check("停止 HPC 任务", "hpc StopJob（v2）")
+            def _hpc_stop():
+                # qzcli 目前没有 HPC 停止命令，直接打 v2 Action 收尾，
+                # 顺便验证它可用 —— 这也是补 `qzcli hpc-stop` 的前置。
+                a._request_v2("hpc", "StopJob", {"job_id": state["hpc_job"]})
+                time.sleep(5)
+                got = a.list_hpc_jobs(ws, page_size=50).get("jobs") or []
+                me = next((j for j in got if j.get("job_id") == state["hpc_job"]), None)
+                return f"status={me.get('status') if me else '（列表里暂未刷新）'}"
+
+            _hpc_stop()
     else:
         print("\n【写操作】跳过（加 --submit 才会真实提交）")
 

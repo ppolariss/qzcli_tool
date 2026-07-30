@@ -161,6 +161,50 @@ class StopJobTests(unittest.TestCase):
         self.assertEqual(len(calls), 1)
 
 
+class HpcPriorityTests(unittest.TestCase):
+    """HPC 提交的 priority —— 平台必填，且方向与训练任务相反。
+
+    实测提交值→平台档位：1→LOW(11) 3→LOW(13) 5→HIGH(30) 10→HIGH(35)。
+    即数字越大优先级越高，而训练任务的 task_priority 是 10 表示低优。
+    默认值取错会让每个 HPC 任务都变高优抢生产资源，所以钉死。
+    """
+
+    def _post_body(self, **kw):
+        seen = {}
+
+        def fake_post(url, *, json=None, **_):
+            seen.update(json or {})
+            return _Resp(200, {"code": 0, "data": {"job_id": "hpc-1"}})
+
+        with mock.patch.object(api, "_curl_post", side_effect=fake_post):
+            _client().create_hpc_job(
+                cookie="ck",
+                job_name="n",
+                workspace_id="ws-1",
+                project_id="p-1",
+                logic_compute_group_id="lcg-1",
+                entrypoint="echo",
+                image="img",
+                predef_quota_id="q-1",
+                cpu=8,
+                mem_gi=64,
+                **kw,
+            )
+        return seen
+
+    def test_priority_is_always_sent(self):
+        """不传 priority 平台直接拒 `priority must be set`，整个命令不可用。"""
+        self.assertIn("priority", self._post_body())
+
+    def test_default_priority_is_low(self):
+        """默认必须落在 LOW 档（1-4）。取 10 会变 HIGH —— 与训练任务方向相反，
+        是最容易照抄错的地方。"""
+        self.assertEqual(self._post_body()["priority"], 1)
+
+    def test_explicit_priority_passthrough(self):
+        self.assertEqual(self._post_body(priority=3)["priority"], 3)
+
+
 class ListSpecsTests(unittest.TestCase):
     """/openapi/v1/specs/list 平台上已 404，规格只能从历史任务反推。"""
 

@@ -19,7 +19,7 @@ qz spec 版本 `cf22fdbe`。每一行都用 `qzcli` 的 CAS cookie 实际打过�
 |---|---|---|---|---|
 | 1 | `POST /api/v1/train_job/list` | `train ListJobs` | `{workspace_id, page_num, page_size}` | `Result.jobs[]` + `Result.total` |
 | 2 | `POST /api/v1/train_job/detail` | `train GetJob` | `{job_id}` | `Result.{job 字段平铺}` |
-| 3 | `POST /api/v1/train_job/events/list` | `train ListJobEvents` | `{filter:{object_type, object_ids:[id]}, page_num, page_size}` | `Result.events[]` + `Result.total` |
+| 3 | `POST /api/v1/train_job/events/list` ⚠️ **不在 master** | `train ListJobEvents`（平台侧实测可用） | `{filter:{object_type, object_ids:[id]}, page_num, page_size}` | `Result.events[]` + `Result.total` |
 | 4 | `POST /api/v1/train_job/stop` | `train StopJob` | `{job_id}` | — （写操作，探针未打） |
 | 5 | `POST /api/v1/notebook/list` | `notebook ListNotebooks` | `{workspace_id, page, page_size}` ⚠️ 是 `page` 不是 `page_num` | `Result.list[]` + `Result.total` |
 | 6 | `POST /api/v1/cluster_metric/cluster_basic_info` | **`workspace GetBasicInfo`** | `{workspace_id}` | `Result.{clusters, compute_groups, resource_types}` |
@@ -32,6 +32,19 @@ qz spec 版本 `cf22fdbe`。每一行都用 `qzcli` 的 CAS cookie 实际打过�
 | 13 | `GET /api/v1/notebook/lab/{id}` | ❌ **无任何 v2 对应** | — | **保持 v1** |
 | 14 | `POST /api/v2/train?Action=CreateJobConsole` | 已是 v2，**不动** | — | 已真机验证（commit `0a9902a`） |
 | 15 | `POST /api/v2/train?Action=GetJobLog` | 已是 v2，**不动** | — | — |
+
+### ⚠️ 关于第 3 行（任务调度事件）
+
+`qzcli events` 子命令和它底层的 `_get_events_with_cookie` / `/api/v1/train_job/events/list`
+**都不在 `master` 上**，而在未合并的 PR #39（分支 `fix/login-socks5h-and-events`）里。
+本次迁移分支从 `master` 起，所以**这条没有被迁移，也无从迁移**。
+
+表里保留这一行，是因为平台侧的 `train ListJobEvents` 已经实测可用
+（`{filter:{object_type:"job", object_ids:[job_id]}}`，返回 `Result.events[]` + `total`），
+**PR #39 合并后照这个形状直接写 v2 即可，不用再走一遍 v1**。
+
+（这条最初被错标成"已迁 v2" —— 接口盘点时读的是当时检出的 PR #39 分支，
+与实际开发基线 `master` 不一致。已更正。）
 
 ## 实测踩到的坑
 

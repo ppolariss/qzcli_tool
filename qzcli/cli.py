@@ -6521,6 +6521,7 @@ def cmd_hpc(args):
             cpus_per_task=args.cpus_per_task,
             memory_per_cpu=args.memory_per_cpu,
             image_type=args.image_type,
+            priority=args.priority,
         )
     except QzAPIError as e:
         display.print_error(f"任务创建失败: {e}")
@@ -7820,6 +7821,16 @@ def main():
         dest="memory_per_cpu",
         default="5G",
         help="每 CPU 内存（默认 5G）",
+    )
+    hpc_parser.add_argument(
+        "--priority",
+        type=int,
+        default=1,
+        help=(
+            "优先级 1-10，**数字越大越高**（1-4→LOW，5-10→HIGH）。"
+            "注意与训练任务的 --priority 方向相反（那边 10 是低优）。"
+            "默认 1=LOW，与现有生产 HPC 任务一致，不抢资源"
+        ),
     )
     hpc_parser.add_argument("--image", required=True, help="容器镜像地址")
     hpc_parser.add_argument(

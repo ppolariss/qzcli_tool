@@ -788,9 +788,29 @@ class QzAPI:
         max_running_time_days: int = 0,
         max_running_time_hours: int = 0,
         max_running_time_minutes: int = 0,
+        priority: int = 1,
     ) -> Dict[str, Any]:
         """
         提交 HPC/CPU 任务（使用 cookie 认证，POST /api/v1/hpc_jobs）
+
+        ``priority`` 是**必填**：平台后来加了这个校验，不传直接被拒
+        （``API 请求失败: priority must be set``），导致 `qzcli hpc` 整个不可用。
+
+        ⚠️ **HPC 的优先级方向和训练任务相反，别照抄。** 实测提交值→平台档位：
+
+        ==========  ==========  ======
+        提交值       存储值       档位
+        ==========  ==========  ======
+        1           11          LOW
+        3           13          LOW
+        5           30          HIGH
+        10          35          HIGH
+        ==========  ==========  ======
+
+        即**数字越大优先级越高**；有效范围 1–10（0/11/12 会被拒
+        ``无效的优先级值``）。而训练任务的 ``task_priority`` 是反的 ——
+        那边 10 表示低优。所以这里默认取 **1（LOW）**，与集群上现有生产
+        HPC 任务一致（它们存储值都是 11/LOW），不抢资源。
 
         Returns:
             API 响应 data 字段（含 job_id 等）
@@ -801,6 +821,7 @@ class QzAPI:
             "workspace_id": workspace_id,
             "project_id": project_id,
             "logic_compute_group_id": logic_compute_group_id,
+            "priority": priority,
             "enable_notification": False,
             "dataset_info": [],
             "sbatch_script": {
