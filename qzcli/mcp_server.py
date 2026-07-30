@@ -1254,9 +1254,10 @@ def qz_create_job(
         or spec_obj.get("gpu_count")
         or spec_obj.get("memory_gb")
     ):
-        # Try one live refresh via /openapi/v1/specs/list, merge back into cache.
+        # 活体刷一次规格再并回缓存。/openapi/v1/specs/list 已经 404，
+        # 所以要把 workspace_id 一起传进去，让 list_specs 走历史任务反推那一级。
         try:
-            fetched = api.list_specs(compute_group_id) or []
+            fetched = api.list_specs(compute_group_id, workspace_id) or []
             for raw in fetched:
                 if raw.get("id") == spec_id or raw.get("quota_id") == spec_id:
                     spec_obj = {
@@ -1312,10 +1313,14 @@ def qz_create_job(
         ],
     }
 
-    # 优先使用 cookie 认证（内部 API），回退到 token 认证（openapi）
+    # 提交路径必须和 CLI 走同一条：CLI 早就默认 v2 CreateJobConsole
+    # （cli.py cmd_create），而这里之前还停在 v1 create_job_with_cookie ——
+    # 同一个工具的两个入口行为不一致，v2 才支持的 exclude_nodes 等参数在
+    # MCP 侧静默失效。顺序：v2 → v1(cookie) → openapi(token)。
     cookie_data = get_cookie()
-    if cookie_data and cookie_data.get("cookie"):
-        result = api.create_job_with_cookie(cookie_data["cookie"], payload)
+    cookie = (cookie_data or {}).get("cookie")
+    if cookie:
+        result = api.create_job_v2(cookie, payload)
     else:
         result = api.create_job(payload)
     job_id = result.get("job_id", "")
@@ -1324,7 +1329,9 @@ def qz_create_job(
     if not job_id:
         raise RuntimeError(f"任务创建失败: 响应中未包含 job_id。raw={result}")
 
-    job_url = f"https://qz.sii.edu.cn/jobs/distributedTrainingDetail/{job_id}?spaceId={resp_ws_id}"
+    job_url = (
+        f"{api.base_url}/jobs/distributedTrainingDetail/{job_id}?spaceId={resp_ws_id}"
+    )
 
     if track:
         job = JobRecord(
@@ -1449,7 +1456,7 @@ def qz_create_hpc_job(
     if not job_id:
         raise RuntimeError(f"任务创建失败: 响应中未包含 job_id。raw={result}")
 
-    job_url = f"https://qz.sii.edu.cn/jobs/hpc?spaceId={workspace_id}"
+    job_url = f"{api.base_url}/jobs/hpc?spaceId={workspace_id}"
 
     if track:
         job = JobRecord(

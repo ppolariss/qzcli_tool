@@ -2,3 +2,9 @@ cookies.txt
 */__pycache__/*
 qzcli.egg-info/*
 CLAUDE.md
+
+# 接口文档的 markdown 渲染产物：可由 docs/api_spec_v2.json 用
+# `python3 tools/gen_api_spec_doc.py` 完全重建，不进仓（280KB+，diff 无意义）。
+# 结构化的 api_spec_v2.json 才是要版本化、要 diff 的那份。
+docs/api_spec_v2.md
+docs/api_spec_v2/

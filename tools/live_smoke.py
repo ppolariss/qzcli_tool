@@ -1,0 +1,567 @@
+#!/usr/bin/env python3
+"""活体冒烟：把 qzcli 每个功能点在**真实平台**上跑一遍，逐项判定通过与否。
+
+为什么不能只靠 `--dry-run` 和单测：单测里 `_curl_post` 是假的，dry-run 根本不发请求。
+v1→v2 迁移最典型的翻车是"接口通了但语义变了"（过滤被忽略、字段改名导致列表恒空、
+分页参数没被认），**只有拿真实响应才能发现**。
+
+用法::
+
+    python3 tools/live_smoke.py --workspace CI-情境智能            # 只读部分
+    python3 tools/live_smoke.py --workspace CI-情境智能 --submit   # 含真实提交+停止
+
+`--submit` 会**真的提交一个任务并在验证完后停掉它**（默认 1 卡、低优先级、
+命令是 echo 立即退出）。会消耗少量点券。不加这个 flag 则完全只读。
+"""
+from __future__ import annotations
+
+import argparse
+import sys
+import time
+import traceback
+from pathlib import Path
+from typing import Any, Callable, Dict, List
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT))
+
+from qzcli import api as qzapi  # noqa: E402
+from qzcli.api import QzAPIError, get_api  # noqa: E402
+from qzcli.config import (  # noqa: E402
+    find_workspace_by_name,
+    get_cookie,
+    get_workspace_resources,
+)
+
+RESULTS: List[Dict[str, Any]] = []
+
+
+def check(point: str, cmd: str):
+    """装饰器：把一个功能点的验证包成一条结果记录。
+
+    判定标准写在每个用例里 —— 关键是**验语义不只验不报错**：
+    列表要非空、过滤要真的改变结果、v1/v2 要一致。
+    """
+
+    def deco(fn: Callable[[], str]):
+        def run():
+            t0 = time.time()
+            try:
+                detail = fn()
+                RESULTS.append(
+                    {
+                        "point": point,
+                        "cmd": cmd,
+                        "ok": True,
+                        "detail": detail,
+                        "sec": round(time.time() - t0, 1),
+                    }
+                )
+                print(f"  ✓ {point:24} {detail}")
+            except Exception as exc:
+                RESULTS.append(
+                    {
+                        "point": point,
+                        "cmd": cmd,
+                        "ok": False,
+                        "detail": f"{type(exc).__name__}: {exc}",
+                        "sec": round(time.time() - t0, 1),
+                    }
+                )
+                print(f"  ✗ {point:24} {type(exc).__name__}: {exc}")
+                if VERBOSE:
+                    traceback.print_exc()
+
+        return run
+
+    return deco
+
+
+VERBOSE = False
+
+
+def assert_true(cond: bool, msg: str):
+    if not cond:
+        raise AssertionError(msg)
+
+
+def main() -> int:
+    global VERBOSE
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--workspace", required=True, help="工作空间名或 ws-<uuid>")
+    ap.add_argument(
+        "--submit", action="store_true", help="含真实提交+停止（会消耗点券）"
+    )
+    ap.add_argument("--compute-group", help="提交用的 lcg-<uuid>；不传则自动挑有空卡的")
+    ap.add_argument("--spec", help="提交用的 spec_id；不传则自动挑 GPU 数最小的")
+    ap.add_argument(
+        "--image",
+        default="docker.sii.shaipower.online/inspire-studio/dhyu-wan-torch29:0.4",
+    )
+    ap.add_argument("-v", "--verbose", action="store_true")
+    args = ap.parse_args()
+    VERBOSE = args.verbose
+
+    cookie = (get_cookie() or {}).get("cookie")
+    if not cookie:
+        print("✗ 无 cookie，先 `qzcli login`", file=sys.stderr)
+        return 1
+
+    ws = args.workspace
+    if not ws.startswith("ws-"):
+        resolved = find_workspace_by_name(ws)
+        assert resolved, f"未找到工作空间 {ws}"
+        ws = resolved
+    a = get_api()
+    print(f"→ workspace={ws}\n")
+
+    state: Dict[str, Any] = {}
+
+    # ---------------- 只读功能点 ----------------
+    print("【只读】")
+
+    @check("查询训练任务列表", "qzcli list -c")
+    def _jobs():
+        v2 = a._list_jobs_v2(ws, cookie, page_size=5)
+        v1 = a._list_jobs_v1(ws, cookie, page_size=5)
+        assert_true(v2.get("jobs"), "v2 返回空列表 —— 典型的静默失败")
+        assert_true(
+            v1["total"] == v2["total"],
+            f"v1/v2 total 不一致 {v1['total']} vs {v2['total']}",
+        )
+        assert_true(
+            len(v2["jobs"]) == 5, f"page_size 未生效，返回 {len(v2['jobs'])} 条"
+        )
+        state["job_id"] = v2["jobs"][0].get("job_id")
+        return f"total={v2['total']}，v1/v2 一致，page_size 生效"
+
+    _jobs()
+
+    @check("过滤参数真的生效", "qzcli list -c --user")
+    def _filter():
+        # 迁移最阴的翻车：v2 不认识某个过滤参数就**静默忽略**，返回全量。
+        # 字段名比对发现不了这个 —— 必须验"过滤前后结果确实变了"。
+        cur = a._list_jobs_v2(ws, cookie, page_size=1)["total"]
+        by_user = a._list_jobs_v2(
+            ws, cookie, page_size=1, created_by="user-不存在的人"
+        )["total"]
+        assert_true(by_user != cur, f"created_by 过滤未生效：过滤前后都是 {cur}")
+        return f"不过滤={cur}，过滤到不存在用户={by_user}（确实收窄）"
+
+    _filter()
+
+    @check("查询任务详情", "qzcli status")
+    def _detail():
+        jid = state.get("job_id")
+        assert_true(jid, "上一步没拿到 job_id")
+        v2 = a._get_job_detail_v2(jid, cookie)
+        v1 = a._get_job_detail_v1(jid, cookie)
+        assert_true(v2.get("name"), "v2 详情缺 name")
+        assert_true(v1.get("name") == v2.get("name"), "v1/v2 name 不一致")
+        assert_true(v1.get("status") == v2.get("status"), "v1/v2 status 不一致")
+        return f"{v2.get('name')[:28]} status={v2.get('status')}，v1/v2 一致"
+
+    _detail()
+
+    # 注意：`qzcli events` 子命令**不在 master**，在未合并的 PR #39 里。
+    # 这里验的是平台侧 Action 可用（给 PR #39 合并后直接写 v2 铺路），
+    # 不是在验 qzcli 现有代码路径。
+    @check("任务调度事件（平台侧）", "train ListJobEvents")
+    def _events():
+        jid = state["job_id"]
+        r = a._request_v2(
+            "train",
+            "ListJobEvents",
+            {
+                "filter": {"object_type": "job", "object_ids": [jid]},
+                "page_num": 1,
+                "page_size": 5,
+            },
+        )
+        assert_true("events" in r, f"响应缺 events 字段: {sorted(r)}")
+        return f"events={len(r.get('events') or [])} total={r.get('total')}"
+
+    _events()
+
+    @check("查看任务日志", "qzcli logs")
+    def _logs():
+        # 找一个跑过的任务（CREATING 的没有日志）
+        jobs = a._list_jobs_v2(ws, cookie, page_size=30)["jobs"]
+        for j in jobs:
+            try:
+                r = a.get_job_logs(j["job_id"], page_size=3)
+            except QzAPIError:
+                continue
+            hits = (r.get("hits") or {}).get("hits") or r.get("logs") or []
+            if hits:
+                state["log_job"] = j["job_id"]
+                return f"{j['job_id'][:20]}… 取到 {len(hits)} 条日志"
+        raise AssertionError("扫了 30 个任务都没取到日志")
+
+    _logs()
+
+    @check("开发机列表 + 过滤", "qzcli list -c（开发机段）")
+    def _nb():
+        allnb = a._list_notebooks_v2(ws, cookie, page_size=50)
+        run = a._list_notebooks_v2(ws, cookie, page_size=50, status=["RUNNING"])
+        v1 = a._list_notebooks_v1(ws, cookie, page_size=50)
+        assert_true(v1.get("total") == allnb.get("total"), "v1/v2 开发机总数不一致")
+        assert_true(
+            run.get("total", 0) <= allnb.get("total", 0),
+            "status 过滤后反而变多，过滤未生效",
+        )
+        if run.get("list"):
+            state["notebook"] = run["list"][0]
+        return f"全部={allnb.get('total')} RUNNING={run.get('total')}，v1/v2 一致"
+
+    _nb()
+
+    @check("空余节点 / 碎卡", "qzcli avail")
+    def _avail():
+        # `avail` 是翻完**所有**节点再统计的。只取第一页会踩坑：节点按类型排序，
+        # 前几十台全是 cpu/hpc，GPU 数当然是 0（v1 也一样）。所以这里必须翻页，
+        # 否则测出来的"没有 GPU"是采样问题不是回归。
+        def walk(fetch):
+            nodes, page = [], 1
+            while True:
+                r = fetch(ws, cookie, page_num=page, page_size=100)
+                batch = r.get("node_dimensions") or []
+                nodes.extend(batch)
+                if len(nodes) >= r.get("total", 0) or not batch or page > 10:
+                    return nodes, r.get("total", 0)
+                page += 1
+
+        n2, t2 = walk(a._list_node_dimension_v2)
+        n1, t1 = walk(a._list_node_dimension_v1)
+        assert_true(n2, "node_dimensions 为空")
+        assert_true(t1 == t2, f"v1/v2 节点总数不一致 {t1} vs {t2}")
+        assert_true(set(n2[0]) == set(n1[0]), "v1/v2 节点条目字段名不一致")
+
+        gpu2 = {
+            x["name"]: (x.get("gpu") or {})
+            for x in n2
+            if (x.get("gpu") or {}).get("total")
+        }
+        gpu1 = {
+            x["name"]: (x.get("gpu") or {})
+            for x in n1
+            if (x.get("gpu") or {}).get("total")
+        }
+        assert_true(gpu2, f"{len(n2)} 个节点里一台有 GPU 的都没有")
+        assert_true(set(gpu1) == set(gpu2), "v1/v2 认定的 GPU 节点集合不同")
+
+        # 真正的回归判据：同一台机器两边算出的卡数要一样。
+        # 但集群是活的（这套 97% 利用率、任务不停起落），v2 和 v1 是两次
+        # **不同时刻**的快照，个别节点在这几秒内被重新分配是正常的。所以对不上的
+        # 节点要**单独复查一次**，只有复查仍然不一致才算真差异 —— 否则这个用例
+        # 会随机红，然后被当成噪声忽略，那就白测了。
+        def gpu_of(fetch, name):
+            page = 1
+            while page <= 10:
+                r = fetch(ws, cookie, page_num=page, page_size=100)
+                for x in r.get("node_dimensions") or []:
+                    if x.get("name") == name:
+                        return x.get("gpu") or {}
+                if page * 100 >= r.get("total", 0):
+                    break
+                page += 1
+            return {}
+
+        def differs(g1, g2):
+            return g1.get("total") != g2.get("total") or g1.get("used") != g2.get(
+                "used"
+            )
+
+        suspects = [k for k in gpu2 if differs(gpu1[k], gpu2[k])]
+        real, churn = [], []
+        for name in suspects:
+            if differs(
+                gpu_of(a._list_node_dimension_v1, name),
+                gpu_of(a._list_node_dimension_v2, name),
+            ):
+                real.append(name)
+            else:
+                churn.append(name)
+        assert_true(not real, f"{len(real)} 台节点复查后 v1/v2 仍不一致: {real[:3]}")
+
+        tot = sum(g.get("total", 0) for g in gpu2.values())
+        used = sum(g.get("used", 0) for g in gpu2.values())
+        note = f"，{len(churn)} 台为集群实时波动（复查一致）" if churn else ""
+        return (
+            f"节点 total={t2}，{len(gpu2)} 台 GPU 机器，"
+            f"共 {used}/{tot} 卡已用，v1/v2 逐台一致{note}"
+        )
+
+    _avail()
+
+    @check("GPU 使用分布", "qzcli usage")
+    def _usage():
+        v2 = a._list_task_dimension_v2(ws, cookie, page_size=20)
+        v1 = a._list_task_dimension_v1(ws, cookie, page_size=20)
+        d2 = v2.get("task_dimensions") or []
+        d1 = v1.get("task_dimensions") or []
+        assert_true(d2, "task_dimensions 为空")
+        assert_true(set(d2[0]) == set(d1[0]), "v1/v2 任务维度字段名不一致")
+
+        # 这里统计的是**正在跑的任务**，秒级变化（本脚本自己就会提交/停止任务）。
+        # 严格比 total 必然随机红，所以只要求量级一致；字段名对齐才是防静默失败的
+        # 真判据。总数完全一样反而说明取的是缓存。
+        t1, t2 = v1.get("total", 0), v2.get("total", 0)
+        drift = abs(t1 - t2) / max(t1, t2, 1)
+        assert_true(
+            drift < 0.10,
+            f"v1/v2 任务维度总数差异 {drift:.1%}（{t1} vs {t2}）超出实时波动范围",
+        )
+        # 交集里的任务，两边算出的 GPU 数必须一致
+        by2 = {x.get("task_id") or x.get("id"): x for x in d2}
+        by1 = {x.get("task_id") or x.get("id"): x for x in d1}
+        both = set(by1) & set(by2)
+        bad = [
+            k
+            for k in both
+            if (by1[k].get("gpu") or {}).get("total")
+            != (by2[k].get("gpu") or {}).get("total")
+        ]
+        assert_true(not bad, f"{len(bad)} 个任务 v1/v2 GPU 数不一致: {list(bad)[:3]}")
+        return (
+            f"任务维度 total={t2}（v1={t1}，实时波动 {drift:.1%}），"
+            f"字段一致，交集 {len(both)} 个任务 GPU 数一致"
+        )
+
+    _usage()
+
+    @check("工作空间任务概览", "qzcli ws")
+    def _wstasks():
+        v2 = a._list_workspace_tasks_v2(
+            ws, cookie, int(time.time()) - 86400, int(time.time())
+        )
+        v1 = a._list_workspace_tasks_v1(
+            ws, cookie, int(time.time()) - 86400, int(time.time())
+        )
+        tg = v2.get("task_groups") or []
+        assert_true(tg, "task_groups 为空")
+        assert_true(len(v1.get("task_groups") or []) == len(tg), "v1/v2 分组数不一致")
+        return f"{len(tg)} 个任务类型分组，v1/v2 一致"
+
+    _wstasks()
+
+    @check("集群/计算组基础信息", "qzcli res")
+    def _basic():
+        v2 = a._cluster_basic_info_v2(ws, cookie)
+        v1 = a._cluster_basic_info_v1(ws, cookie)
+        assert_true(v2.get("compute_groups"), "compute_groups 为空")
+        assert_true(
+            len(v1.get("compute_groups") or []) == len(v2["compute_groups"]),
+            "v1/v2 计算组数不一致",
+        )
+        state["basic"] = v2
+        return f"{len(v2['compute_groups'])} 个计算组，v1/v2 一致"
+
+    _basic()
+
+    @check("规格(spec)发现", "qzcli create 选规格")
+    def _specs():
+        lcgs = a._request_v2(
+            "workspace",
+            "ListLogicComputeGroups",
+            {"filter": {"workspace_id": ws}, "page_num": 1, "page_size": 50},
+        )
+        groups = lcgs.get("logic_compute_groups") or []
+        assert_true(groups, "ListLogicComputeGroups 返回空")
+        state["lcgs"] = groups
+        found = []
+        for g in groups[:12]:
+            s = a.list_specs(g["logic_compute_group_id"], ws)
+            if s:
+                found.extend(s)
+        assert_true(found, "所有计算组都反推不出 spec —— create 会不可用")
+        state["specs"] = found
+        gmin = min(x["gpu_count"] for x in found if x["gpu_count"])
+        return f"{len(groups)} 个计算组，反推出 {len(found)} 个 spec（最小 {gmin} 卡）"
+
+    _specs()
+
+    @check("计算组硬件规格", "list_node_specs（新增）")
+    def _nodespecs():
+        ns = a.list_node_specs(ws)
+        assert_true(ns, "node_specs 为空")
+        return f"{len(ns)} 个 node_spec"
+
+    _nodespecs()
+
+    @check("工作空间/项目列表", "qzcli workspaces")
+    def _wslist():
+        wss = a.list_workspaces(cookie)
+        assert_true(wss, "工作空间列表为空")
+        assert_true(any(w.get("id") == ws for w in wss), "当前工作空间不在返回里")
+        return f"{len(wss)} 个工作空间（走 v1，v2 无权限）"
+
+    _wslist()
+
+    @check("HPC 任务列表", "list_hpc_jobs")
+    def _hpc():
+        r = a.list_hpc_jobs(ws, page_size=5)
+        assert_true("jobs" in r and "total" in r, f"响应字段异常: {sorted(r)}")
+        return f"total={r['total']}"
+
+    _hpc()
+
+    # ---------------- 写操作 ----------------
+    if args.submit:
+        print("\n【写操作 — 真实提交】")
+
+        @check("提交训练任务", "qzcli create")
+        def _create():
+            specs = state.get("specs") or []
+            assert_true(specs, "没有可用 spec")
+            spec = None
+            if args.spec:
+                spec = next((s for s in specs if s["id"] == args.spec), None)
+                assert_true(spec, f"指定的 spec {args.spec} 不在可用列表里")
+            else:
+                # 挑 GPU 数最小的，别占大机器
+                spec = min(specs, key=lambda s: (s["gpu_count"] or 99))
+            lcg = (
+                args.compute_group or (spec.get("logic_compute_group_ids") or [None])[0]
+            )
+            assert_true(lcg, "拿不到计算组")
+            proj = (get_workspace_resources(ws) or {}).get("projects") or {}
+            project_id = next(iter(proj), None)
+            assert_true(project_id, "拿不到 project_id")
+
+            payload = {
+                "name": f"qzcli-v2-smoke-{int(time.time())}",
+                "logic_compute_group_id": lcg,
+                "project_id": project_id,
+                "workspace_id": ws,
+                "framework": "pytorch",
+                "command": "echo QZCLI_V2_SMOKE_OK && sleep 5",
+                "task_priority": 10,  # 低优，不抢生产资源
+                "auto_fault_tolerance": False,
+                "framework_config": [
+                    {
+                        "cpu": spec["cpu_count"],
+                        "gpu_count": spec["gpu_count"],
+                        "mem_gi": spec["memory_size_gib"],
+                        "resource_spec_price": qzapi.build_resource_spec_price(
+                            {
+                                "cpu_count": spec["cpu_count"],
+                                "gpu_count": spec["gpu_count"],
+                                "memory_gb": spec["memory_size_gib"],
+                                "gpu_type": spec["gpu_type"],
+                                "id": spec["id"],
+                            },
+                            lcg,
+                        ),
+                        "image": args.image,
+                        "image_type": "SOURCE_PRIVATE",
+                        "instance_count": 1,
+                        "shm_gi": max(64, int(spec["memory_size_gib"] * 0.5)),
+                    }
+                ],
+            }
+            r = a.create_job_v2(cookie, payload)
+            jid = r.get("job_id")
+            assert_true(jid, f"响应里没有 job_id: {r}")
+            state["new_job"] = jid
+            state["new_job_name"] = payload["name"]
+            return f"job_id={jid} spec={spec['gpu_count']}卡 优先级=10(低优)"
+
+        _create()
+
+        if state.get("new_job"):
+
+            @check("新任务能被查到", "qzcli status <new>")
+            def _newdetail():
+                time.sleep(3)
+                d = a._get_job_detail_v2(state["new_job"], cookie)
+                assert_true(
+                    d.get("name") == state["new_job_name"],
+                    f"查回来的 name 不对: {d.get('name')}",
+                )
+                return f"status={d.get('status')}"
+
+            _newdetail()
+
+            @check("停止任务", "qzcli stop")
+            def _stop():
+                ok = a.stop_job_with_cookie(state["new_job"], cookie)
+                assert_true(ok, "stop 返回 False")
+                time.sleep(5)
+                d = a._get_job_detail_v2(state["new_job"], cookie)
+                return f"已发停止指令，当前 status={d.get('status')}"
+
+            _stop()
+
+        # ---- HPC：这条路**没有**迁 v2，仍走 /api/v1/hpc_jobs。
+        # 正因为没迁才更要测：确认 v1 这条腿在本次改动后依然是通的。
+        @check("提交 HPC 任务", "qzcli hpc（仍走 v1）")
+        def _hpc_create():
+            # 规格从历史 HPC 任务反推，不写死 —— 换工作空间也能跑
+            hist = a.list_hpc_jobs(ws, page_size=20).get("jobs") or []
+            sample = next(
+                (
+                    j
+                    for j in hist
+                    if (j.get("slurm_cluster_spec") or {}).get("predef_quota_id")
+                ),
+                None,
+            )
+            assert_true(sample, "历史 HPC 任务里找不到可复用的规格")
+            sp = sample["slurm_cluster_spec"]
+            state["hpc_lcg"] = sample["logic_compute_group_id"]
+            r = a.create_hpc_job(
+                cookie=cookie,
+                job_name=f"qzcli-v2-smoke-hpc-{int(time.time())}",
+                workspace_id=ws,
+                project_id=sample["project_id"],
+                logic_compute_group_id=sample["logic_compute_group_id"],
+                entrypoint="echo QZCLI_V2_SMOKE_HPC_OK",
+                image=sp["image"],
+                predef_quota_id=sp["predef_quota_id"],
+                cpu=sp["cpu"],
+                mem_gi=sp["mem_gi"],
+                instances=1,
+                image_type=sp.get("image_type", "SOURCE_PRIVATE"),
+                # 兜底：万一 entrypoint 没退出，20 分钟后平台自己收
+                max_running_time_minutes=20,
+            )
+            jid = r.get("job_id")
+            assert_true(jid, f"响应里没有 job_id: {r}")
+            state["hpc_job"] = jid
+            return f"job_id={jid} cpu={sp['cpu']} mem={sp['mem_gi']}Gi（v1 路径）"
+
+        _hpc_create()
+
+        if state.get("hpc_job"):
+
+            @check("停止 HPC 任务", "hpc StopJob（v2）")
+            def _hpc_stop():
+                # qzcli 目前没有 HPC 停止命令，直接打 v2 Action 收尾，
+                # 顺便验证它可用 —— 这也是补 `qzcli hpc-stop` 的前置。
+                a._request_v2("hpc", "StopJob", {"job_id": state["hpc_job"]})
+                time.sleep(5)
+                got = a.list_hpc_jobs(ws, page_size=50).get("jobs") or []
+                me = next((j for j in got if j.get("job_id") == state["hpc_job"]), None)
+                return f"status={me.get('status') if me else '（列表里暂未刷新）'}"
+
+            _hpc_stop()
+    else:
+        print("\n【写操作】跳过（加 --submit 才会真实提交）")
+
+    # ---------------- 汇总 ----------------
+    print("\n" + "=" * 68)
+    ok = sum(1 for r in RESULTS if r["ok"])
+    for r in RESULTS:
+        print(f"  {'✓' if r['ok'] else '✗'}  {r['point']:24} {r['cmd']:28} {r['sec']}s")
+    print(f"\n{ok}/{len(RESULTS)} 通过")
+    failed = [r for r in RESULTS if not r["ok"]]
+    if failed:
+        print("\n失败项：")
+        for r in failed:
+            print(f"  - {r['point']}: {r['detail']}")
+    return 0 if not failed else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

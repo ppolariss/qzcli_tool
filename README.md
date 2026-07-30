@@ -613,10 +613,45 @@ export QZCLI_ENV_FILE="/path/to/.env"   # 可选，自定义凭据文件位置
 CLI 参数 > --password-stdin > shell 环境变量 > QZCLI_ENV_FILE 指向的 .env（默认 ~/.qzcli/.env） > ~/.qzcli/config.json > 交互输入
 ```
 
+## 平台 API v1 → v2 迁移
+
+启智平台正在把 `/api/v1` 下线（`/openapi/v1/specs/list` **已经 404**），官方 CLI `qz`
+是纯 v2 客户端。qzcli 的接口层已迁到 v2，策略是 **v2 优先 + v1 兜底**：
+公开方法签名一律不变，内部由 `api._v2_then_v1` 分发，只在 v2 **路由不通**
+（404/405/50x、或被网关 302 成 HTML）时回落 v1；业务错误和 401 直接抛出，
+不做静默降级。
+
+已迁移：`train ListJobs / GetJob / StopJob`、`notebook ListNotebooks`、
+`workspace ListNodeDimension / ListTaskDimension / GetBasicInfo /
+GetOverviewTaskMetric`、`hpc ListJobs`。
+
+**两个仍留在 v1 的地方**（v2 没有对应能力，见 `docs/v1_to_v2_mapping.md`）：
+
+- `/api/v1/project/list` —— v2 的 `project ListProjects` 对普通账号是
+  `AccessForbidden`；且 v2 全域**没有 `ListWorkspaces`**，工作空间只能从项目推导
+- `/api/v1/notebook/lab/{id}` —— v2 拿不到 Jupyter 访问地址，`qzcli exec` 依赖它
+
+### 相关文档与工具
+
+| 文件 | 说明 |
+|---|---|
+| `docs/v1_to_v2_mapping.md` | 端点映射表（**真机实测**，含踩坑记录和平台侧缺口） |
+| `docs/api_spec_v2.json` | 官方 `qz` 全部 11 services / 144 actions 的结构化接口定义，可 diff |
+| `docs/v2_probe_report.md` | cookie 在 v2 各 Action 上的可用性探针报告 |
+| `tools/gen_api_spec_doc.py` | 扫 `qz spec`/`schema`/`--dry-run` 重新生成上面的接口文档 |
+| `tools/probe_v2.py` | 探针：只打只读 Action，产物自动对 UUID 打码 |
+| `tools/compare_v1_v2.py` | 同一份数据 v1/v2 各拉一次逐字段 diff，防"静默返回空" |
+
+> ⚠️ 改 v2 端点时注意：`cluster.*` 和 `workspace.*` 有一批同名 Action，描述几乎一样，
+> 但 **`cluster.*` 是集群管理员权限，普通账号一律 `AccessForbidden`**。
+> qzcli 是工作空间级工具，必须走 `workspace.*`。
+
 ## Roadmap
 
 - Cookie API 收敛: 提取统一的 browser headers 和 cookie request wrapper，减少 `api.py` 中重复 headers。
 - Release 工程化: 继续完善 changelog、贡献者说明、issue 模板和版本发布流程。
+- `qzcli exec` 改走 SSH（`notebook GetNotebook` 的 `extra_info.HostIP/SshPort/ProxyJump`），
+  以摘掉最后一个 v1 依赖。
 
 ## Known Issues
 

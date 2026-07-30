@@ -6,6 +6,7 @@ import functools
 import inspect
 import json as _json
 import random
+import sys
 import threading
 import time as _time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -42,11 +43,24 @@ V2_BROWSER_UA = (
 
 
 class QzAPIError(Exception):
-    """API 错误"""
+    """API 错误。
 
-    def __init__(self, message: str, code: Optional[int] = None):
+    ``code``     —— HTTP 状态码（如 401/404），没有则 None。
+    ``api_code`` —— v2 信封里 ``ResponseMetadata.Error.Code`` 的原值
+                    （如 ``AccessForbidden`` / ``InvalidParameter``）。
+                    有了它，下游就能**按结构**判断错误类型，而不是去抠错误文案 ——
+                    平台改一个字的措辞就会让 substring 匹配失效。
+    """
+
+    def __init__(
+        self,
+        message: str,
+        code: Optional[int] = None,
+        api_code: Optional[str] = None,
+    ):
         super().__init__(message)
         self.code = code
+        self.api_code = api_code
 
 
 class QzTransientError(QzAPIError):
@@ -194,7 +208,7 @@ def _unwrap_v2_result(data: Dict[str, Any]) -> Dict[str, Any]:
         if isinstance(err, dict):
             code = err.get("Code") or "Error"
             message = err.get("Message") or "未知错误"
-            raise QzAPIError(f"API 请求失败: {code}: {message}")
+            raise QzAPIError(f"API 请求失败: {code}: {message}", api_code=str(code))
     elif data.get("code") not in (None, 0):
         raise QzAPIError(
             f"API 请求失败: {data.get('message', '未知错误')}", data.get("code")
@@ -206,6 +220,67 @@ def _unwrap_v2_result(data: Dict[str, Any]) -> Dict[str, Any]:
     if isinstance(legacy, dict):
         return legacy
     return {}
+
+
+# 已经就某个端点提示过"v2 不可用、已回落 v1"的集合，用来避免刷屏：
+# `qzcli avail` 这类命令会对十几个工作空间循环调同一个端点。
+_V2_FALLBACK_WARNED: set = set()
+
+# 触发回落 v1 的 HTTP 状态码。这些表示"v2 这条路由不通"，重试没意义：
+#   404 网关未注册该 Action  405 方法不允许  501 未实现  502/503/504 网关侧挂了
+# 刻意**不含** 401 —— 那由 `with_auth_retry` 重登处理。
+_V2_FALLBACK_STATUS = frozenset({404, 405, 501, 502, 503, 504})
+
+# 权限类业务错误：v2 通了、认证也过了，但这个账号/工作空间在 v2 侧没被授权。
+# 这类**必须回落 v1**，否则就是纯退化 —— 实测「拟人多模态大任务」工作空间在 v2 上
+# basic/node/jobs 三个接口全是 AccessForbidden，而 v1 完全正常；不回落的话该空间
+# 的 `qzcli list / avail / res` 会从"能用"变成"直接报错"。
+# 平台把 v2 权限补齐之前，这就是常态，不是偶发。
+_V2_FALLBACK_API_CODES = frozenset(
+    {"AccessForbidden", "Forbidden", "PermissionDenied", "NoPermission", "Unauthorized"}
+)
+
+
+def _v2_then_v1(name: str, v2_call, v1_call, *, logger=None):
+    """先打 v2，只在"v2 走不通"时回落 v1。
+
+    迁移期的核心保护：平台正在把 /api/v1 逐步下线（``/openapi/v1/specs/list``
+    已经 404），但也有 v2 反而更严的情况（部分工作空间 v2 权限还没开）。
+    两边都可能先坏，所以两条腿都留着。
+
+    **回落的两类**：
+
+    1. 路由不通 —— ``_V2_FALLBACK_STATUS`` 里的状态码，或响应非 JSON
+       （APISIX 把请求 302 到了 Keycloak）
+    2. 权限没开 —— ``_V2_FALLBACK_API_CODES`` 里的 Error Code
+
+    **不回落的**：其他一切业务错误，尤其是 ``InvalidParameter`` ——
+    那是**我们自己请求写错了**，回落 v1 会让它一直不被发现。
+    这条线别顺手放开：权限问题回落是"平台还没准备好"，参数问题回落是"把 bug 藏起来"，
+    两件事性质完全不同。
+    """
+    try:
+        return v2_call()
+    except QzAPIError as exc:
+        is_perm = exc.api_code in _V2_FALLBACK_API_CODES
+        is_route = exc.code in _V2_FALLBACK_STATUS or "非 JSON" in str(exc)
+        if not (is_perm or is_route):
+            raise
+        if name not in _V2_FALLBACK_WARNED:
+            _V2_FALLBACK_WARNED.add(name)
+            if is_perm:
+                msg = (
+                    f"[qzcli] v2 接口 {name} 权限未开通（{exc.api_code}），本次已回落 v1。"
+                    f" 功能不受影响，但这是平台侧待授权项 —— v1 下线后该接口会不可用，"
+                    f"请找平台开通对应工作空间的 v2 权限。"
+                )
+            else:
+                msg = f"[qzcli] v2 接口 {name} 不可用（{exc}），本次回落 v1。"
+            if logger:
+                logger(msg)
+            else:
+                print(msg, file=sys.stderr)
+        return v1_call()
 
 
 def build_resource_spec_price(
@@ -361,17 +436,27 @@ class QzAPI:
         service: str,
         action: str,
         body: Dict[str, Any],
+        cookie: Optional[str] = None,
+        referer_path: str = "/jobs",
+        raw: bool = False,
     ) -> Dict[str, Any]:
         """POST 到 /api/v2/{service}?Action={action}。
 
         与 /openapi/v1 不同：
-          - 响应不带 {code:0, data:...} 信封，直接返回业务字段
+          - 响应是 AWS 风格信封 ``{"ResponseMetadata": ..., "Result": ...}``
           - APISIX 网关要求 ``x-inspire-client-source`` 头，否则 302 到 Keycloak
           - 认证走 cookie（同 /api/v1/）：Bearer 在这条路径下不被接受
-        缺 cookie 时给出明确的 ``qzcli login`` 提示。
+
+        默认返回**已解封装的** ``Result``（见 ``_unwrap_v2_result``）；调用方不需要
+        再自己剥一层。需要看原始信封时传 ``raw=True``。
+
+        ``cookie`` 显式传入时优先于磁盘上的（``create_job_v2`` 这类已经在上层拿好
+        cookie 的调用点用得到）；不传则从 ``~/.qzcli/.cookie`` 读，配合
+        ``with_auth_retry`` 在 401 时自动重登后读到新 cookie。
         """
-        cookie_data = get_cookie()
-        cookie = cookie_data.get("cookie") if cookie_data else None
+        if not cookie:
+            cookie_data = get_cookie()
+            cookie = cookie_data.get("cookie") if cookie_data else None
         if not cookie:
             raise QzAPIError(
                 "v2 API 需要 cookie 认证，但本地没有有效 cookie。"
@@ -384,7 +469,7 @@ class QzAPI:
             "content-type": "application/json",
             "cookie": cookie,
             "origin": self.base_url,
-            "referer": f"{self.base_url}/jobs",
+            "referer": f"{self.base_url}{referer_path}",
             "user-agent": V2_BROWSER_UA,
             "x-inspire-client-source": V2_CLIENT_SOURCE,
         }
@@ -400,6 +485,15 @@ class QzAPI:
             raise QzAPIError(
                 "Cookie 已过期或无效，请运行 `qzcli login` 重新获取",
                 401,
+            )
+
+        # 网关对未注册路由回的是 `404 page not found`（text/plain），要和
+        # 「认证失败被 302 到 Keycloak 的 HTML」区分开 —— 前者该回落 v1，
+        # 后者重新登录才有用。
+        if response.status_code == 404:
+            raise QzAPIError(
+                f"v2 网关上没有 /api/v2/{service}?Action={action} 这条路由（404）。",
+                404,
             )
 
         ctype = response.headers.get("Content-Type", "")
@@ -422,7 +516,7 @@ class QzAPI:
                 f"v2 API 请求失败 ({response.status_code}): {result}",
                 response.status_code,
             )
-        return result
+        return result if raw else _unwrap_v2_result(result)
 
     def get_job_detail(self, job_id: str) -> Dict[str, Any]:
         """查询任务详情（使用 cookie 认证，优先于 token）"""
@@ -436,9 +530,32 @@ class QzAPI:
         result = self._request("/openapi/v1/train_job/detail", {"job_id": job_id})
         return result.get("data", {})
 
-    @with_auth_retry
     def get_job_detail_with_cookie(self, job_id: str, cookie: str) -> Dict[str, Any]:
-        """使用 cookie 查询任务详情（内部 API）"""
+        """任务详情：优先 v2 ``train GetJob``，v2 路由不通时回落 v1。
+
+        两边都把 job 字段平铺在结果顶层，调用方无需区分。
+        """
+        return _v2_then_v1(
+            "train_job/detail",
+            lambda: self._get_job_detail_v2(job_id, cookie),
+            lambda: self._get_job_detail_v1(job_id, cookie),
+        )
+
+    def _get_job_detail_v2(
+        self, job_id: str, cookie: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """``POST /api/v2/train?Action=GetJob``。"""
+        return self._request_v2(
+            "train",
+            "GetJob",
+            {"job_id": job_id},
+            cookie=cookie,
+            referer_path=f"/jobs/distributedTrainingDetail/{job_id}",
+        )
+
+    @with_auth_retry
+    def _get_job_detail_v1(self, job_id: str, cookie: str) -> Dict[str, Any]:
+        """遗留路径 ``POST /api/v1/train_job/detail``。"""
         url = f"{self.base_url}/api/v1/train_job/detail"
         payload = {"job_id": job_id}
         headers = {
@@ -447,9 +564,9 @@ class QzAPI:
             "cache-control": "no-cache",
             "content-type": "application/json",
             "cookie": cookie,
-            "origin": "https://qz.sii.edu.cn",
+            "origin": self.base_url,
             "pragma": "no-cache",
-            "referer": f"https://qz.sii.edu.cn/jobs/distributedTrainingDetail/{job_id}",
+            "referer": f"{self.base_url}/jobs/distributedTrainingDetail/{job_id}",
             "sec-ch-ua": '"Not(A:Brand";v="8", "Chromium";v="144"',
             "sec-ch-ua-mobile": "?0",
             "sec-ch-ua-platform": '"macOS"',
@@ -626,10 +743,8 @@ class QzAPI:
         if end_timestamp_ms is not None:
             body["filter"]["end_timestamp_ms"] = str(end_timestamp_ms)
 
-        result = self._request_v2("train", "GetJobLog", body)
-        if isinstance(result.get("Result"), dict):
-            result = result["Result"]
-        return result
+        # `_request_v2` 已经剥掉 ResponseMetadata/Result 信封了
+        return self._request_v2("train", "GetJobLog", body)
 
     def get_jobs_detail(
         self, job_ids: List[str], max_workers: int = 5
@@ -667,9 +782,34 @@ class QzAPI:
         except QzAPIError:
             return False
 
-    @with_auth_retry
     def stop_job_with_cookie(self, job_id: str, cookie: str) -> bool:
-        """使用 cookie 停止任务（内部 API）"""
+        """停止任务：优先 v2 ``train StopJob``，v2 路由不通时回落 v1。
+
+        唯一迁到 v2 的**写**操作。回落判据依旧只认"路由不通"
+        （404/405/50x/非 JSON）—— 业务错误（任务已结束、无权限）会直接抛给用户，
+        绝不会因为回落而变成"停了两次"。
+        """
+        return _v2_then_v1(
+            "train_job/stop",
+            lambda: self._stop_job_v2(job_id, cookie),
+            lambda: self._stop_job_v1(job_id, cookie),
+        )
+
+    def _stop_job_v2(self, job_id: str, cookie: Optional[str] = None) -> bool:
+        """``POST /api/v2/train?Action=StopJob``。"""
+        self._request_v2(
+            "train",
+            "StopJob",
+            {"job_id": job_id},
+            cookie=cookie,
+            referer_path=f"/jobs/distributedTrainingDetail/{job_id}",
+        )
+        # 成功即无 Error 信封；_request_v2 已在失败时抛异常
+        return True
+
+    @with_auth_retry
+    def _stop_job_v1(self, job_id: str, cookie: str) -> bool:
+        """遗留路径 ``POST /api/v1/train_job/stop``。"""
         url = f"{self.base_url}/api/v1/train_job/stop"
         payload = {"job_id": job_id}
         headers = {
@@ -678,9 +818,9 @@ class QzAPI:
             "cache-control": "no-cache",
             "content-type": "application/json",
             "cookie": cookie,
-            "origin": "https://qz.sii.edu.cn",
+            "origin": self.base_url,
             "pragma": "no-cache",
-            "referer": f"https://qz.sii.edu.cn/jobs/distributedTrainingDetail/{job_id}",
+            "referer": f"{self.base_url}/jobs/distributedTrainingDetail/{job_id}",
             "sec-ch-ua": '"Not(A:Brand";v="8", "Chromium";v="144"',
             "sec-ch-ua-mobile": "?0",
             "sec-ch-ua-platform": '"macOS"',
@@ -723,8 +863,8 @@ class QzAPI:
             "accept": "application/json, text/plain, */*",
             "content-type": "application/json",
             "cookie": cookie,
-            "origin": "https://qz.sii.edu.cn",
-            "referer": f"https://qz.sii.edu.cn/jobs/distributedTraining?spaceId={workspace_id}",
+            "origin": self.base_url,
+            "referer": f"{self.base_url}/jobs/distributedTraining?spaceId={workspace_id}",
             "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36",
         }
         response = _curl_post(url, json=config, headers=headers, timeout=60)
@@ -749,24 +889,14 @@ class QzAPI:
         key + framework_config[0] + 嵌套 resource_spec_price），差别只在 endpoint、
         响应封装（ResponseMetadata/Result）和新增的 `exclude_nodes` 等 v2 选项。
         """
-        url = f"{self.base_url}/api/v2/train?Action=CreateJobConsole"
         workspace_id = config.get("workspace_id", "")
-        headers = {
-            "accept": "application/json, text/plain, */*",
-            "content-type": "application/json",
-            "cookie": cookie,
-            "origin": "https://qz.sii.edu.cn",
-            "referer": f"https://qz.sii.edu.cn/jobs/distributedTraining?spaceId={workspace_id}",
-            "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36",
-        }
-        response = _curl_post(url, json=config, headers=headers, timeout=60)
-        if response.status_code == 401:
-            raise QzAPIError("Cookie 已过期或无效，请重新获取", 401)
-        if response.status_code != 200:
-            raise QzAPIError(
-                f"请求失败: HTTP {response.status_code}", response.status_code
-            )
-        return _unwrap_v2_result(response.json())
+        return self._request_v2(
+            "train",
+            "CreateJobConsole",
+            config,
+            cookie=cookie,
+            referer_path=f"/jobs/distributedTraining?spaceId={workspace_id}",
+        )
 
     @with_auth_retry
     def create_hpc_job(
@@ -788,9 +918,29 @@ class QzAPI:
         max_running_time_days: int = 0,
         max_running_time_hours: int = 0,
         max_running_time_minutes: int = 0,
+        priority: int = 1,
     ) -> Dict[str, Any]:
         """
         提交 HPC/CPU 任务（使用 cookie 认证，POST /api/v1/hpc_jobs）
+
+        ``priority`` 是**必填**：平台后来加了这个校验，不传直接被拒
+        （``API 请求失败: priority must be set``），导致 `qzcli hpc` 整个不可用。
+
+        ⚠️ **HPC 的优先级方向和训练任务相反，别照抄。** 实测提交值→平台档位：
+
+        ==========  ==========  ======
+        提交值       存储值       档位
+        ==========  ==========  ======
+        1           11          LOW
+        3           13          LOW
+        5           30          HIGH
+        10          35          HIGH
+        ==========  ==========  ======
+
+        即**数字越大优先级越高**；有效范围 1–10（0/11/12 会被拒
+        ``无效的优先级值``）。而训练任务的 ``task_priority`` 是反的 ——
+        那边 10 表示低优。所以这里默认取 **1（LOW）**，与集群上现有生产
+        HPC 任务一致（它们存储值都是 11/LOW），不抢资源。
 
         Returns:
             API 响应 data 字段（含 job_id 等）
@@ -801,6 +951,7 @@ class QzAPI:
             "workspace_id": workspace_id,
             "project_id": project_id,
             "logic_compute_group_id": logic_compute_group_id,
+            "priority": priority,
             "enable_notification": False,
             "dataset_info": [],
             "sbatch_script": {
@@ -835,8 +986,8 @@ class QzAPI:
             "accept": "application/json, text/plain, */*",
             "content-type": "application/json",
             "cookie": cookie,
-            "origin": "https://qz.sii.edu.cn",
-            "referer": f"https://qz.sii.edu.cn/jobs/hpc?spaceId={workspace_id}",
+            "origin": self.base_url,
+            "referer": f"{self.base_url}/jobs/hpc?spaceId={workspace_id}",
             "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
         }
         response = _curl_post(url, json=payload, headers=headers, timeout=60)
@@ -857,70 +1008,36 @@ class QzAPI:
             )
         return result.get("data", {})
 
-    @with_auth_retry
     def list_hpc_jobs(
         self,
         workspace_id: str,
-        cookie: str,
+        cookie: Optional[str] = None,
         status: Optional[str] = None,
         page_num: int = 1,
         page_size: int = 100,
     ) -> Dict[str, Any]:
-        """
-        列出 HPC 任务（使用 cookie 认证，POST /api/v1/hpc_jobs/list）
+        """列出 HPC 任务（v2 ``hpc ListJobs``）。
 
-        Args:
-            workspace_id: 工作空间 ID
-            cookie: 浏览器 cookie 字符串
-            status: 状态过滤，如 'RUNNING'、'QUEUEING'，None 表示不过滤
-            page_num: 页码
-            page_size: 每页数量
+        原来的实现打 ``/api/v1/hpc_jobs/list``，且仓库里零调用者。这里没有直接删掉，
+        而是换成 v2 实现 —— 真机验证过返回 ``Result.jobs[]`` + ``Result.total``，
+        和 v1 的 ``data.jobs`` 形状一致，所以调用方感知不到差别。
 
-        Returns:
-            包含 jobs 列表和 total 的字典
+        ``cookie`` 参数保留只为兼容旧签名，实际由 ``_request_v2`` 从磁盘读。
         """
-        url = f"{self.base_url}/api/v1/hpc_jobs/list"
-        payload: Dict[str, Any] = {
+        body: Dict[str, Any] = {
             "workspace_id": workspace_id,
             "page_num": page_num,
             "page_size": page_size,
         }
         if status:
-            payload["status"] = status
-        headers = {
-            "accept": "application/json, text/plain, */*",
-            "accept-language": "en-US,en;q=0.9",
-            "cache-control": "no-cache",
-            "content-type": "application/json",
-            "cookie": cookie,
-            "origin": "https://qz.sii.edu.cn",
-            "pragma": "no-cache",
-            "referer": f"https://qz.sii.edu.cn/jobs/hpc?spaceId={workspace_id}",
-            "sec-ch-ua": '"Not(A:Brand";v="8", "Chromium";v="144"',
-            "sec-ch-ua-mobile": "?0",
-            "sec-ch-ua-platform": '"macOS"',
-            "sec-fetch-dest": "empty",
-            "sec-fetch-mode": "cors",
-            "sec-fetch-site": "same-origin",
-            "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36",
-        }
-        response = _curl_post(url, json=payload, headers=headers, timeout=60)
-        if response.status_code == 401:
-            raise QzAPIError("Cookie 已过期或无效，请重新获取", 401)
-        if response.status_code != 200:
-            raise QzAPIError(
-                f"请求失败: HTTP {response.status_code}", response.status_code
-            )
-        try:
-            result = response.json()
-        except Exception:
-            raise QzAPIError("响应不是有效的 JSON，请检查 cookie 是否正确")
-        if result.get("code") != 0:
-            raise QzAPIError(
-                f"API 请求失败: {result.get('message', '未知错误')}",
-                result.get("code"),
-            )
-        return result.get("data", {})
+            body["status"] = status
+        return self._request_v2(
+            "hpc",
+            "ListJobs",
+            body,
+            cookie=cookie,
+            referer_path=f"/jobs/hpc?spaceId={workspace_id}",
+        )
 
     def test_connection(self) -> bool:
         """测试连接"""
@@ -930,30 +1047,64 @@ class QzAPI:
         except Exception:
             return False
 
-    @with_auth_retry
     def list_workspace_tasks(
         self,
         workspace_id: str,
         cookie: str,
         hours: int = 24,
     ) -> Dict[str, Any]:
+        """工作空间任务概览：优先 v2 ``workspace GetOverviewTaskMetric``，不通时回落 v1。
+
+        返回含 ``task_groups``（按任务类型分组的状态统计）。
+
+        ⚠️ ``time_range`` 的时间戳是**秒**不是毫秒，且区间**硬限制 ≤ 1 个月**。
+        传毫秒会被当成秒解释，跨度爆表，平台报
+        ``InternalError: 查询时间区间不能超过1个月``。
         """
-        获取工作空间任务概览统计（使用浏览器 cookie 认证）
-
-        Args:
-            workspace_id: 工作空间 ID
-            cookie: 浏览器 cookie 字符串
-            hours: 查询最近多少小时的数据（默认 24）
-
-        Returns:
-            API 响应数据，包含 task_groups 列表（按任务类型分组的状态统计）
-        """
-        import time as _time
-
-        url = f"{self.base_url}/api/v1/cluster_metric/overview_task_metric"
-
         end_ts = int(_time.time())
         start_ts = end_ts - hours * 3600
+        return _v2_then_v1(
+            "cluster_metric/overview_task_metric",
+            lambda: self._list_workspace_tasks_v2(
+                workspace_id, cookie, start_ts, end_ts
+            ),
+            lambda: self._list_workspace_tasks_v1(
+                workspace_id, cookie, start_ts, end_ts
+            ),
+        )
+
+    def _list_workspace_tasks_v2(
+        self,
+        workspace_id: str,
+        cookie: Optional[str],
+        start_ts: int,
+        end_ts: int,
+    ) -> Dict[str, Any]:
+        """``POST /api/v2/workspace?Action=GetOverviewTaskMetric``。"""
+        return self._request_v2(
+            "workspace",
+            "GetOverviewTaskMetric",
+            {
+                "filter": {"workspace_id": workspace_id},
+                "time_range": {
+                    "start_timestamp": str(start_ts),
+                    "end_timestamp": str(end_ts),
+                },
+            },
+            cookie=cookie,
+            referer_path=f"/jobs/spacesOverview?spaceId={workspace_id}",
+        )
+
+    @with_auth_retry
+    def _list_workspace_tasks_v1(
+        self,
+        workspace_id: str,
+        cookie: str,
+        start_ts: int,
+        end_ts: int,
+    ) -> Dict[str, Any]:
+        """遗留路径 ``POST /api/v1/cluster_metric/overview_task_metric``。"""
+        url = f"{self.base_url}/api/v1/cluster_metric/overview_task_metric"
 
         payload = {
             "filter": {"workspace_id": workspace_id},
@@ -967,8 +1118,8 @@ class QzAPI:
             "accept": "application/json, text/plain, */*",
             "content-type": "application/json",
             "cookie": cookie,
-            "origin": "https://qz.sii.edu.cn",
-            "referer": f"https://qz.sii.edu.cn/jobs/spacesOverview?spaceId={workspace_id}",
+            "origin": self.base_url,
+            "referer": f"{self.base_url}/jobs/spacesOverview?spaceId={workspace_id}",
             "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36",
         }
 
@@ -999,7 +1150,8 @@ class QzAPI:
 
         return result.get("data", {})
 
-    @with_auth_retry
+    # 注意：分发器本身**不**挂 @with_auth_retry —— v2 分支的重试在 `_request_v2`
+    # 上，v1 分支的重试在 `_list_jobs_v1` 上，再包一层会变成重试套重试。
     def list_jobs_with_cookie(
         self,
         workspace_id: str,
@@ -1008,20 +1160,54 @@ class QzAPI:
         page_size: int = 100,
         created_by: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """
-        使用 cookie 获取任务列表（内部 API）
+        """获取任务列表：优先 v2 ``train ListJobs``，v2 路由不通时回落 v1。
 
-        Args:
-            workspace_id: 工作空间 ID
-            cookie: 浏览器 cookie 字符串
-            page_num: 页码
-            page_size: 每页数量
-            created_by: 创建者用户 ID（可选，不传则获取所有）
-
-        Returns:
-            包含 jobs 列表和 total 的字典
+        两边响应形状一致（``{jobs: [...], total: N}``），调用方无需区分。
         """
-        # 注意：使用 /api/v1/ 而不是 /openapi/v1/，前者需要 cookie 认证
+        return _v2_then_v1(
+            "train_job/list",
+            lambda: self._list_jobs_v2(
+                workspace_id, cookie, page_num, page_size, created_by
+            ),
+            lambda: self._list_jobs_v1(
+                workspace_id, cookie, page_num, page_size, created_by
+            ),
+        )
+
+    def _list_jobs_v2(
+        self,
+        workspace_id: str,
+        cookie: Optional[str] = None,
+        page_num: int = 1,
+        page_size: int = 100,
+        created_by: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """``POST /api/v2/train?Action=ListJobs`` → ``Result.{jobs, total}``。"""
+        body: Dict[str, Any] = {
+            "workspace_id": workspace_id,
+            "page_num": page_num,
+            "page_size": page_size,
+        }
+        if created_by:
+            body["created_by"] = created_by
+        return self._request_v2(
+            "train",
+            "ListJobs",
+            body,
+            cookie=cookie,
+            referer_path=f"/jobs/distributedTraining?spaceId={workspace_id}",
+        )
+
+    @with_auth_retry
+    def _list_jobs_v1(
+        self,
+        workspace_id: str,
+        cookie: str,
+        page_num: int = 1,
+        page_size: int = 100,
+        created_by: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """遗留路径 ``POST /api/v1/train_job/list`` → ``data.{jobs, total}``。"""
         url = f"{self.base_url}/api/v1/train_job/list"
 
         payload = {
@@ -1040,9 +1226,9 @@ class QzAPI:
             "cache-control": "no-cache",
             "content-type": "application/json",
             "cookie": cookie,
-            "origin": "https://qz.sii.edu.cn",
+            "origin": self.base_url,
             "pragma": "no-cache",
-            "referer": f"https://qz.sii.edu.cn/jobs/distributedTraining?spaceId={workspace_id}",
+            "referer": f"{self.base_url}/jobs/distributedTraining?spaceId={workspace_id}",
             "sec-ch-ua": '"Not(A:Brand";v="8", "Chromium";v="144"',
             "sec-ch-ua-mobile": "?0",
             "sec-ch-ua-platform": '"macOS"',
@@ -1079,33 +1265,18 @@ class QzAPI:
 
         return result.get("data", {})
 
-    @with_auth_retry
-    def list_notebooks_with_cookie(
-        self,
+    @staticmethod
+    def _notebook_list_body(
         workspace_id: str,
-        cookie: str,
-        page: int = 1,
-        page_size: int = 50,
-        user_ids: Optional[List[str]] = None,
-        status: Optional[List[str]] = None,
+        page: int,
+        page_size: int,
+        user_ids: Optional[List[str]],
+        status: Optional[List[str]],
     ) -> Dict[str, Any]:
-        """
-        使用 cookie 获取交互式建模实例列表（开发机）
-
-        Args:
-            workspace_id: 工作空间 ID
-            cookie: 浏览器 cookie 字符串
-            page: 页码（从 1 开始）
-            page_size: 每页数量
-            user_ids: 用户 ID 列表（过滤创建者）
-            status: 状态列表（如 ["RUNNING"]）
-
-        Returns:
-            包含 list 和 total 的字典
-        """
-        url = f"{self.base_url}/api/v1/notebook/list"
-
-        payload = {
+        """v1 和 v2 的开发机列表请求体**完全一致** —— 分页都是 ``page``（不是
+        ``page_num``）、过滤都在 ``filter_by{}``、排序键都是 ``order_by[].order``。
+        所以这里共用一份，避免两边漂移。"""
+        return {
             "workspace_id": workspace_id,
             "page": page,
             "page_size": page_size,
@@ -1119,12 +1290,70 @@ class QzAPI:
             "order_by": [{"field": "created_at", "order": "desc"}],
         }
 
+    def list_notebooks_with_cookie(
+        self,
+        workspace_id: str,
+        cookie: str,
+        page: int = 1,
+        page_size: int = 50,
+        user_ids: Optional[List[str]] = None,
+        status: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        """获取开发机列表：优先 v2 ``notebook ListNotebooks``，不通时回落 v1。
+
+        两边都返回 ``{list: [...], total: N}``。
+        """
+        return _v2_then_v1(
+            "notebook/list",
+            lambda: self._list_notebooks_v2(
+                workspace_id, cookie, page, page_size, user_ids, status
+            ),
+            lambda: self._list_notebooks_v1(
+                workspace_id, cookie, page, page_size, user_ids, status
+            ),
+        )
+
+    def _list_notebooks_v2(
+        self,
+        workspace_id: str,
+        cookie: Optional[str] = None,
+        page: int = 1,
+        page_size: int = 50,
+        user_ids: Optional[List[str]] = None,
+        status: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        """``POST /api/v2/notebook?Action=ListNotebooks`` → ``Result.{list, total}``。"""
+        return self._request_v2(
+            "notebook",
+            "ListNotebooks",
+            self._notebook_list_body(workspace_id, page, page_size, user_ids, status),
+            cookie=cookie,
+            referer_path=f"/jobs/interactiveModeling?spaceId={workspace_id}",
+        )
+
+    @with_auth_retry
+    def _list_notebooks_v1(
+        self,
+        workspace_id: str,
+        cookie: str,
+        page: int = 1,
+        page_size: int = 50,
+        user_ids: Optional[List[str]] = None,
+        status: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        """遗留路径 ``POST /api/v1/notebook/list`` → ``data.{list, total}``。"""
+        url = f"{self.base_url}/api/v1/notebook/list"
+
+        payload = self._notebook_list_body(
+            workspace_id, page, page_size, user_ids, status
+        )
+
         headers = {
             "accept": "application/json, text/plain, */*",
             "content-type": "application/json",
             "cookie": cookie,
-            "origin": "https://qz.sii.edu.cn",
-            "referer": f"https://qz.sii.edu.cn/jobs/interactiveModeling?spaceId={workspace_id}",
+            "origin": self.base_url,
+            "referer": f"{self.base_url}/jobs/interactiveModeling?spaceId={workspace_id}",
             "sec-ch-ua": '"Not(A:Brand";v="8", "Chromium";v="144"',
             "sec-ch-ua-mobile": "?0",
             "sec-ch-ua-platform": '"macOS"',
@@ -1243,22 +1472,141 @@ class QzAPI:
             "specs": list(specs.values()),
         }
 
-    def list_specs(self, compute_group_id: str) -> List[Dict[str, Any]]:
-        """
-        获取计算组可用的规格列表（使用 OpenAPI）
+    def list_specs(
+        self, compute_group_id: str, workspace_id: str = ""
+    ) -> List[Dict[str, Any]]:
+        """获取计算组可用的规格列表。
+
+        这是整个迁移里最麻烦的一个：**v2 没有任何 action 返回 spec_id**。
+        把 144 个 action 的 schema 全 grep 过 —— ``spec_id`` 只作为**请求**字段
+        存在（``train.CreateJob.framework_config[]`` / ``hpc.CreateJob`` /
+        ``inference-serving.CreateServing``）。``workspace GetWorkspaceNodeSpecs``
+        和 ``GetLogicComputeGroupNodeSpecs`` 返回的 ``node_specs[]`` 只有硬件参数
+        （cpu/gpu/内存/型号），**没有 id**，拿来当 spec 用会被
+        ``_normalize_spec_item`` 直接丢掉。
+
+        而老的 ``/openapi/v1/specs/list`` **平台上已经 404 了**。
+
+        所以这里走两级：
+
+        1. 老 OpenAPI（唯一的"规格清单"语义来源，还活着就用）
+        2. v2 ``train ListJobs`` 的历史任务：
+           ``framework_config[].instance_spec_price_info`` 里带 ``quota_id``，
+           而 quota_id 就是 spec_id，同时还带全套 cpu/gpu/内存/gpu_type。
+           这是目前**唯一能从 v2 拿到真实 spec id 的路径**。
+
+        再往上还有第三级（``~/.qzcli/resources.json`` 本地缓存），由调用方兜。
 
         Args:
-            compute_group_id: 计算组 ID
-
-        Returns:
-            规格列表
+            compute_group_id: 逻辑计算组 ID
+            workspace_id: 工作空间 ID。留空则跳过第 2 级 —— 历史任务必须按
+                工作空间查。
         """
-        result = self._request(
-            "/openapi/v1/specs/list", {"logic_compute_group_id": compute_group_id}
-        )
-        return result.get("data", {}).get("specs", [])
+        try:
+            result = self._request(
+                "/openapi/v1/specs/list", {"logic_compute_group_id": compute_group_id}
+            )
+            specs = result.get("data", {}).get("specs", [])
+            if specs:
+                return specs
+        except QzAPIError:
+            # 404 / invalid_grant 都算这一级不可用，静默降级到历史任务推断
+            pass
 
-    @with_auth_retry
+        if not workspace_id:
+            return []
+        return self._specs_from_job_history(compute_group_id, workspace_id)
+
+    def _specs_from_job_history(
+        self, compute_group_id: str, workspace_id: str, page_size: int = 200
+    ) -> List[Dict[str, Any]]:
+        """从历史任务里反推规格（v2 ``train ListJobs``）。
+
+        平台不提供"某计算组有哪些规格"的 v2 查询，但**跑过的任务里带着它用的
+        规格**，所以按 quota_id 去重就能还原出一份可用规格表。
+        字段名对齐 ``_normalize_spec_item`` 认识的那几个别名。
+        """
+        try:
+            data = self.list_jobs_with_cookie(
+                workspace_id, "", page_num=1, page_size=page_size
+            )
+        except QzAPIError:
+            return []
+
+        specs: Dict[str, Dict[str, Any]] = {}
+        for job in data.get("jobs") or []:
+            lcg_id = job.get("logic_compute_group_id", "")
+            if compute_group_id and lcg_id != compute_group_id:
+                continue
+            for fc in job.get("framework_config") or []:
+                info = fc.get("instance_spec_price_info") or {}
+                quota_id = info.get("quota_id")
+                if not quota_id or quota_id in specs:
+                    continue
+                gpu_info = info.get("gpu_info") or {}
+                specs[quota_id] = {
+                    "id": quota_id,
+                    "quota_id": quota_id,
+                    "gpu_count": info.get("gpu_count") or fc.get("gpu_count") or 0,
+                    "cpu_count": info.get("cpu_count") or fc.get("cpu") or 0,
+                    "memory_size_gib": info.get("memory_size_gib")
+                    or fc.get("mem_gi")
+                    or 0,
+                    # gpu_type 平台校验时要**完整串**（NVIDIA_H200_SXM_141G），
+                    # 不是简称，所以直接用响应里的原值
+                    "gpu_type": gpu_info.get("gpu_type") or "",
+                    "gpu_info": gpu_info,
+                    "logic_compute_group_ids": [lcg_id] if lcg_id else [],
+                }
+        return list(specs.values())
+
+    def list_node_specs(
+        self, workspace_id: str, logic_compute_group_id: str = ""
+    ) -> List[Dict[str, Any]]:
+        """计算组/工作空间的**硬件规格**（v2）。
+
+        注意这**不是** ``list_specs`` 的替代品 —— 返回的 ``node_specs[]`` 里
+        没有 spec_id，不能拿去提任务，只能用于展示"这个组有什么样的机器"。
+        ``logic_compute_group_id`` 留空则查整个工作空间。
+        """
+        if logic_compute_group_id:
+            body = {
+                "workspace_id": workspace_id,
+                "logic_compute_group_id": logic_compute_group_id,
+            }
+            action = "GetLogicComputeGroupNodeSpecs"
+        else:
+            body = {"workspace_id": workspace_id}
+            action = "GetWorkspaceNodeSpecs"
+        result = self._request_v2(
+            "workspace",
+            action,
+            body,
+            referer_path=f"/jobs/spacesOverview?spaceId={workspace_id}",
+        )
+        return result.get("node_specs") or []
+
+    @staticmethod
+    def _dimension_body(
+        workspace_id: str,
+        logic_compute_group_id: Optional[str],
+        compute_group_id: Optional[str],
+        page_num: int,
+        page_size: int,
+    ) -> Dict[str, Any]:
+        """v1 `cluster_metric/list_*_dimension` 和 v2 `workspace List*Dimension`
+        共用同一份请求体（``filter{}`` + ``page_num``/``page_size``）。"""
+        filter_params = {"workspace_id": workspace_id}
+        if logic_compute_group_id:
+            filter_params["logic_compute_group_id"] = logic_compute_group_id
+        if compute_group_id:
+            filter_params["compute_group_id"] = compute_group_id
+        return {
+            "page_num": page_num,
+            "page_size": page_size,
+            "filter": filter_params,
+        }
+
     def list_node_dimension(
         self,
         workspace_id: str,
@@ -1268,33 +1616,77 @@ class QzAPI:
         page_num: int = 1,
         page_size: int = 100,
     ) -> Dict[str, Any]:
-        """
-        获取节点维度的资源使用情况（使用浏览器 cookie 认证）
+        """节点维度资源使用：优先 v2 ``workspace ListNodeDimension``，不通时回落 v1。
 
-        Args:
-            workspace_id: 工作空间 ID
-            cookie: 浏览器 cookie 字符串
-            logic_compute_group_id: 计算组 ID（可选）
-            compute_group_id: 物理计算组 ID（可选）
-            page_num: 页码
-            page_size: 每页数量
-
-        Returns:
-            包含 node_dimensions 列表的字典
+        ⚠️ **必须是 `workspace` 而不是 `cluster`**。`qz spec` 里
+        ``cluster.ListNodeDimension`` 和 ``workspace.ListNodeDimension`` 描述几乎
+        一样，但前者是集群管理员权限 —— 普通账号实测返回 ``AccessForbidden``。
+        qzcli 是工作空间级工具，一律走 ``workspace.*``。
         """
+        return _v2_then_v1(
+            "cluster_metric/list_node_dimension",
+            lambda: self._list_node_dimension_v2(
+                workspace_id,
+                cookie,
+                logic_compute_group_id,
+                compute_group_id,
+                page_num,
+                page_size,
+            ),
+            lambda: self._list_node_dimension_v1(
+                workspace_id,
+                cookie,
+                logic_compute_group_id,
+                compute_group_id,
+                page_num,
+                page_size,
+            ),
+        )
+
+    def _list_node_dimension_v2(
+        self,
+        workspace_id: str,
+        cookie: Optional[str] = None,
+        logic_compute_group_id: Optional[str] = None,
+        compute_group_id: Optional[str] = None,
+        page_num: int = 1,
+        page_size: int = 100,
+    ) -> Dict[str, Any]:
+        """``POST /api/v2/workspace?Action=ListNodeDimension`` → ``Result.{node_dimensions, total}``。"""
+        return self._request_v2(
+            "workspace",
+            "ListNodeDimension",
+            self._dimension_body(
+                workspace_id,
+                logic_compute_group_id,
+                compute_group_id,
+                page_num,
+                page_size,
+            ),
+            cookie=cookie,
+            referer_path=f"/jobs/spacesOverview?spaceId={workspace_id}",
+        )
+
+    @with_auth_retry
+    def _list_node_dimension_v1(
+        self,
+        workspace_id: str,
+        cookie: str,
+        logic_compute_group_id: Optional[str] = None,
+        compute_group_id: Optional[str] = None,
+        page_num: int = 1,
+        page_size: int = 100,
+    ) -> Dict[str, Any]:
+        """遗留路径 ``POST /api/v1/cluster_metric/list_node_dimension``。"""
         url = f"{self.base_url}/api/v1/cluster_metric/list_node_dimension"
 
-        filter_params = {"workspace_id": workspace_id}
-        if logic_compute_group_id:
-            filter_params["logic_compute_group_id"] = logic_compute_group_id
-        if compute_group_id:
-            filter_params["compute_group_id"] = compute_group_id
-
-        payload = {
-            "page_num": page_num,
-            "page_size": page_size,
-            "filter": filter_params,
-        }
+        payload = self._dimension_body(
+            workspace_id,
+            logic_compute_group_id,
+            compute_group_id,
+            page_num,
+            page_size,
+        )
 
         # 需要完整的浏览器 headers 才能通过认证
         headers = {
@@ -1303,9 +1695,9 @@ class QzAPI:
             "cache-control": "no-cache",
             "content-type": "application/json",
             "cookie": cookie,
-            "origin": "https://qz.sii.edu.cn",
+            "origin": self.base_url,
             "pragma": "no-cache",
-            "referer": f"https://qz.sii.edu.cn/jobs/spacesOverview?spaceId={workspace_id}",
+            "referer": f"{self.base_url}/jobs/spacesOverview?spaceId={workspace_id}",
             "sec-ch-ua": '"Not(A:Brand";v="8", "Chromium";v="144"',
             "sec-ch-ua-mobile": "?0",
             "sec-ch-ua-platform": '"macOS"',
@@ -1342,7 +1734,6 @@ class QzAPI:
 
         return result.get("data", {})
 
-    @with_auth_retry
     def list_task_dimension(
         self,
         workspace_id: str,
@@ -1351,19 +1742,51 @@ class QzAPI:
         page_num: int = 1,
         page_size: int = 200,
     ) -> Dict[str, Any]:
-        """
-        获取任务维度的资源使用情况（使用浏览器 cookie 认证）
+        """任务维度资源使用：优先 v2 ``workspace ListTaskDimension``，不通时回落 v1。
 
-        Args:
-            workspace_id: 工作空间 ID
-            cookie: 浏览器 cookie 字符串
-            project_id: 项目 ID（可选）
-            page_num: 页码
-            page_size: 每页数量
-
-        Returns:
-            包含 task_dimensions 列表的字典
+        同 ``list_node_dimension``：**必须走 `workspace` 不是 `cluster`**，
+        后者对普通账号是 ``AccessForbidden``。
         """
+        return _v2_then_v1(
+            "cluster_metric/list_task_dimension",
+            lambda: self._list_task_dimension_v2(
+                workspace_id, cookie, project_id, page_num, page_size
+            ),
+            lambda: self._list_task_dimension_v1(
+                workspace_id, cookie, project_id, page_num, page_size
+            ),
+        )
+
+    def _list_task_dimension_v2(
+        self,
+        workspace_id: str,
+        cookie: Optional[str] = None,
+        project_id: Optional[str] = None,
+        page_num: int = 1,
+        page_size: int = 200,
+    ) -> Dict[str, Any]:
+        """``POST /api/v2/workspace?Action=ListTaskDimension`` → ``Result.{task_dimensions, total}``。"""
+        filter_params = {"workspace_id": workspace_id}
+        if project_id:
+            filter_params["project_id"] = project_id
+        return self._request_v2(
+            "workspace",
+            "ListTaskDimension",
+            {"page_num": page_num, "page_size": page_size, "filter": filter_params},
+            cookie=cookie,
+            referer_path=f"/jobs/spacesOverview?spaceId={workspace_id}",
+        )
+
+    @with_auth_retry
+    def _list_task_dimension_v1(
+        self,
+        workspace_id: str,
+        cookie: str,
+        project_id: Optional[str] = None,
+        page_num: int = 1,
+        page_size: int = 200,
+    ) -> Dict[str, Any]:
+        """遗留路径 ``POST /api/v1/cluster_metric/list_task_dimension``。"""
         url = f"{self.base_url}/api/v1/cluster_metric/list_task_dimension"
 
         filter_params = {"workspace_id": workspace_id}
@@ -1382,9 +1805,9 @@ class QzAPI:
             "cache-control": "no-cache",
             "content-type": "application/json",
             "cookie": cookie,
-            "origin": "https://qz.sii.edu.cn",
+            "origin": self.base_url,
             "pragma": "no-cache",
-            "referer": f"https://qz.sii.edu.cn/jobs/spacesOverview?spaceId={workspace_id}",
+            "referer": f"{self.base_url}/jobs/spacesOverview?spaceId={workspace_id}",
             "sec-ch-ua": '"Not(A:Brand";v="8", "Chromium";v="144"',
             "sec-ch-ua-mobile": "?0",
             "sec-ch-ua-platform": '"macOS"',
@@ -1421,18 +1844,34 @@ class QzAPI:
 
         return result.get("data", {})
 
-    @with_auth_retry
     def get_cluster_basic_info(self, workspace_id: str, cookie: str) -> Dict[str, Any]:
-        """
-        获取工作空间的集群和计算组信息
+        """工作空间的集群/计算组信息：优先 v2 ``workspace GetBasicInfo``，不通时回落 v1。
 
-        Args:
-            workspace_id: 工作空间 ID
-            cookie: 浏览器 cookie 字符串
-
-        Returns:
-            包含 clusters, compute_groups, resource_types 的字典
+        ⚠️ v2 侧对应的是 ``workspace GetBasicInfo``，**不是** 同名的
+        ``cluster GetClusterBasicInfo`` —— 后者普通账号 ``AccessForbidden``。
+        两边都返回 ``{clusters, compute_groups, resource_types}``。
         """
+        return _v2_then_v1(
+            "cluster_metric/cluster_basic_info",
+            lambda: self._cluster_basic_info_v2(workspace_id, cookie),
+            lambda: self._cluster_basic_info_v1(workspace_id, cookie),
+        )
+
+    def _cluster_basic_info_v2(
+        self, workspace_id: str, cookie: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """``POST /api/v2/workspace?Action=GetBasicInfo``。"""
+        return self._request_v2(
+            "workspace",
+            "GetBasicInfo",
+            {"workspace_id": workspace_id},
+            cookie=cookie,
+            referer_path=f"/jobs/spacesOverview?spaceId={workspace_id}",
+        )
+
+    @with_auth_retry
+    def _cluster_basic_info_v1(self, workspace_id: str, cookie: str) -> Dict[str, Any]:
+        """遗留路径 ``POST /api/v1/cluster_metric/cluster_basic_info``。"""
         url = f"{self.base_url}/api/v1/cluster_metric/cluster_basic_info"
 
         payload = {"workspace_id": workspace_id}
@@ -1443,9 +1882,9 @@ class QzAPI:
             "cache-control": "no-cache",
             "content-type": "application/json",
             "cookie": cookie,
-            "origin": "https://qz.sii.edu.cn",
+            "origin": self.base_url,
             "pragma": "no-cache",
-            "referer": f"https://qz.sii.edu.cn/jobs/spacesOverview?spaceId={workspace_id}",
+            "referer": f"{self.base_url}/jobs/spacesOverview?spaceId={workspace_id}",
             "sec-ch-ua": '"Not(A:Brand";v="8", "Chromium";v="144"',
             "sec-ch-ua-mobile": "?0",
             "sec-ch-ua-platform": '"macOS"',
@@ -1506,9 +1945,9 @@ class QzAPI:
             "cache-control": "no-cache",
             "content-type": "application/json",
             "cookie": cookie,
-            "origin": "https://qz.sii.edu.cn",
+            "origin": self.base_url,
             "pragma": "no-cache",
-            "referer": "https://qz.sii.edu.cn/operations/projects",
+            "referer": f"{self.base_url}/operations/projects",
             "sec-ch-ua": '"Not(A:Brand";v="8", "Chromium";v="144"',
             "sec-ch-ua-mobile": "?0",
             "sec-ch-ua-platform": '"macOS"',

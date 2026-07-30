@@ -354,3 +354,96 @@ class FindNotebookJupyterInfoTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ExecConcurrencyTests(unittest.TestCase):
+    """多 agent 并发 exec 同一台开发机时的隔离性。
+
+    这两条都是真机 3 路并发实测出来的：修复前第 3 路收到的是第 2 路的输出、
+    第 1 路什么都没收到。
+    """
+
+    def _launch(self, n=3):
+        """并发跑 n 次 _exec_launch，收集 job_id 和实际用到的 terminal。"""
+        from qzcli import cli
+
+        created, deleted, sent = [], [], []
+
+        class _Resp:
+            status_code = 200
+
+            def __init__(self, payload):
+                self._p = payload
+
+            def json(self):
+                return self._p
+
+        def fake_post(url, **_):
+            name = f"t{len(created) + 1}"
+            created.append(name)
+            return _Resp({"name": name})
+
+        def fake_get(url, **_):
+            # 故意让"已存在的终端"非空 —— 老实现会去抢 terms[0]
+            return _Resp([{"name": "human-session"}])
+
+        def fake_delete(url, **_):
+            deleted.append(url.rsplit("/", 1)[-1])
+            return _Resp({})
+
+        def fake_put(url, **_):
+            return _Resp({})
+
+        class _WS:
+            def settimeout(self, *_a):
+                pass
+
+            def recv(self):
+                raise RuntimeError("drain")
+
+            def send(self, payload):
+                sent.append(payload)
+
+            def close(self):
+                pass
+
+        info = {"base_url": "https://nb.example/x", "token": "tk"}
+        job_ids = []
+        with patch("requests.post", side_effect=fake_post), patch(
+            "requests.get", side_effect=fake_get
+        ), patch("requests.delete", side_effect=fake_delete), patch(
+            "requests.put", side_effect=fake_put
+        ), patch(
+            "websocket.create_connection", return_value=_WS()
+        ), patch(
+            "time.sleep"
+        ):
+            for _ in range(n):
+                job_ids.append(cli._exec_launch(info, "echo hi", MagicMock()))
+        return job_ids, created, deleted, sent
+
+    def test_job_ids_are_unique_within_same_second(self):
+        """job_id 决定输出文件名 /tmp/.qzcli/<job_id>_out。原来只有秒级时间戳，
+        同一秒内并发的 exec 会拿到同一个 id，输出互相覆盖。"""
+        job_ids, _, _, _ = self._launch(5)
+        self.assertEqual(len(set(job_ids)), 5, f"job_id 有重复: {job_ids}")
+
+    def test_each_exec_creates_its_own_terminal(self):
+        """老实现复用 terms[0]，既会和别的 agent 抢，也会往人开着的
+        交互式终端里打字。现在必须每次自建。"""
+        _, created, _, _ = self._launch(3)
+        self.assertEqual(len(created), 3)
+        self.assertEqual(len(set(created)), 3)
+        self.assertNotIn("human-session", created)
+
+    def test_terminal_is_cleaned_up(self):
+        """不删的话每跑一次就在开发机上攒一个终端。"""
+        _, created, deleted, _ = self._launch(3)
+        self.assertEqual(sorted(deleted), sorted(created))
+
+    def test_command_is_detached_so_it_survives_terminal_delete(self):
+        """终端删掉后命令还得继续跑完，靠 setsid/nohup 摘出去。"""
+        _, _, _, sent = self._launch(1)
+        payload = sent[0]
+        self.assertIn("setsid", payload)
+        self.assertIn("nohup", payload)

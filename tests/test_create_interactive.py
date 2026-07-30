@@ -233,7 +233,7 @@ class FakeInteractiveAPI:
             ]
         }
 
-    def list_specs(self, compute_group_id):
+    def list_specs(self, compute_group_id, workspace_id=""):
         return [
             {
                 "id": self.SPEC_ID,
@@ -284,12 +284,12 @@ class FakeInteractiveAPI:
 
 
 class BrokenSpecsAPI(FakeInteractiveAPI):
-    def list_specs(self, compute_group_id):
+    def list_specs(self, compute_group_id, workspace_id=""):
         raise ValueError("Extra data: line 1 column 5 (char 4)")
 
 
 class UnsupportedSpecsAPI(FakeInteractiveAPI):
-    def list_specs(self, compute_group_id):
+    def list_specs(self, compute_group_id, workspace_id=""):
         raise QzAPIError("API 请求失败: 响应不是有效 JSON (HTTP 404)")
 
 
@@ -552,7 +552,7 @@ class SpecPrefetchTrackingAPI(MultiComputeGroupAPI):
     def __init__(self):
         self.list_specs_calls = []
 
-    def list_specs(self, compute_group_id):
+    def list_specs(self, compute_group_id, workspace_id=""):
         self.list_specs_calls.append(compute_group_id)
         return [
             {

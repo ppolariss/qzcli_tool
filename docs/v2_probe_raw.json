@@ -1,0 +1,1109 @@
+{
+  "qz_spec_version": "cf22fdbe",
+  "records": [
+    {
+      "service": "cluster",
+      "action": "GetClusterBasicInfo",
+      "request_body": {},
+      "status": 200,
+      "content_type": "application/json; charset=utf-8",
+      "verdict": "JSON_ERR:AccessForbidden",
+      "envelope": "{ResponseMetadata}"
+    },
+    {
+      "service": "cluster",
+      "action": "GetClusterOverviewOptions",
+      "request_body": {},
+      "status": 200,
+      "content_type": "application/json; charset=utf-8",
+      "verdict": "JSON_ERR:AccessForbidden",
+      "envelope": "{ResponseMetadata}"
+    },
+    {
+      "service": "cluster",
+      "action": "GetConsumeTimeSeries",
+      "request_body": {},
+      "status": 200,
+      "content_type": "application/json; charset=utf-8",
+      "verdict": "JSON_ERR:InternalError",
+      "envelope": "{ResponseMetadata}"
+    },
+    {
+      "service": "cluster",
+      "action": "GetNodeDistincts",
+      "request_body": {},
+      "status": 200,
+      "content_type": "application/json; charset=utf-8",
+      "verdict": "OK_RESULT",
+      "envelope": "{ResponseMetadata, Result} → Result{clusters, compute_groups, compute_nets, gpu_types, logic_compute_groups, net_groups, node_types, storage_disks}"
+    },
+    {
+      "service": "cluster",
+      "action": "GetNodeEvents",
+      "request_body": {},
+      "status": 200,
+      "content_type": "application/json; charset=utf-8",
+      "verdict": "JSON_ERR:AccessForbidden",
+      "envelope": "{ResponseMetadata}"
+    },
+    {
+      "service": "cluster",
+      "action": "GetNodeResourceInfoDictionary",
+      "request_body": {},
+      "status": 200,
+      "content_type": "application/json; charset=utf-8",
+      "verdict": "OK_RESULT",
+      "envelope": "{ResponseMetadata, Result} → Result{cpu_infos, gpu_infos}"
+    },
+    {
+      "service": "cluster",
+      "action": "GetOverviewResourceMetric",
+      "request_body": {},
+      "status": 200,
+      "content_type": "application/json; charset=utf-8",
+      "verdict": "JSON_ERR:AccessForbidden",
+      "envelope": "{ResponseMetadata}"
+    },
+    {
+      "service": "cluster",
+      "action": "GetOverviewResourceMetricByTime",
+      "request_body": {},
+      "status": 200,
+      "content_type": "application/json; charset=utf-8",
+      "verdict": "JSON_ERR:AccessForbidden",
+      "envelope": "{ResponseMetadata}"
+    },
+    {
+      "service": "cluster",
+      "action": "GetOverviewTaskMetric",
+      "request_body": {},
+      "status": 200,
+      "content_type": "application/json; charset=utf-8",
+      "verdict": "JSON_ERR:AccessForbidden",
+      "envelope": "{ResponseMetadata}"
+    },
+    {
+      "service": "cluster",
+      "action": "ListClusterRegions",
+      "request_body": {},
+      "status": 200,
+      "content_type": "application/json; charset=utf-8",
+      "verdict": "JSON_ERR:AccessForbidden",
+      "envelope": "{ResponseMetadata}"
+    },
+    {
+      "service": "cluster",
+      "action": "ListClusters",
+      "request_body": {},
+      "status": 200,
+      "content_type": "application/json; charset=utf-8",
+      "verdict": "JSON_ERR:AccessForbidden",
+      "envelope": "{ResponseMetadata}"
+    },
+    {
+      "service": "cluster",
+      "action": "ListLogicComputeGroups",
+      "request_body": {
+        "page_size": 1
+      },
+      "status": 200,
+      "content_type": "application/json; charset=utf-8",
+      "verdict": "JSON_ERR:AccessForbidden",
+      "envelope": "{ResponseMetadata}"
+    },
+    {
+      "service": "cluster",
+      "action": "ListNodeDimension",
+      "request_body": {
+        "page_size": 1
+      },
+      "status": 200,
+      "content_type": "application/json; charset=utf-8",
+      "verdict": "JSON_ERR:AccessForbidden",
+      "envelope": "{ResponseMetadata}"
+    },
+    {
+      "service": "cluster",
+      "action": "ListNodeEvents",
+      "request_body": {
+        "page_size": 1
+      },
+      "status": 200,
+      "content_type": "application/json; charset=utf-8",
+      "verdict": "OK_RESULT",
+      "envelope": "{ResponseMetadata, Result} → Result{events, total}"
+    },
+    {
+      "service": "cluster",
+      "action": "ListNodes",
+      "request_body": {
+        "page_size": 1
+      },
+      "status": 200,
+      "content_type": "application/json; charset=utf-8",
+      "verdict": "OK_RESULT",
+      "envelope": "{ResponseMetadata, Result} → Result{backup, fault, nodes, online, total}"
+    },
+    {
+      "service": "cluster",
+      "action": "ListProjectDimension",
+      "request_body": {
+        "page_size": 1
+      },
+      "status": 200,
+      "content_type": "application/json; charset=utf-8",
+      "verdict": "JSON_ERR:AccessForbidden",
+      "envelope": "{ResponseMetadata}"
+    },
+    {
+      "service": "cluster",
+      "action": "ListTaskDimension",
+      "request_body": {
+        "page_size": 1
+      },
+      "status": 200,
+      "content_type": "application/json; charset=utf-8",
+      "verdict": "JSON_ERR:AccessForbidden",
+      "envelope": "{ResponseMetadata}"
+    },
+    {
+      "service": "cluster",
+      "action": "ListUserDimension",
+      "request_body": {
+        "page_size": 1
+      },
+      "status": 200,
+      "content_type": "application/json; charset=utf-8",
+      "verdict": "JSON_ERR:AccessForbidden",
+      "envelope": "{ResponseMetadata}"
+    },
+    {
+      "service": "hpc",
+      "action": "GetJob",
+      "request_body": {
+        "job_id": "probe"
+      },
+      "status": 200,
+      "content_type": "application/json; charset=utf-8",
+      "verdict": "JSON_ERR:ResourceNotFound",
+      "envelope": "{ResponseMetadata}"
+    },
+    {
+      "service": "hpc",
+      "action": "GetJobLog",
+      "request_body": {
+        "page_size": 1
+      },
+      "status": 200,
+      "content_type": "application/json; charset=utf-8",
+      "verdict": "JSON_ERR:InternalError",
+      "envelope": "{ResponseMetadata}"
+    },
+    {
+      "service": "hpc",
+      "action": "GetTaskMetric",
+      "request_body": {},
+      "status": 200,
+      "content_type": "application/json; charset=utf-8",
+      "verdict": "JSON_ERR:InternalError",
+      "envelope": "{ResponseMetadata}"
+    },
+    {
+      "service": "hpc",
+      "action": "GetTaskMetricBatch",
+      "request_body": {},
+      "status": 200,
+      "content_type": "application/json; charset=utf-8",
+      "verdict": "JSON_ERR:InternalError",
+      "envelope": "{ResponseMetadata}"
+    },
+    {
+      "service": "hpc",
+      "action": "ListJobEvents",
+      "request_body": {
+        "page_size": 1
+      },
+      "status": 200,
+      "content_type": "application/json; charset=utf-8",
+      "verdict": "JSON_ERR:InternalError",
+      "envelope": "{ResponseMetadata}"
+    },
+    {
+      "service": "hpc",
+      "action": "ListJobInstances",
+      "request_body": {
+        "job_id": "probe",
+        "page_size": 1
+      },
+      "status": 200,
+      "content_type": "application/json; charset=utf-8",
+      "verdict": "JSON_ERR:ResourceNotFound",
+      "envelope": "{ResponseMetadata}"
+    },
+    {
+      "service": "hpc",
+      "action": "ListJobs",
+      "request_body": {
+        "page_size": 1
+      },
+      "status": 200,
+      "content_type": "application/json; charset=utf-8",
+      "verdict": "JSON_ERR:InternalError",
+      "envelope": "{ResponseMetadata}"
+    },
+    {
+      "service": "inference-serving",
+      "action": "GetServing",
+      "request_body": {
+        "inference_serving_id": "probe"
+      },
+      "status": 404,
+      "content_type": "text/plain; charset=utf-8",
+      "verdict": "NOT_ROUTED",
+      "envelope": "404 page not found"
+    },
+    {
+      "service": "inference-serving",
+      "action": "GetServingApiMetric",
+      "request_body": {
+        "inference_serving_id": "probe",
+        "metric_types": [],
+        "time_range": {}
+      },
+      "status": 404,
+      "content_type": "text/plain; charset=utf-8",
+      "verdict": "NOT_ROUTED",
+      "envelope": "404 page not found"
+    },
+    {
+      "service": "inference-serving",
+      "action": "GetServingApiMetricBatch",
+      "request_body": {
+        "inference_serving_ids": [],
+        "metric_types": [],
+        "time_range": {}
+      },
+      "status": 404,
+      "content_type": "text/plain; charset=utf-8",
+      "verdict": "NOT_ROUTED",
+      "envelope": "404 page not found"
+    },
+    {
+      "service": "inference-serving",
+      "action": "GetServingLog",
+      "request_body": {
+        "page_size": 1
+      },
+      "status": 404,
+      "content_type": "text/plain; charset=utf-8",
+      "verdict": "NOT_ROUTED",
+      "envelope": "404 page not found"
+    },
+    {
+      "service": "inference-serving",
+      "action": "GetTaskMetric",
+      "request_body": {},
+      "status": 404,
+      "content_type": "text/plain; charset=utf-8",
+      "verdict": "NOT_ROUTED",
+      "envelope": "404 page not found"
+    },
+    {
+      "service": "inference-serving",
+      "action": "GetTaskMetricBatch",
+      "request_body": {},
+      "status": 404,
+      "content_type": "text/plain; charset=utf-8",
+      "verdict": "NOT_ROUTED",
+      "envelope": "404 page not found"
+    },
+    {
+      "service": "inference-serving",
+      "action": "ListServingEvents",
+      "request_body": {
+        "page_size": 1
+      },
+      "status": 404,
+      "content_type": "text/plain; charset=utf-8",
+      "verdict": "NOT_ROUTED",
+      "envelope": "404 page not found"
+    },
+    {
+      "service": "inference-serving",
+      "action": "ListServingInstances",
+      "request_body": {
+        "inference_serving_id": "probe",
+        "page_size": 1
+      },
+      "status": 404,
+      "content_type": "text/plain; charset=utf-8",
+      "verdict": "NOT_ROUTED",
+      "envelope": "404 page not found"
+    },
+    {
+      "service": "inference-serving",
+      "action": "ListServingVersions",
+      "request_body": {
+        "inference_serving_id": "probe"
+      },
+      "status": 404,
+      "content_type": "text/plain; charset=utf-8",
+      "verdict": "NOT_ROUTED",
+      "envelope": "404 page not found"
+    },
+    {
+      "service": "inference-serving",
+      "action": "ListServings",
+      "request_body": {
+        "page_size": 1
+      },
+      "status": 404,
+      "content_type": "text/plain; charset=utf-8",
+      "verdict": "NOT_ROUTED",
+      "envelope": "404 page not found"
+    },
+    {
+      "service": "notebook",
+      "action": "GetNotebook",
+      "request_body": {
+        "notebook_id": "probe"
+      },
+      "status": 200,
+      "content_type": "application/json; charset=utf-8",
+      "verdict": "JSON_ERR:ResourceNotFound",
+      "envelope": "{ResponseMetadata}"
+    },
+    {
+      "service": "notebook",
+      "action": "GetRealtimeNotebookMetric",
+      "request_body": {},
+      "status": 200,
+      "content_type": "application/json; charset=utf-8",
+      "verdict": "OK_RESULT",
+      "envelope": "{ResponseMetadata, Result} → Result{resource_metric_list}"
+    },
+    {
+      "service": "notebook",
+      "action": "GetRealtimeNotebookMetricByTime",
+      "request_body": {},
+      "status": 200,
+      "content_type": "application/json; charset=utf-8",
+      "verdict": "OK_RESULT",
+      "envelope": "{ResponseMetadata, Result} → Result{time_seris_metric_groups}"
+    },
+    {
+      "service": "notebook",
+      "action": "GetTaskMetric",
+      "request_body": {},
+      "status": 200,
+      "content_type": "application/json; charset=utf-8",
+      "verdict": "JSON_ERR:InternalError",
+      "envelope": "{ResponseMetadata}"
+    },
+    {
+      "service": "notebook",
+      "action": "GetTaskMetricBatch",
+      "request_body": {},
+      "status": 200,
+      "content_type": "application/json; charset=utf-8",
+      "verdict": "JSON_ERR:InternalError",
+      "envelope": "{ResponseMetadata}"
+    },
+    {
+      "service": "notebook",
+      "action": "ListNotebookEvents",
+      "request_body": {
+        "notebook_id": "probe",
+        "page_size": 1
+      },
+      "status": 200,
+      "content_type": "application/json; charset=utf-8",
+      "verdict": "JSON_ERR:ResourceNotFound",
+      "envelope": "{ResponseMetadata}"
+    },
+    {
+      "service": "notebook",
+      "action": "ListNotebooks",
+      "request_body": {
+        "page_size": 1
+      },
+      "status": 200,
+      "content_type": "application/json; charset=utf-8",
+      "verdict": "JSON_ERR:InternalError",
+      "envelope": "{ResponseMetadata}"
+    },
+    {
+      "service": "notebook",
+      "action": "ListRunIndex",
+      "request_body": {
+        "notebook_id": "probe"
+      },
+      "status": 200,
+      "content_type": "application/json; charset=utf-8",
+      "verdict": "JSON_ERR:ResourceNotFound",
+      "envelope": "{ResponseMetadata}"
+    },
+    {
+      "service": "project",
+      "action": "ListProjects",
+      "request_body": {
+        "page_size": 1
+      },
+      "status": 200,
+      "content_type": "application/json; charset=utf-8",
+      "verdict": "JSON_ERR:AccessForbidden",
+      "envelope": "{ResponseMetadata}"
+    },
+    {
+      "service": "ray",
+      "action": "GetJob",
+      "request_body": {
+        "ray_job_id": "probe"
+      },
+      "status": 200,
+      "content_type": "application/json; charset=utf-8",
+      "verdict": "JSON_ERR:ResourceNotFound",
+      "envelope": "{ResponseMetadata}"
+    },
+    {
+      "service": "ray",
+      "action": "GetJobLog",
+      "request_body": {
+        "page_size": 1
+      },
+      "status": 200,
+      "content_type": "application/json; charset=utf-8",
+      "verdict": "JSON_ERR:InternalError",
+      "envelope": "{ResponseMetadata}"
+    },
+    {
+      "service": "ray",
+      "action": "GetTaskMetric",
+      "request_body": {},
+      "status": 200,
+      "content_type": "application/json; charset=utf-8",
+      "verdict": "JSON_ERR:InternalError",
+      "envelope": "{ResponseMetadata}"
+    },
+    {
+      "service": "ray",
+      "action": "GetTaskMetricBatch",
+      "request_body": {},
+      "status": 200,
+      "content_type": "application/json; charset=utf-8",
+      "verdict": "JSON_ERR:InternalError",
+      "envelope": "{ResponseMetadata}"
+    },
+    {
+      "service": "ray",
+      "action": "ListJobCreators",
+      "request_body": {},
+      "status": 200,
+      "content_type": "application/json; charset=utf-8",
+      "verdict": "OK_RESULT",
+      "envelope": "{ResponseMetadata, Result} → Result{items}"
+    },
+    {
+      "service": "ray",
+      "action": "ListJobEvents",
+      "request_body": {
+        "page_size": 1
+      },
+      "status": 200,
+      "content_type": "application/json; charset=utf-8",
+      "verdict": "OK_RESULT",
+      "envelope": "{ResponseMetadata, Result} → Result{items, total}"
+    },
+    {
+      "service": "ray",
+      "action": "ListJobInstances",
+      "request_body": {
+        "page_size": 1
+      },
+      "status": 200,
+      "content_type": "application/json; charset=utf-8",
+      "verdict": "OK_RESULT",
+      "envelope": "{ResponseMetadata, Result} → Result{items, total}"
+    },
+    {
+      "service": "ray",
+      "action": "ListJobScalingHistories",
+      "request_body": {
+        "page_size": 1
+      },
+      "status": 200,
+      "content_type": "application/json; charset=utf-8",
+      "verdict": "OK_RESULT",
+      "envelope": "{ResponseMetadata, Result} → Result{items, total}"
+    },
+    {
+      "service": "ray",
+      "action": "ListJobs",
+      "request_body": {
+        "page_size": 1
+      },
+      "status": 200,
+      "content_type": "application/json; charset=utf-8",
+      "verdict": "JSON_ERR:InternalError",
+      "envelope": "{ResponseMetadata}"
+    },
+    {
+      "service": "train",
+      "action": "GetJob",
+      "request_body": {
+        "job_id": "probe"
+      },
+      "status": 200,
+      "content_type": "application/json; charset=utf-8",
+      "verdict": "JSON_ERR:AccessForbidden",
+      "envelope": "{ResponseMetadata}"
+    },
+    {
+      "service": "train",
+      "action": "GetJobLog",
+      "request_body": {
+        "page_size": 1
+      },
+      "status": 200,
+      "content_type": "application/json; charset=utf-8",
+      "verdict": "JSON_ERR:InternalError",
+      "envelope": "{ResponseMetadata}"
+    },
+    {
+      "service": "train",
+      "action": "GetJobWorkdir",
+      "request_body": {
+        "workspace_id": "ws-8207e9e2-<redacted>",
+        "project_id": "project-c67c548f-<redacted>"
+      },
+      "status": 200,
+      "content_type": "application/json; charset=utf-8",
+      "verdict": "OK_RESULT",
+      "envelope": "{ResponseMetadata, Result} → Result{data}"
+    },
+    {
+      "service": "train",
+      "action": "GetTaskMetric",
+      "request_body": {},
+      "status": 200,
+      "content_type": "application/json; charset=utf-8",
+      "verdict": "JSON_ERR:InternalError",
+      "envelope": "{ResponseMetadata}"
+    },
+    {
+      "service": "train",
+      "action": "GetTaskMetricBatch",
+      "request_body": {},
+      "status": 200,
+      "content_type": "application/json; charset=utf-8",
+      "verdict": "JSON_ERR:InternalError",
+      "envelope": "{ResponseMetadata}"
+    },
+    {
+      "service": "train",
+      "action": "ListJobEvents",
+      "request_body": {
+        "page_size": 1
+      },
+      "status": 200,
+      "content_type": "application/json; charset=utf-8",
+      "verdict": "OK_RESULT",
+      "envelope": "{ResponseMetadata, Result} → Result{events, total}"
+    },
+    {
+      "service": "train",
+      "action": "ListJobInstances",
+      "request_body": {
+        "job_id": "probe",
+        "page_size": 1
+      },
+      "status": 200,
+      "content_type": "application/json; charset=utf-8",
+      "verdict": "JSON_ERR:AccessForbidden",
+      "envelope": "{ResponseMetadata}"
+    },
+    {
+      "service": "train",
+      "action": "ListJobs",
+      "request_body": {
+        "page_size": 1
+      },
+      "status": 200,
+      "content_type": "application/json; charset=utf-8",
+      "verdict": "JSON_ERR:InternalError",
+      "envelope": "{ResponseMetadata}"
+    },
+    {
+      "service": "train",
+      "action": "ListPreCheckItems",
+      "request_body": {
+        "logic_compute_group_id": "lcg-2e7c3207-<redacted>"
+      },
+      "status": 200,
+      "content_type": "application/json; charset=utf-8",
+      "verdict": "JSON_ERR:InternalError",
+      "envelope": "{ResponseMetadata}"
+    },
+    {
+      "service": "user",
+      "action": "GetAPIKeyPlaintext",
+      "request_body": {
+        "api_key_id": "probe"
+      },
+      "status": 200,
+      "content_type": "application/json; charset=utf-8",
+      "verdict": "JSON_ERR:InternalError",
+      "envelope": "{ResponseMetadata}"
+    },
+    {
+      "service": "user",
+      "action": "GetUserDetail",
+      "request_body": {},
+      "status": 200,
+      "content_type": "application/json; charset=utf-8",
+      "verdict": "OK_RESULT",
+      "envelope": "{ResponseMetadata, Result} → Result{avatar_url, created_at, email, extra_info, global_role, id, name, name_en}"
+    },
+    {
+      "service": "user",
+      "action": "ListAPIKeys",
+      "request_body": {},
+      "status": 200,
+      "content_type": "application/json; charset=utf-8",
+      "verdict": "OK_RESULT",
+      "envelope": "{ResponseMetadata, Result} → Result{items}"
+    },
+    {
+      "service": "workspace",
+      "action": "GetAllQuota",
+      "request_body": {
+        "page_size": 1
+      },
+      "status": 200,
+      "content_type": "application/json; charset=utf-8",
+      "verdict": "JSON_ERR:AccessForbidden",
+      "envelope": "{ResponseMetadata}"
+    },
+    {
+      "service": "workspace",
+      "action": "GetBasicInfo",
+      "request_body": {
+        "workspace_id": "ws-8207e9e2-<redacted>"
+      },
+      "status": 200,
+      "content_type": "application/json; charset=utf-8",
+      "verdict": "OK_RESULT",
+      "envelope": "{ResponseMetadata, Result} → Result{clusters, compute_groups, resource_types}"
+    },
+    {
+      "service": "workspace",
+      "action": "GetDefaultParentProjectSandboxQuota",
+      "request_body": {},
+      "status": 200,
+      "content_type": "application/json; charset=utf-8",
+      "verdict": "JSON_ERR:InvalidParameter",
+      "envelope": "{ResponseMetadata}"
+    },
+    {
+      "service": "workspace",
+      "action": "GetDefaultParentProjectUserSandboxQuota",
+      "request_body": {},
+      "status": 200,
+      "content_type": "application/json; charset=utf-8",
+      "verdict": "JSON_ERR:InvalidParameter",
+      "envelope": "{ResponseMetadata}"
+    },
+    {
+      "service": "workspace",
+      "action": "GetDefaultSubProjectUserSandboxQuota",
+      "request_body": {},
+      "status": 200,
+      "content_type": "application/json; charset=utf-8",
+      "verdict": "JSON_ERR:InvalidParameter",
+      "envelope": "{ResponseMetadata}"
+    },
+    {
+      "service": "workspace",
+      "action": "GetDefaultUserQuota",
+      "request_body": {},
+      "status": 200,
+      "content_type": "application/json; charset=utf-8",
+      "verdict": "JSON_ERR:AccessForbidden",
+      "envelope": "{ResponseMetadata}"
+    },
+    {
+      "service": "workspace",
+      "action": "GetDefaultUserTaskQuota",
+      "request_body": {},
+      "status": 200,
+      "content_type": "application/json; charset=utf-8",
+      "verdict": "JSON_ERR:InvalidParameter",
+      "envelope": "{ResponseMetadata}"
+    },
+    {
+      "service": "workspace",
+      "action": "GetDefaultWorkspaceUserSandboxQuota",
+      "request_body": {},
+      "status": 200,
+      "content_type": "application/json; charset=utf-8",
+      "verdict": "JSON_ERR:InvalidParameter",
+      "envelope": "{ResponseMetadata}"
+    },
+    {
+      "service": "workspace",
+      "action": "GetEffectiveParentProjectSandboxQuota",
+      "request_body": {},
+      "status": 200,
+      "content_type": "application/json; charset=utf-8",
+      "verdict": "JSON_ERR:InvalidParameter",
+      "envelope": "{ResponseMetadata}"
+    },
+    {
+      "service": "workspace",
+      "action": "GetLogicComputeGroupNodeSpecs",
+      "request_body": {
+        "logic_compute_group_id": "lcg-2e7c3207-<redacted>"
+      },
+      "status": 200,
+      "content_type": "application/json; charset=utf-8",
+      "verdict": "JSON_ERR:AccessForbidden",
+      "envelope": "{ResponseMetadata}"
+    },
+    {
+      "service": "workspace",
+      "action": "GetLogicComputeGroupResource",
+      "request_body": {
+        "logic_compute_group_id": "lcg-2e7c3207-<redacted>"
+      },
+      "status": 200,
+      "content_type": "application/json; charset=utf-8",
+      "verdict": "JSON_ERR:AccessForbidden",
+      "envelope": "{ResponseMetadata}"
+    },
+    {
+      "service": "workspace",
+      "action": "GetOverviewOptions",
+      "request_body": {},
+      "status": 200,
+      "content_type": "application/json; charset=utf-8",
+      "verdict": "JSON_ERR:AccessForbidden",
+      "envelope": "{ResponseMetadata}"
+    },
+    {
+      "service": "workspace",
+      "action": "GetOverviewResourceMetric",
+      "request_body": {},
+      "status": 200,
+      "content_type": "application/json; charset=utf-8",
+      "verdict": "JSON_ERR:AccessForbidden",
+      "envelope": "{ResponseMetadata}"
+    },
+    {
+      "service": "workspace",
+      "action": "GetOverviewResourceMetricByTime",
+      "request_body": {},
+      "status": 200,
+      "content_type": "application/json; charset=utf-8",
+      "verdict": "JSON_ERR:AccessForbidden",
+      "envelope": "{ResponseMetadata}"
+    },
+    {
+      "service": "workspace",
+      "action": "GetOverviewTaskMetric",
+      "request_body": {},
+      "status": 200,
+      "content_type": "application/json; charset=utf-8",
+      "verdict": "JSON_ERR:AccessForbidden",
+      "envelope": "{ResponseMetadata}"
+    },
+    {
+      "service": "workspace",
+      "action": "GetProjectUserQuotaProjectList",
+      "request_body": {},
+      "status": 200,
+      "content_type": "application/json; charset=utf-8",
+      "verdict": "JSON_ERR:AccessForbidden",
+      "envelope": "{ResponseMetadata}"
+    },
+    {
+      "service": "workspace",
+      "action": "GetSandboxQuotaOverview",
+      "request_body": {},
+      "status": 200,
+      "content_type": "application/json; charset=utf-8",
+      "verdict": "JSON_ERR:InvalidParameter",
+      "envelope": "{ResponseMetadata}"
+    },
+    {
+      "service": "workspace",
+      "action": "GetScheduleConfig",
+      "request_body": {},
+      "status": 200,
+      "content_type": "application/json; charset=utf-8",
+      "verdict": "JSON_ERR:AccessForbidden",
+      "envelope": "{ResponseMetadata}"
+    },
+    {
+      "service": "workspace",
+      "action": "GetUserTaskQuota",
+      "request_body": {
+        "page_size": 1
+      },
+      "status": 200,
+      "content_type": "application/json; charset=utf-8",
+      "verdict": "JSON_ERR:InvalidParameter",
+      "envelope": "{ResponseMetadata}"
+    },
+    {
+      "service": "workspace",
+      "action": "GetWorkspaceComputeResource",
+      "request_body": {},
+      "status": 200,
+      "content_type": "application/json; charset=utf-8",
+      "verdict": "JSON_ERR:AccessForbidden",
+      "envelope": "{ResponseMetadata}"
+    },
+    {
+      "service": "workspace",
+      "action": "GetWorkspaceNodeSpecs",
+      "request_body": {},
+      "status": 200,
+      "content_type": "application/json; charset=utf-8",
+      "verdict": "JSON_ERR:AccessForbidden",
+      "envelope": "{ResponseMetadata}"
+    },
+    {
+      "service": "workspace",
+      "action": "GetWorkspaceQuota",
+      "request_body": {},
+      "status": 200,
+      "content_type": "application/json; charset=utf-8",
+      "verdict": "JSON_ERR:AccessForbidden",
+      "envelope": "{ResponseMetadata}"
+    },
+    {
+      "service": "workspace",
+      "action": "GetWorkspaceTaskQuota",
+      "request_body": {},
+      "status": 200,
+      "content_type": "application/json; charset=utf-8",
+      "verdict": "JSON_ERR:InvalidParameter",
+      "envelope": "{ResponseMetadata}"
+    },
+    {
+      "service": "workspace",
+      "action": "ListConfiguredParentProjectSandboxQuotaProjects",
+      "request_body": {},
+      "status": 200,
+      "content_type": "application/json; charset=utf-8",
+      "verdict": "JSON_ERR:InvalidParameter",
+      "envelope": "{ResponseMetadata}"
+    },
+    {
+      "service": "workspace",
+      "action": "ListConfiguredParentProjectUserSandboxQuotaUsers",
+      "request_body": {},
+      "status": 200,
+      "content_type": "application/json; charset=utf-8",
+      "verdict": "JSON_ERR:InvalidParameter",
+      "envelope": "{ResponseMetadata}"
+    },
+    {
+      "service": "workspace",
+      "action": "ListConfiguredSubProjectSandboxQuotaProjects",
+      "request_body": {},
+      "status": 200,
+      "content_type": "application/json; charset=utf-8",
+      "verdict": "JSON_ERR:InvalidParameter",
+      "envelope": "{ResponseMetadata}"
+    },
+    {
+      "service": "workspace",
+      "action": "ListConfiguredSubProjectUserSandboxQuotaUsers",
+      "request_body": {},
+      "status": 200,
+      "content_type": "application/json; charset=utf-8",
+      "verdict": "JSON_ERR:InvalidParameter",
+      "envelope": "{ResponseMetadata}"
+    },
+    {
+      "service": "workspace",
+      "action": "ListConfiguredWorkspaceUserSandboxQuotaUsers",
+      "request_body": {},
+      "status": 200,
+      "content_type": "application/json; charset=utf-8",
+      "verdict": "JSON_ERR:InvalidParameter",
+      "envelope": "{ResponseMetadata}"
+    },
+    {
+      "service": "workspace",
+      "action": "ListLogicComputeGroups",
+      "request_body": {
+        "page_size": 1
+      },
+      "status": 200,
+      "content_type": "application/json; charset=utf-8",
+      "verdict": "JSON_ERR:AccessForbidden",
+      "envelope": "{ResponseMetadata}"
+    },
+    {
+      "service": "workspace",
+      "action": "ListNodeDimension",
+      "request_body": {
+        "page_size": 1
+      },
+      "status": 200,
+      "content_type": "application/json; charset=utf-8",
+      "verdict": "JSON_ERR:AccessForbidden",
+      "envelope": "{ResponseMetadata}"
+    },
+    {
+      "service": "workspace",
+      "action": "ListParentProjectSandboxQuotas",
+      "request_body": {
+        "page_size": 1
+      },
+      "status": 200,
+      "content_type": "application/json; charset=utf-8",
+      "verdict": "JSON_ERR:InvalidParameter",
+      "envelope": "{ResponseMetadata}"
+    },
+    {
+      "service": "workspace",
+      "action": "ListParentProjectUserSandboxQuotas",
+      "request_body": {
+        "page_size": 1
+      },
+      "status": 200,
+      "content_type": "application/json; charset=utf-8",
+      "verdict": "JSON_ERR:InvalidParameter",
+      "envelope": "{ResponseMetadata}"
+    },
+    {
+      "service": "workspace",
+      "action": "ListProjectDimension",
+      "request_body": {
+        "page_size": 1
+      },
+      "status": 200,
+      "content_type": "application/json; charset=utf-8",
+      "verdict": "JSON_ERR:AccessForbidden",
+      "envelope": "{ResponseMetadata}"
+    },
+    {
+      "service": "workspace",
+      "action": "ListProjectQuotas",
+      "request_body": {
+        "page_size": 1
+      },
+      "status": 200,
+      "content_type": "application/json; charset=utf-8",
+      "verdict": "JSON_ERR:AccessForbidden",
+      "envelope": "{ResponseMetadata}"
+    },
+    {
+      "service": "workspace",
+      "action": "ListSandboxMenu",
+      "request_body": {},
+      "status": 200,
+      "content_type": "application/json; charset=utf-8",
+      "verdict": "JSON_ERR:InvalidParameter",
+      "envelope": "{ResponseMetadata}"
+    },
+    {
+      "service": "workspace",
+      "action": "ListSubProjectSandboxQuotas",
+      "request_body": {
+        "page_size": 1
+      },
+      "status": 200,
+      "content_type": "application/json; charset=utf-8",
+      "verdict": "JSON_ERR:InvalidParameter",
+      "envelope": "{ResponseMetadata}"
+    },
+    {
+      "service": "workspace",
+      "action": "ListSubProjectUserSandboxQuotas",
+      "request_body": {
+        "page_size": 1
+      },
+      "status": 200,
+      "content_type": "application/json; charset=utf-8",
+      "verdict": "JSON_ERR:InvalidParameter",
+      "envelope": "{ResponseMetadata}"
+    },
+    {
+      "service": "workspace",
+      "action": "ListTaskDimension",
+      "request_body": {
+        "page_size": 1
+      },
+      "status": 200,
+      "content_type": "application/json; charset=utf-8",
+      "verdict": "JSON_ERR:AccessForbidden",
+      "envelope": "{ResponseMetadata}"
+    },
+    {
+      "service": "workspace",
+      "action": "ListUserDimension",
+      "request_body": {
+        "page_size": 1
+      },
+      "status": 200,
+      "content_type": "application/json; charset=utf-8",
+      "verdict": "JSON_ERR:AccessForbidden",
+      "envelope": "{ResponseMetadata}"
+    },
+    {
+      "service": "workspace",
+      "action": "ListUserQuotas",
+      "request_body": {
+        "page_size": 1
+      },
+      "status": 200,
+      "content_type": "application/json; charset=utf-8",
+      "verdict": "JSON_ERR:AccessForbidden",
+      "envelope": "{ResponseMetadata}"
+    },
+    {
+      "service": "workspace",
+      "action": "ListWorkspaceMembers",
+      "request_body": {
+        "page_size": 1
+      },
+      "status": 200,
+      "content_type": "application/json; charset=utf-8",
+      "verdict": "JSON_ERR:AccessForbidden",
+      "envelope": "{ResponseMetadata}"
+    },
+    {
+      "service": "workspace",
+      "action": "ListWorkspaceNodes",
+      "request_body": {},
+      "status": 200,
+      "content_type": "application/json; charset=utf-8",
+      "verdict": "JSON_ERR:AccessForbidden",
+      "envelope": "{ResponseMetadata}"
+    },
+    {
+      "service": "workspace",
+      "action": "ListWorkspaceParentProjects",
+      "request_body": {},
+      "status": 200,
+      "content_type": "application/json; charset=utf-8",
+      "verdict": "JSON_ERR:AccessForbidden",
+      "envelope": "{ResponseMetadata}"
+    },
+    {
+      "service": "workspace",
+      "action": "ListWorkspaceUserSandboxQuotas",
+      "request_body": {
+        "page_size": 1
+      },
+      "status": 200,
+      "content_type": "application/json; charset=utf-8",
+      "verdict": "JSON_ERR:InvalidParameter",
+      "envelope": "{ResponseMetadata}"
+    }
+  ]
+}
