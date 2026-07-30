@@ -605,6 +605,7 @@ export QZCLI_USERNAME="your_username"
 export QZCLI_PASSWORD="your_password"
 export QZCLI_API_URL="https://qz.sii.edu.cn"
 export QZCLI_ENV_FILE="/path/to/.env"   # 可选，自定义凭据文件位置
+export QZCLI_SESSION_ID="my-agent-01"   # 可选，见下方「多 agent 并发 exec」
 ```
 
 `qzcli login` / 自动刷新 cookie 会按下面的优先级读取凭据：
@@ -612,6 +613,37 @@ export QZCLI_ENV_FILE="/path/to/.env"   # 可选，自定义凭据文件位置
 ```bash
 CLI 参数 > --password-stdin > shell 环境变量 > QZCLI_ENV_FILE 指向的 .env（默认 ~/.qzcli/.env） > ~/.qzcli/config.json > 交互输入
 ```
+
+## 多 agent 并发 exec（session 隔离）
+
+多个 AI agent 常常同时对**同一台开发机**跑 `qzcli exec`。为此每次 exec 都归属于一个
+session，输出隔离在 `/tmp/.qzcli/<session>/` 下，`job_id` 形如
+`qzcli_<session>_<时间戳>_<随机>`。
+
+session 来源与凭据同一套优先级：`QZCLI_SESSION_ID` 环境变量 →
+`QZCLI_ENV_FILE` 指向的 `.env` → `~/.qzcli/config.json` 的 `session_id` →
+**都没有就按进程自动生成**（进程内稳定）。
+
+```bash
+# 不设也不会串车：每个进程自动一个 session
+qzcli exec my-dev nvidia-smi
+
+# 想让多个进程归到同一个 session（比如一个 agent 起了多个 qzcli 子进程）
+export QZCLI_SESSION_ID="my-agent-01"
+
+# --detach 之后忘了记 job_id，可以查回来（默认只列本 session）
+qzcli exec --list my-dev
+qzcli exec --list --all my-dev     # 看所有 session
+qzcli exec-attach my-dev <JOB ID>
+```
+
+其他几条相关行为：
+
+- 每次 exec **自建一个终端并在启动后删掉**，不复用已有终端 —— 否则会往别人开着的
+  交互式会话里打字（实测见过开发机上躺着 4 个别人的终端）
+- 命令用 `setsid`（无则 `nohup`）从终端摘出去，删终端不影响它跑完
+- `/tmp/.qzcli/` 下超过 **7 天**的 session 目录会在下次 exec 时自动清理
+- 升级前拿到的老格式 `job_id`（无 session 段）仍能 `exec-attach`，会回落到平铺路径
 
 ## 平台 API v1 → v2 迁移
 

@@ -2,8 +2,11 @@
 配置管理模块
 """
 
+import hashlib
 import json
 import os
+import re
+import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -31,6 +34,7 @@ def get_proxy() -> str:
     if proxy:
         return proxy
     return os.environ.get("ALL_PROXY") or os.environ.get("HTTPS_PROXY", "")
+
 
 # 配置目录
 CONFIG_DIR = Path.home() / ".qzcli"
@@ -143,6 +147,67 @@ def get_api_base_url() -> str:
         or env_file_values.get("QZCLI_API_URL")
         or config.get("api_base_url", DEFAULT_CONFIG["api_base_url"])
     )
+
+
+# 自动生成的 session id 缓存：**同一进程内必须稳定**，否则同一个 agent 的多次
+# exec 会落到不同 session，attach/list 就串不起来了。
+_AUTO_SESSION_ID: Optional[str] = None
+
+# session id 会进远端目录名和 job_id，必须文件名安全。
+_SESSION_ID_SAFE_RE = re.compile(r"[^A-Za-z0-9_-]")
+_SESSION_ID_MAX_LEN = 24
+
+
+def _sanitize_session_id(raw: str) -> str:
+    """把用户给的 session id 收敛成文件名安全的短串。
+
+    会拼进 ``/tmp/.qzcli/<session>/`` 和 job_id，所以不能有 ``/``、空格、中文。
+    非法字符换成 ``-``，超长截断。
+
+    **全是非法字符时（比如纯中文的 session 名）不能返回空串** —— 那样会静默
+    退回自动值，用户显式设的 session 被无视，而且两个不同的中文名会撞成同一个。
+    这种情况改用原串的哈希，保证"不同输入 → 不同 session"。
+    """
+    raw = raw.strip()
+    if not raw:
+        return ""
+    cleaned = _SESSION_ID_SAFE_RE.sub("-", raw)[:_SESSION_ID_MAX_LEN].strip("-")
+    if cleaned:
+        return cleaned
+    return "s" + hashlib.sha1(raw.encode("utf-8")).hexdigest()[:8]
+
+
+def get_session_id() -> str:
+    """获取本次调用所属的 session id。
+
+    优先级和 ``get_credentials`` 一致（env → .env 文件 → config.json），
+    都没有则**按进程自动生成**一个并在进程内复用。
+
+    这是给多 agent 并发用的：多个 agent 同时对同一台开发机跑 ``qzcli exec``
+    时，靠它把各自的输出隔离到不同目录、也让 ``exec --list`` 只列自己的任务。
+
+    - 想让多个进程归到同一个 session（比如一个 agent 起了多个 qzcli 子进程），
+      显式设 ``QZCLI_SESSION_ID``
+    - 不设也不会串车：自动值每进程一个
+    """
+    global _AUTO_SESSION_ID
+
+    config = load_config()
+    env_file_values = load_env_file()
+    explicit = (
+        os.environ.get("QZCLI_SESSION_ID")
+        or env_file_values.get("QZCLI_SESSION_ID")
+        or config.get("session_id")
+        or ""
+    )
+    if explicit:
+        cleaned = _sanitize_session_id(explicit)
+        if cleaned:
+            return cleaned
+
+    if _AUTO_SESSION_ID is None:
+        _AUTO_SESSION_ID = uuid.uuid4().hex[:8]
+    return _AUTO_SESSION_ID
 
 
 def init_config(

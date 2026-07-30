@@ -1,7 +1,8 @@
 """Tests for the job-events API + `qzcli events` command + status diagnosis.
 
 Covers the InspireSkill-borrowed scheduling-diagnosis feature: the unified
-``/api/v1/train_job/events/list`` endpoint (job vs instance via
+events endpoint —— 现在优先 v2 ``train ListJobEvents``、路由不通回落
+``/api/v1/train_job/events/list``（job vs instance via
 ``filter.object_type``), CLI filtering/formatting, and the queuing-reason line
 appended to ``qzcli status``.
 """
@@ -15,15 +16,18 @@ from unittest import mock
 
 from qzcli import api, cli
 
-
 # ---- API layer ----
 
 
 class _FakeResp:
-    def __init__(self, status_code=200, payload=None, text=""):
+    def __init__(
+        self, status_code=200, payload=None, text="", content_type="application/json"
+    ):
         self.status_code = status_code
         self._payload = payload
         self.text = text
+        # v2 路径会 sniff content-type 来识别「被 302 到 Keycloak 的 HTML」
+        self.headers = {"Content-Type": content_type}
 
     def json(self):
         if self._payload is None:
@@ -51,61 +55,103 @@ _JOB_EVENTS = [
 
 class JobEventsAPITests(unittest.TestCase):
     def _api(self):
-        with mock.patch.object(api, "get_api_base_url", return_value="https://qz.sii.edu.cn"), \
-                mock.patch.object(api, "get_credentials", return_value=("u", "p")):
+        with mock.patch.object(
+            api, "get_api_base_url", return_value="https://qz.sii.edu.cn"
+        ), mock.patch.object(api, "get_credentials", return_value=("u", "p")):
             return api.QzAPI()
 
-    def test_job_events_endpoint_and_body(self):
+    def test_job_events_hits_v2_first(self):
+        """默认走 v2 ``train ListJobEvents``。"""
         captured = {}
 
-        def _fake_post(url, json=None, headers=None, timeout=None):
+        def _fake_post(url, json=None, headers=None, params=None, timeout=None):
             captured["url"] = url
+            captured["params"] = params
             captured["body"] = json
             captured["headers"] = headers
-            return _FakeResp(200, {"code": 0, "data": {"events": _JOB_EVENTS, "total": 2}})
+            return _FakeResp(200, {"Result": {"events": _JOB_EVENTS, "total": 2}})
 
         with mock.patch.object(api, "_curl_post", side_effect=_fake_post):
             out = self._api().get_job_events_with_cookie("job-x", "cookie-v")
 
-        self.assertEqual(captured["url"], "https://qz.sii.edu.cn/api/v1/train_job/events/list")
-        self.assertEqual(captured["body"]["filter"], {"object_type": "job", "object_ids": ["job-x"]})
+        self.assertEqual(captured["url"], "https://qz.sii.edu.cn/api/v2/train")
+        self.assertEqual(captured["params"], {"Action": "ListJobEvents"})
+        self.assertEqual(
+            captured["body"]["filter"], {"object_type": "job", "object_ids": ["job-x"]}
+        )
         self.assertEqual(captured["headers"]["cookie"], "cookie-v")
+        self.assertEqual(out, _JOB_EVENTS)
+
+    def test_falls_back_to_v1_when_v2_route_missing(self):
+        """v2 路由不通时回落 v1，请求体一致、返回形状一致。"""
+        urls = []
+
+        def _fake_post(url, json=None, headers=None, params=None, timeout=None):
+            urls.append(url)
+            if "/api/v2/" in url:
+                return _FakeResp(
+                    404, None, text="404 page not found", content_type="text/plain"
+                )
+            return _FakeResp(
+                200, {"code": 0, "data": {"events": _JOB_EVENTS, "total": 2}}
+            )
+
+        api._V2_FALLBACK_WARNED.clear()
+        with mock.patch.object(
+            api, "_curl_post", side_effect=_fake_post
+        ), mock.patch.object(api, "print"):
+            out = self._api().get_job_events_with_cookie("job-x", "cookie-v")
+
+        self.assertTrue(urls[0].endswith("/api/v2/train"))
+        self.assertTrue(urls[1].endswith("/api/v1/train_job/events/list"))
         self.assertEqual(out, _JOB_EVENTS)
 
     def test_instance_events_resolves_pods_and_object_type(self):
         captured = {}
 
-        def _fake_post(url, json=None, headers=None, timeout=None):
+        def _fake_post(url, json=None, headers=None, params=None, timeout=None):
             captured["body"] = json
-            return _FakeResp(200, {"code": 0, "data": {"events": [], "total": 0}})
+            return _FakeResp(200, {"Result": {"events": [], "total": 0}})
 
         client = self._api()
-        with mock.patch.object(client, "_resolve_pod_names", return_value=["job-x-worker-0", "job-x-worker-1"]), \
-                mock.patch.object(api, "_curl_post", side_effect=_fake_post):
+        with mock.patch.object(
+            client,
+            "_resolve_pod_names",
+            return_value=["job-x-worker-0", "job-x-worker-1"],
+        ), mock.patch.object(api, "_curl_post", side_effect=_fake_post):
             client.get_job_instance_events_with_cookie("job-x", "cookie-v")
 
         self.assertEqual(captured["body"]["filter"]["object_type"], "instance")
         self.assertEqual(
-            captured["body"]["filter"]["object_ids"], ["job-x-worker-0", "job-x-worker-1"]
+            captured["body"]["filter"]["object_ids"],
+            ["job-x-worker-0", "job-x-worker-1"],
         )
 
     def test_401_raises_qz_error(self):
-        with mock.patch.object(api, "_curl_post", return_value=_FakeResp(401, text="<html>302")):
+        with mock.patch.object(
+            api, "_curl_post", return_value=_FakeResp(401, text="<html>302")
+        ):
             with self.assertRaises(api.QzAPIError):
                 self._api().get_job_events_with_cookie("job-x", "cookie-v")
 
-    def test_nonzero_code_raises(self):
-        with mock.patch.object(
-            api, "_curl_post", return_value=_FakeResp(200, {"code": 500, "message": "boom"})
-        ):
+    def test_business_error_raises(self):
+        """v2 的错误信封同样要抛出来，不能当成空结果。"""
+        payload = {
+            "ResponseMetadata": {
+                "Error": {"Code": "InvalidParameter", "Message": "boom"}
+            }
+        }
+        with mock.patch.object(api, "_curl_post", return_value=_FakeResp(200, payload)):
             with self.assertRaises(api.QzAPIError):
                 self._api().get_job_events_with_cookie("job-x", "cookie-v")
 
     def test_missing_events_returns_empty_list(self):
         with mock.patch.object(
-            api, "_curl_post", return_value=_FakeResp(200, {"code": 0, "data": {}})
+            api, "_curl_post", return_value=_FakeResp(200, {"Result": {}})
         ):
-            self.assertEqual([], self._api().get_job_events_with_cookie("job-x", "cookie-v"))
+            self.assertEqual(
+                [], self._api().get_job_events_with_cookie("job-x", "cookie-v")
+            )
 
 
 # ---- helpers ----
@@ -121,23 +167,37 @@ class SchedulingHelperTests(unittest.TestCase):
     def test_pick_reason_prefers_unschedulable_over_preempt(self):
         events = [
             {"reason": "Evict", "message": "preempted", "last_timestamp": "3000"},
-            {"reason": "Unschedulable", "message": "no nodes", "last_timestamp": "1000"},
+            {
+                "reason": "Unschedulable",
+                "message": "no nodes",
+                "last_timestamp": "1000",
+            },
         ]
-        self.assertEqual(("Unschedulable", "no nodes"), cli._pick_scheduling_reason(events))
+        self.assertEqual(
+            ("Unschedulable", "no nodes"), cli._pick_scheduling_reason(events)
+        )
 
     def test_pick_reason_latest_when_multiple_problems(self):
         events = [
             {"reason": "Unschedulable", "message": "old", "last_timestamp": "1000"},
             {"reason": "FailedScheduling", "message": "new", "last_timestamp": "5000"},
         ]
-        self.assertEqual(("FailedScheduling", "new"), cli._pick_scheduling_reason(events))
+        self.assertEqual(
+            ("FailedScheduling", "new"), cli._pick_scheduling_reason(events)
+        )
 
     def test_pick_reason_falls_back_to_preempt(self):
-        events = [{"reason": "Evict", "message": "preempted by hi-pri", "last_timestamp": "1"}]
-        self.assertEqual(("Evict", "preempted by hi-pri"), cli._pick_scheduling_reason(events))
+        events = [
+            {"reason": "Evict", "message": "preempted by hi-pri", "last_timestamp": "1"}
+        ]
+        self.assertEqual(
+            ("Evict", "preempted by hi-pri"), cli._pick_scheduling_reason(events)
+        )
 
     def test_pick_reason_none_when_no_scheduling(self):
-        events = [{"reason": "Started", "message": "container up", "last_timestamp": "1"}]
+        events = [
+            {"reason": "Started", "message": "container up", "last_timestamp": "1"}
+        ]
         self.assertIsNone(cli._pick_scheduling_reason(events))
 
 
@@ -166,7 +226,9 @@ class _FakeEventsAPI:
         self.job_calls += 1
         return list(self._job)
 
-    def get_job_instance_events_with_cookie(self, job_id, cookie, pod_names=None, page_size=200):
+    def get_job_instance_events_with_cookie(
+        self, job_id, cookie, pod_names=None, page_size=200
+    ):
         self.inst_calls += 1
         return list(self._inst)
 
@@ -188,9 +250,11 @@ def _events_args(**over):
 class CmdEventsTests(unittest.TestCase):
     def _run(self, args, fapi, cookie="cookie-v"):
         display = _FakeDisplay()
-        with mock.patch.object(cli, "get_display", return_value=display), \
-                mock.patch.object(cli, "get_api", return_value=fapi), \
-                mock.patch.object(cli, "_get_cookie_value", return_value=cookie):
+        with mock.patch.object(
+            cli, "get_display", return_value=display
+        ), mock.patch.object(cli, "get_api", return_value=fapi), mock.patch.object(
+            cli, "_get_cookie_value", return_value=cookie
+        ):
             with redirect_stdout(io.StringIO()) as out:
                 rc = cli.cmd_events(args)
         return rc, display, out.getvalue()
@@ -217,7 +281,12 @@ class CmdEventsTests(unittest.TestCase):
 
     def test_tail_keeps_last_n(self):
         many = [
-            {"type": "Normal", "reason": f"R{i}", "message": "m", "last_timestamp": str(i)}
+            {
+                "type": "Normal",
+                "reason": f"R{i}",
+                "message": "m",
+                "last_timestamp": str(i),
+            }
             for i in range(5)
         ]
         fapi = _FakeEventsAPI(job_events=many)
@@ -231,7 +300,12 @@ class CmdEventsTests(unittest.TestCase):
         fapi = _FakeEventsAPI(
             job_events=_JOB_EVENTS,
             instance_events=[
-                {"type": "Warning", "reason": "FailedScheduling", "message": "pod stuck", "last_timestamp": "9000"}
+                {
+                    "type": "Warning",
+                    "reason": "FailedScheduling",
+                    "message": "pod stuck",
+                    "last_timestamp": "9000",
+                }
             ],
         )
         rc, display, _ = self._run(_events_args(all_instances=True), fapi)
@@ -274,10 +348,15 @@ class CmdStatusDiagnosisTests(unittest.TestCase):
         display = _FakeDisplay()
         display.print_job_detail = lambda *a, **k: None
         args = argparse.Namespace(job_id="job-x", json=False)
-        with mock.patch.object(cli, "get_display", return_value=display), \
-                mock.patch.object(cli, "get_store", return_value=_FakeStore()), \
-                mock.patch.object(cli, "get_api", return_value=api_obj), \
-                mock.patch.object(cli, "_get_cookie_value", return_value="cookie-v"):
+        with mock.patch.object(
+            cli, "get_display", return_value=display
+        ), mock.patch.object(
+            cli, "get_store", return_value=_FakeStore()
+        ), mock.patch.object(
+            cli, "get_api", return_value=api_obj
+        ), mock.patch.object(
+            cli, "_get_cookie_value", return_value="cookie-v"
+        ):
             rc = cli.cmd_status(args)
         return rc, display
 
@@ -286,7 +365,9 @@ class CmdStatusDiagnosisTests(unittest.TestCase):
         rc, display = self._run(api_obj)
         self.assertEqual(0, rc)
         self.assertEqual(1, api_obj.job_calls)
-        self.assertTrue(any("排队原因" in ln and "Unschedulable" in ln for ln in display.lines))
+        self.assertTrue(
+            any("排队原因" in ln and "Unschedulable" in ln for ln in display.lines)
+        )
 
     def test_running_job_no_events_call(self):
         api_obj = _StatusAPI("job_running", job_events=_JOB_EVENTS)
@@ -298,7 +379,14 @@ class CmdStatusDiagnosisTests(unittest.TestCase):
     def test_queuing_but_no_scheduling_event_is_silent(self):
         api_obj = _StatusAPI(
             "job_pending",
-            job_events=[{"type": "Normal", "reason": "Started", "message": "up", "last_timestamp": "1"}],
+            job_events=[
+                {
+                    "type": "Normal",
+                    "reason": "Started",
+                    "message": "up",
+                    "last_timestamp": "1",
+                }
+            ],
         )
         rc, display = self._run(api_obj)
         self.assertEqual(0, rc)
