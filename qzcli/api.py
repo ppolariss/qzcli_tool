@@ -10,7 +10,9 @@ import sys
 import threading
 import time as _time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 from functools import lru_cache
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlencode
 
@@ -18,6 +20,7 @@ import requests
 
 from . import __version__
 from .config import (
+    CONFIG_DIR,
     clear_token_cache,
     get_api_base_url,
     get_cookie,
@@ -232,6 +235,65 @@ _V2_FALLBACK_WARNED: set = set()
 _V2_FALLBACK_STATUS = frozenset({404, 405, 501, 502, 503, 504})
 
 
+# 跨进程重登锁：等锁的最长秒数。超时就放行去自己登 —— 宁可多登一次，
+# 也不能让命令挂死在这里（比如上一个持锁进程被 kill -9 没释放）。
+_RELOGIN_LOCK_TIMEOUT_S = 60
+
+
+@contextmanager
+def _relogin_file_lock():
+    """跨进程互斥，保证同一时刻只有一个 qzcli 进程在走 CAS 登录。
+
+    多 agent 场景下每次 ``qzcli`` 调用都是独立进程，进程内的 ``threading.Lock``
+    完全挡不住它们同时撞 CAS —— 而 CAS 会把这种并发登录判为异常、要求验证码，
+    结果是**所有进程一起被锁在外面**。
+
+    用 ``flock`` 而不是"自己造锁文件"：进程被 ``kill -9`` 时内核会自动释放，
+    不会留下永久僵尸锁。拿不到锁也不阻塞主流程 —— 超时后照常放行。
+    """
+    lock_path = Path(CONFIG_DIR) / ".relogin.lock"
+    fh = None
+    acquired = False
+    try:
+        try:
+            import fcntl
+        except ImportError:
+            # 非 POSIX（Windows）没有 flock，退回只有进程内锁的老行为
+            yield False
+            return
+
+        Path(CONFIG_DIR).mkdir(parents=True, exist_ok=True)
+        fh = open(lock_path, "w")
+        deadline = _time.time() + _RELOGIN_LOCK_TIMEOUT_S
+        while True:
+            try:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
+                break
+            except OSError:
+                if _time.time() >= deadline:
+                    # 等太久了。放行去自己登 —— 多登一次总好过命令挂死。
+                    break
+                _time.sleep(0.2)
+        yield acquired
+    except OSError:
+        # 锁文件建不了（只读 HOME 之类）不该让整条命令失败
+        yield False
+    finally:
+        if fh is not None:
+            try:
+                if acquired:
+                    import fcntl as _f
+
+                    _f.flock(fh.fileno(), _f.LOCK_UN)
+            except Exception:
+                pass
+            try:
+                fh.close()
+            except Exception:
+                pass
+
+
 def _v2_then_v1(name: str, v2_call, v1_call, *, logger=None):
     """先打 v2，只在"v2 这条路由不通"时回落 v1。
 
@@ -306,8 +368,20 @@ class QzAPI:
     def _relogin(self) -> Optional[str]:
         """用本地凭据走 CAS 重新登录并持久化新 cookie。
 
-        返回新 cookie 字符串；没有凭据或登录失败时返回 ``None``。线程安全：并发
-        调用（如 ``get_jobs_detail`` 扇出）共享一次登录，避免对 CAS 造成登录风暴。
+        返回新 cookie 字符串；没有凭据或登录失败时返回 ``None``。
+
+        **并发保护是两层的，缺一不可**：
+
+        - 进程内 ``threading.Lock``：挡住 ``get_jobs_detail`` 这类线程扇出
+        - **跨进程文件锁**：挡住多个 qzcli 进程同时撞 CAS
+
+        第二层是必须的。多 agent 场景下每次 ``qzcli`` 调用都是独立进程，cookie
+        一过期，N 个进程会在同一瞬间各自去登录 —— **CAS 会判定为异常并要求输入
+        验证码，然后所有人一起被锁在外面**，连"自动重登"本身也一起失效。
+        真实踩过：一轮压测里几十个子进程并发触发，账号被锁到要人工过验证码。
+
+        拿到锁之后会**再读一次盘上的 cookie**：别的进程可能刚刚已经登好了，
+        这时直接用它的结果，全程只发生一次 CAS 登录。
         """
         if not (self._username and self._password):
             return None
@@ -315,13 +389,18 @@ class QzAPI:
         with self._relogin_lock:
             current = (get_cookie() or {}).get("cookie")
             if current and current != stale:
-                return current  # 其他线程已经刷新过了
-            try:
-                cookie = self.login_with_cas(self._username, self._password)
-            except QzAPIError:
-                return None
-            save_cookie(cookie, (get_cookie() or {}).get("workspace_id", ""))
-            return cookie
+                return current  # 同进程其他线程已经刷新过了
+            with _relogin_file_lock():
+                # 拿到跨进程锁后重读：可能别的进程已经登好了
+                current = (get_cookie() or {}).get("cookie")
+                if current and current != stale:
+                    return current
+                try:
+                    cookie = self.login_with_cas(self._username, self._password)
+                except QzAPIError:
+                    return None
+                save_cookie(cookie, (get_cookie() or {}).get("workspace_id", ""))
+                return cookie
 
     def _get_token(self, force_refresh: bool = False) -> str:
         """获取 Access Token（带缓存）"""
