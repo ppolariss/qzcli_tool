@@ -36,7 +36,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
-from qzcli.api import QzAPIError, get_api  # noqa: E402
+from qzcli.api import get_api  # noqa: E402
 from qzcli.config import find_workspace_by_name, get_cookie  # noqa: E402
 
 OUT_DIR = REPO_ROOT / "docs"
