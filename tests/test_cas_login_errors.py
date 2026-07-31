@@ -60,10 +60,24 @@ class CasLoginFailureMessageTests(unittest.TestCase):
         self.assertIn("频繁", message, "要点出最常见的真实原因")
 
     def test_real_captcha_error_is_reported(self):
-        """真的要验证码时（错误容器里明确写了）必须报出来。"""
-        message = _describe_cas_login_failure(_page("验证码错误，请重新输入"))
+        """真的要验证码时（错误容器里明确写了）必须报出来，并带上原文。
+
+        真实抓到的文案就是"验证码信息无效" —— CAS 平时不要验证码，是短时间内
+        登录失败几次后才临时打开的。
+        """
+        message = _describe_cas_login_failure(_page("验证码信息无效。"))
         self.assertIn("验证码", message)
-        self.assertIn("验证码错误，请重新输入", message, "原文要带上")
+        self.assertIn("验证码信息无效", message, "原文要带上")
+
+    def test_captcha_advice_leads_with_waiting_not_manual_cookie(self):
+        """验证码是临时限流，第一建议必须是"等一会儿"。
+
+        以前这里直接叫用户去浏览器手工取 cookie —— 那等于承认密码登录坏了，
+        而它并没有坏；何况已保存的 cookie 多半还有效，压根不用重新登录。
+        """
+        message = _describe_cas_login_failure(_page("验证码信息无效。"))
+        self.assertIn("等几分钟", message)
+        self.assertIn("无需重新登录", message)
 
     def test_password_error_is_reported(self):
         message = _describe_cas_login_failure(_page("用户名或密码错误"))

@@ -333,8 +333,14 @@ def _describe_cas_login_failure(html: str) -> str:
 
     if detail:
         if "验证码" in detail:
+            # CAS 平时不要验证码，是短时间内登录失败几次之后才临时打开的。
+            # 所以第一建议是"等几分钟重试"，而不是"去浏览器手工取 cookie"——
+            # 后者等于承认工具坏了；何况已保存的 cookie 通常还有效，
+            # 多数情况下根本不需要重新登录。
             return (
-                f"CAS 要求验证码：{detail}。请在浏览器登录后用 `qzcli cookie` 手动设置"
+                f"CAS 暂时要求验证码：{detail}"
+                "（短时间内登录过于频繁会触发，等几分钟通常自行恢复）。"
+                "若已保存的 cookie 仍有效，无需重新登录即可继续使用"
             )
         if "密码" in detail or "账号" in detail or "用户名" in detail:
             return f"用户名或密码错误：{detail}"
