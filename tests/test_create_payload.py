@@ -10,7 +10,7 @@ import io
 import json
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 from unittest import mock
 
 from qzcli import cli
@@ -406,3 +406,102 @@ class ProjectStaleCacheTests(unittest.TestCase):
 
         got = _project_belongs_to_workspace_on_platform(self._api({}), "ws-1", "proj-x")
         self.assertIsNone(got)
+
+
+class AutoSelectSpecFallbackTests(unittest.TestCase):
+    """缓存无规格时自动选规格要回落到平台。
+
+    **缓存没有规格是常态，不是边缘情况**：`res -u` 默认 quick 模式明确不产出
+    specs（只能从历史任务反推），所以 `specs={}` 是默认稳态 —— 实测 16 个
+    工作空间里 15 个是空的。只看缓存的话，`create` 不带 `--spec` 在绝大多数
+    工作空间上直接报「未指定资源规格且缓存中无可用规格」。
+    """
+
+    def _api(self, specs=None, fail=False):
+        from qzcli.api import QzAPIError
+
+        api = MagicMock()
+        if fail:
+            api.list_specs = MagicMock(side_effect=QzAPIError("boom"))
+        else:
+            api.list_specs = MagicMock(return_value=specs or [])
+        return api
+
+    def _empty_cache(self):
+        return {"specs": {}, "compute_groups": {"lcg-1": {"id": "lcg-1"}}}
+
+    def test_falls_back_to_platform_when_cache_empty(self):
+        from qzcli import cli
+
+        api = self._api(
+            [{"id": "q-8", "gpu_count": 8, "cpu_count": 150, "memory_size_gib": 1500}]
+        )
+        with patch.object(
+            cli, "get_workspace_resources", return_value=self._empty_cache()
+        ):
+            sid, _ = cli._auto_select_spec_for_compute_group("ws-1", "lcg-1", api=api)
+        self.assertEqual(sid, "q-8")
+
+    def test_picks_smallest_gpu_spec(self):
+        """别默认就占最大的机器。"""
+        from qzcli import cli
+
+        api = self._api(
+            [
+                {
+                    "id": "q-8",
+                    "gpu_count": 8,
+                    "cpu_count": 150,
+                    "memory_size_gib": 1500,
+                },
+                {"id": "q-1", "gpu_count": 1, "cpu_count": 15, "memory_size_gib": 200},
+                {"id": "q-4", "gpu_count": 4, "cpu_count": 60, "memory_size_gib": 800},
+            ]
+        )
+        with patch.object(
+            cli, "get_workspace_resources", return_value=self._empty_cache()
+        ):
+            sid, _ = cli._auto_select_spec_for_compute_group("ws-1", "lcg-1", api=api)
+        self.assertEqual(sid, "q-1")
+
+    def test_cache_wins_when_present(self):
+        """缓存有就用缓存 —— 不改变现有行为，也不多打一次平台。"""
+        from qzcli import cli
+
+        api = self._api([{"id": "q-from-platform", "gpu_count": 1}])
+        cached = {
+            "specs": {
+                "q-cached": {
+                    "id": "q-cached",
+                    "gpu_count": 8,
+                    "logic_compute_group_ids": ["lcg-1"],
+                }
+            },
+            "compute_groups": {"lcg-1": {"id": "lcg-1"}},
+        }
+        with patch.object(cli, "get_workspace_resources", return_value=cached):
+            sid, _ = cli._auto_select_spec_for_compute_group("ws-1", "lcg-1", api=api)
+        self.assertEqual(sid, "q-cached")
+        api.list_specs.assert_not_called()
+
+    def test_platform_failure_degrades_gracefully(self):
+        """平台也查不到就照旧返回 None，让上层报原来的错，不要抛异常。"""
+        from qzcli import cli
+
+        with patch.object(
+            cli, "get_workspace_resources", return_value=self._empty_cache()
+        ):
+            sid, _ = cli._auto_select_spec_for_compute_group(
+                "ws-1", "lcg-1", api=self._api(fail=True)
+            )
+        self.assertIsNone(sid)
+
+    def test_no_api_keeps_old_behaviour(self):
+        """不传 api 时维持纯缓存行为（向后兼容）。"""
+        from qzcli import cli
+
+        with patch.object(
+            cli, "get_workspace_resources", return_value=self._empty_cache()
+        ):
+            sid, _ = cli._auto_select_spec_for_compute_group("ws-1", "lcg-1")
+        self.assertIsNone(sid)

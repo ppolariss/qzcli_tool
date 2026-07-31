@@ -4361,9 +4361,19 @@ def _lookup_spec_for_payload(
 
 
 def _auto_select_spec_for_compute_group(
-    workspace_id: str, compute_group_id: str
+    workspace_id: str, compute_group_id: str, api=None
 ) -> Tuple[Optional[str], Optional[str]]:
-    """从缓存中为当前计算组选择一个 spec。"""
+    """为当前计算组自动挑一个 spec：先看缓存，缓存没有就问平台。
+
+    **缓存没有是常态，不是边缘情况。** `res -u` 默认走 quick 模式，而 quick
+    明确不产出 specs（specs 只能从历史任务反推），所以 `specs={}` 是默认稳态 ——
+    实测本机 16 个工作空间里 15 个是空的。只看缓存的话，`create` 不带 `--spec`
+    在绝大多数工作空间上直接报「未指定资源规格且缓存中无可用规格」。
+
+    平台侧 `api.list_specs()` 已经有权威来源了
+    （`workspace GetScheduleConfig` 的 predef_train_spec，v0.4.0 加的），
+    这里接上即可。**缓存有就用缓存**，不改变现有行为。
+    """
     cached_resources = get_workspace_resources(workspace_id) or {}
     cached_specs = [
         normalized
@@ -4376,6 +4386,21 @@ def _auto_select_spec_for_compute_group(
         compute_group_id,
         cached_resources.get("compute_groups", {}),
     )
+    if not scoped_specs and api is not None:
+        # 缓存没有 → 问平台。挑 GPU 数最小的那个，别默认就占最大的机器。
+        try:
+            platform_specs = [
+                normalized
+                for spec in api.list_specs(compute_group_id, workspace_id)
+                for normalized in [_normalize_spec_item(spec, compute_group_id)]
+                if normalized
+            ]
+        except QzAPIError:
+            platform_specs = []
+        if platform_specs:
+            scoped_specs = sorted(
+                platform_specs, key=lambda s: (s.get("gpu_count") or 0)
+            )
     if not scoped_specs:
         return None, None
     first = scoped_specs[0]
@@ -6529,7 +6554,7 @@ def cmd_create(args):
                 return 1
     else:
         spec_id, spec_display = _auto_select_spec_for_compute_group(
-            workspace_id, compute_group_id
+            workspace_id, compute_group_id, api=api
         )
         if not spec_id:
             display.print_error("未指定资源规格且缓存中无可用规格")
