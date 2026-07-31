@@ -201,3 +201,103 @@ class ExecDetachAttachTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CrossProcessReloginLockTests(unittest.TestCase):
+    """跨进程重登锁。
+
+    真实事故：多 agent 场景下每次 qzcli 调用都是独立进程，cookie 一过期，
+    N 个进程同一瞬间各自去撞 CAS —— CAS 判为异常登录、要求验证码，
+    **所有人一起被锁在外面**，连"自动重登"本身也失效。
+    进程内的 threading.Lock 完全挡不住这个。
+    """
+
+    def _client(self, login_fn):
+        import threading
+
+        from qzcli import api as _api
+
+        a = _api.QzAPI.__new__(_api.QzAPI)
+        a.base_url = "https://qz.example"
+        a._username, a._password = "u", "p"
+        a._token = None
+        a._auto_relogin = True
+        a._relogin_lock = threading.Lock()
+        a.login_with_cas = login_fn
+        return a
+
+    def test_file_lock_is_acquired_during_relogin(self):
+        """重登必须在跨进程锁的保护下进行。"""
+        from qzcli import api as _api
+
+        seen = {}
+
+        def fake_login(u, p):
+            seen["locked_while_logging_in"] = True
+            return "inspire-session=NEW"
+
+        import contextlib
+
+        @contextlib.contextmanager
+        def spy_lock():
+            seen["lock_used"] = True
+            yield True
+
+        with patch.object(_api, "_relogin_file_lock", spy_lock), patch.object(
+            _api, "get_cookie", return_value={"cookie": "STALE"}
+        ), patch.object(_api, "save_cookie"):
+            self._client(fake_login)._relogin()
+
+        self.assertTrue(seen.get("lock_used"), "重登没有走跨进程锁")
+        self.assertTrue(seen.get("locked_while_logging_in"))
+
+    def test_rechecks_cookie_after_acquiring_lock(self):
+        """拿到锁后要重读盘上的 cookie —— 别的进程可能刚登好了，
+        这时应该直接用它的结果，而不是再撞一次 CAS。"""
+        from qzcli import api as _api
+
+        calls = []
+
+        def fake_login(u, p):
+            calls.append(1)
+            return "inspire-session=MINE"
+
+        # 第 1 次读到 STALE（触发重登），拿到锁后第 2/3 次读到别人刚写的新 cookie
+        reads = iter(
+            [
+                {"cookie": "STALE"},
+                {"cookie": "STALE"},
+                {"cookie": "inspire-session=FROM-OTHER-PROC"},
+            ]
+        )
+
+        import contextlib
+
+        @contextlib.contextmanager
+        def lock():
+            yield True
+
+        with patch.object(_api, "_relogin_file_lock", lock), patch.object(
+            _api, "get_cookie", side_effect=lambda: next(reads)
+        ), patch.object(_api, "save_cookie"):
+            got = self._client(fake_login)._relogin()
+
+        self.assertEqual(got, "inspire-session=FROM-OTHER-PROC")
+        self.assertEqual(calls, [], "别的进程已经登好了，不该再撞一次 CAS")
+
+    def test_lock_helper_yields_and_releases(self):
+        from qzcli.api import _relogin_file_lock
+
+        with _relogin_file_lock() as got:
+            self.assertTrue(got)
+        # 释放后应能立刻再拿到
+        with _relogin_file_lock() as got2:
+            self.assertTrue(got2)
+
+    def test_lock_failure_does_not_break_command(self):
+        """锁文件建不了（只读 HOME 之类）不能让整条命令失败。"""
+        from qzcli import api as _api
+
+        with patch("builtins.open", side_effect=OSError("read-only fs")):
+            with _api._relogin_file_lock() as got:
+                self.assertFalse(got)
