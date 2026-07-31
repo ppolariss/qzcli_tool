@@ -335,3 +335,74 @@ class ComputeGroupStaleCacheTests(unittest.TestCase):
 
         got = _compute_group_exists_on_platform(self._api(groups=[]), "ws-1", "lcg-x")
         self.assertIsNone(got)
+
+
+class ProjectStaleCacheTests(unittest.TestCase):
+    """项目不在本地缓存时，不能拿过期缓存直接拒。
+
+    与 `ComputeGroupStaleCacheTests` **完全同构** —— cli.py 里项目和计算组的归属
+    校验是同一套逻辑，v0.4.2 只给计算组加了平台复核，项目这条漏了。
+
+    真实复现：`project-7e0957fb`（CI-扩散音视频生成）是真实项目，今天的千卡训练
+    和推理任务都跑在它下面；把它从缓存删掉，create 就报「项目 ... 不属于当前
+    工作空间」—— 这句话是假的。新建/新加入的项目必然有这个窗口期。
+    """
+
+    def _api(self, projects_spaces=None, fail=False):
+        """projects_spaces: {project_id: [workspace_id, ...]}"""
+        from qzcli.api import QzAPIError
+
+        api = MagicMock()
+        if fail:
+            api.list_projects_raw = MagicMock(side_effect=QzAPIError("boom"))
+        else:
+            api.list_projects_raw = MagicMock(
+                return_value=[
+                    {"id": pid, "space_list": [{"id": w} for w in wss]}
+                    for pid, wss in (projects_spaces or {}).items()
+                ]
+            )
+        return api
+
+    def test_project_on_platform_is_accepted(self):
+        """缓存里没有、但平台确认它属于这个工作空间 → 放行。"""
+        from qzcli.cli import _project_belongs_to_workspace_on_platform
+
+        got = _project_belongs_to_workspace_on_platform(
+            self._api({"proj-real": ["ws-1", "ws-2"]}), "ws-1", "proj-real"
+        )
+        self.assertIs(got, True)
+
+    def test_project_in_other_workspace_only_is_rejected(self):
+        """项目存在但属于**别的**工作空间 → 确实该拒。"""
+        from qzcli.cli import _project_belongs_to_workspace_on_platform
+
+        got = _project_belongs_to_workspace_on_platform(
+            self._api({"proj-real": ["ws-other"]}), "ws-1", "proj-real"
+        )
+        self.assertIs(got, False)
+
+    def test_unknown_project_is_rejected(self):
+        from qzcli.cli import _project_belongs_to_workspace_on_platform
+
+        got = _project_belongs_to_workspace_on_platform(
+            self._api({"proj-a": ["ws-1"]}), "ws-1", "proj-nonexistent"
+        )
+        self.assertIs(got, False)
+
+    def test_query_failure_is_inconclusive_not_rejection(self):
+        """查不了平台就返回 None（不确定）→ 上层放行让平台自己拒，
+        总好过拿过期缓存误伤一个真实项目。"""
+        from qzcli.cli import _project_belongs_to_workspace_on_platform
+
+        got = _project_belongs_to_workspace_on_platform(
+            self._api(fail=True), "ws-1", "proj-x"
+        )
+        self.assertIsNone(got)
+
+    def test_empty_project_list_is_inconclusive(self):
+        """返回空列表可能是分页/权限问题，不能据此判定「不属于」。"""
+        from qzcli.cli import _project_belongs_to_workspace_on_platform
+
+        got = _project_belongs_to_workspace_on_platform(self._api({}), "ws-1", "proj-x")
+        self.assertIsNone(got)

@@ -2253,19 +2253,10 @@ class QzAPI:
 
     @with_rate_limit_retry
     @with_auth_retry
-    def list_workspaces(self, cookie: str) -> List[Dict[str, Any]]:
-        """
-        获取用户可访问的工作空间列表
-
-        通过 /api/v1/project/list 获取项目列表，从中提取工作空间信息。
-        每个项目的 space_list 字段包含该项目关联的工作空间。
-
-        Args:
-            cookie: 浏览器 cookie 字符串
-
-        Returns:
-            工作空间列表 [{"id": "ws-xxx", "name": "工作空间名称"}, ...]
-        """
+    @with_rate_limit_retry
+    @with_auth_retry
+    def _project_list_items(self, cookie: str = "") -> List[Dict[str, Any]]:
+        """``POST /api/v1/project/list`` → ``data.items``。"""
         url = f"{self.base_url}/api/v1/project/list"
 
         payload = {"page": 1, "page_size": 100, "filter": {}}
@@ -2322,6 +2313,34 @@ class QzAPI:
         data = result.get("data", {})
         items = data.get("items", [])
 
+        return items
+
+    def list_projects_raw(self, cookie: str = "") -> List[Dict[str, Any]]:
+        """项目列表原始条目（``/api/v1/project/list`` 的 ``data.items``）。
+
+        每条含 ``id`` / ``name`` / ``space_list[]``，即**项目 → 它属于哪些工作空间**
+        的权威映射。``list_workspaces`` 和「项目归属核实」都基于它。
+
+        为什么用 v1：v2 的 ``project ListProjects`` 对普通账号是 ``AccessForbidden``
+        （实测），全域也没有别的接口能给出这个映射。详见
+        ``docs/v1_to_v2_mapping.md``。
+        """
+        return self._project_list_items(cookie)
+
+    def list_workspaces(self, cookie: str) -> List[Dict[str, Any]]:
+        """
+        获取用户可访问的工作空间列表
+
+        通过 /api/v1/project/list 获取项目列表，从中提取工作空间信息。
+        每个项目的 space_list 字段包含该项目关联的工作空间。
+
+        Args:
+            cookie: 浏览器 cookie 字符串
+
+        Returns:
+            工作空间列表 [{"id": "ws-xxx", "name": "工作空间名称"}, ...]
+        """
+        items = self._project_list_items(cookie)
         # 从项目的 space_list 中提取工作空间（去重）
         #
         # 注意 project/list 会把**你不是成员的项目**也返回回来，其 space_list 里

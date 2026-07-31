@@ -2961,6 +2961,34 @@ def _resolve_cached_resource_value(
     return None, None
 
 
+def _project_belongs_to_workspace_on_platform(api, workspace_id, project_id):
+    """跟平台确认项目是否真属于该工作空间（不看本地缓存）。
+
+    与 `_compute_group_exists_on_platform` 同构 —— 两处归属校验本来就是同一套
+    逻辑，之前只给计算组加了平台复核，项目这条漏了，于是**新建/新加入的项目
+    会原样重演那个 bug**：报「项目 X 不属于当前工作空间」，而它其实属于。
+
+    数据源是 `/api/v1/project/list` 的 `items[].space_list[]`，即"项目 → 它属于
+    哪些工作空间"。用 v1 是因为 v2 的 `project ListProjects` 对普通账号是
+    `AccessForbidden`，全域也没有别的接口给得出这个映射。
+
+    返回 True/False；查询失败或列表为空返回 None（不确定 → 上层放行，
+    让平台自己拒，总好过拿过期缓存误伤一个真实项目）。
+    """
+    try:
+        items = api.list_projects_raw()
+    except QzAPIError:
+        return None
+    if not items:
+        return None
+    for proj in items:
+        if proj.get("id") != project_id:
+            continue
+        spaces = {s.get("id") for s in (proj.get("space_list") or [])}
+        return workspace_id in spaces
+    return False
+
+
 def _compute_group_exists_on_platform(
     api, workspace_id, compute_group_id, display=None
 ):
@@ -6379,13 +6407,30 @@ def cmd_create(args):
             )
             is False
         ):
-            display.print_error(
-                f"项目 '{args.project}' 不属于当前工作空间 '{ws_display}'"
+            # 缓存说「不属于」不能直接拒 —— 新建/新加入的项目必然还没进缓存。
+            # 跟平台确认一次再决定（与计算组同一模式）。
+            on_platform = _project_belongs_to_workspace_on_platform(
+                api, workspace_id, project_id
             )
-            display.print(
-                "[dim]请先运行 qzcli res -w <workspace> -u 刷新缓存，或改用正确的项目 ID[/dim]"
-            )
-            return 1
+            if on_platform is True:
+                display.print(
+                    "[dim]项目不在本地缓存里，但平台确认它属于该工作空间，继续。"
+                    "（缓存已过期，可稍后 qzcli res -u 更新）[/dim]"
+                )
+            elif on_platform is None:
+                display.print(
+                    "[dim]项目不在本地缓存里，且无法向平台确认；继续提交，"
+                    "由平台校验。[/dim]"
+                )
+            else:
+                display.print_error(
+                    f"项目 '{args.project}' 不属于当前工作空间 "
+                    f"'{ws_display}'（已向平台确认）"
+                )
+                display.print(
+                    "[dim]请先运行 qzcli res -w <workspace> -u 刷新缓存，或改用正确的项目 ID[/dim]"
+                )
+                return 1
     else:
         project_id, proj_display = _auto_select_resource(workspace_id, "projects")
         if not project_id:
