@@ -15,7 +15,12 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from . import __version__
-from .api import QzAPIError, build_resource_spec_price, get_api
+from .api import (
+    QzAPIError,
+    _relogin_file_lock,
+    build_resource_spec_price,
+    get_api,
+)
 from .config import (
     CONFIG_DIR,
     clear_cookie,
@@ -7050,15 +7055,15 @@ def cmd_batch(args):
             failed_tasks.append(f"{idx}: template error {e}")
             continue
 
+        # 注意：dry-run **不在这里 continue**。以前是在这里就跳过了，导致
+        # `batch --dry-run` 只校验模板字符串，**完全不校验 workspace / project /
+        # compute-group / spec 是否解析得出来** —— 用户拿它当提交前预检必然翻车。
+        # 现在走完整的 cmd_create 链路，由 cmd_create 自己的 --dry-run 在最后
+        # 一步停住（它是走完整解析的），这样两个 dry-run 的语义才一致。
         if args.dry_run:
-            display.print(f"  [{idx}/{total}] {job_name}")
-            display.print(
-                f"    命令: {command[:120]}{'...' if len(command) > 120 else ''}"
-            )
-            display.print("")
-            continue
-
-        display.print(f"[bold][{idx}/{total}][/bold] 提交: {job_name}")
+            display.print(f"[bold][{idx}/{total}][/bold] 预检: {job_name}")
+        else:
+            display.print(f"[bold][{idx}/{total}][/bold] 提交: {job_name}")
 
         # Build argparse-like namespace for cmd_create
         create_args = argparse.Namespace(
@@ -7079,7 +7084,8 @@ def cmd_batch(args):
             priority=defaults.get("priority", 10),
             framework=defaults.get("framework", "pytorch"),
             no_track=False,
-            dry_run=False,
+            # 必须透传 —— 否则 batch --dry-run 会真的提交任务
+            dry_run=args.dry_run,
             output_json=False,
         )
 
@@ -7768,7 +7774,18 @@ def cmd_login(args):
     display.print("[dim]正在登录...[/dim]")
 
     try:
-        cookie = api.login_with_cas(username, password)
+        # 拿跨进程锁再登。v0.4.1 的锁只保护了自动重登（`_relogin`），
+        # **显式 `qzcli login` 没拿** —— 多个 agent 同时敲 login 仍会并发撞 CAS，
+        # 被判为异常登录要求验证码，然后所有人一起被锁在外面。
+        # 拿到锁后如果别的进程刚登好（cookie 变了），直接用它的结果。
+        before = (get_cookie() or {}).get("cookie")
+        with _relogin_file_lock():
+            fresh = (get_cookie() or {}).get("cookie")
+            if fresh and fresh != before:
+                display.print("[dim]另一个进程刚刚登录过，直接复用其 cookie[/dim]")
+                cookie = fresh
+            else:
+                cookie = api.login_with_cas(username, password)
 
         # 保存 cookie
         save_cookie(cookie, workspace_id=args.workspace)
