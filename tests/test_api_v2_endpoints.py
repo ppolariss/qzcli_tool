@@ -206,7 +206,17 @@ class HpcPriorityTests(unittest.TestCase):
 
 
 class ListSpecsTests(unittest.TestCase):
-    """/openapi/v1/specs/list 平台上已 404，规格只能从历史任务反推。"""
+    """/openapi/v1/specs/list 已 404 之后的后备链路：预定义规格表 → 历史任务反推。
+
+    这里专测「历史任务反推」那一级，所以把前面的预定义规格表那级短路掉
+    （返回空 schedule_config），否则会真去打网络。
+    """
+
+    @staticmethod
+    def _no_predef(client):
+        """短路掉第 1 级（GetScheduleConfig），让用例落到历史任务反推。"""
+        client._request_v2 = lambda *a, **k: {"schedule_config": {}}
+        return client
 
     def test_recovers_spec_ids_from_job_history(self):
         job = {
@@ -226,7 +236,7 @@ class ListSpecsTests(unittest.TestCase):
                 }
             ],
         }
-        client = _client()
+        client = self._no_predef(_client())
         with mock.patch.object(
             client, "_request", side_effect=QzAPIError("404", 404)
         ), mock.patch.object(
@@ -250,7 +260,7 @@ class ListSpecsTests(unittest.TestCase):
                 ],
             }
         ]
-        client = _client()
+        client = self._no_predef(_client())
         with mock.patch.object(
             client, "_request", side_effect=QzAPIError("404", 404)
         ), mock.patch.object(
@@ -260,14 +270,14 @@ class ListSpecsTests(unittest.TestCase):
 
     def test_without_workspace_id_returns_empty(self):
         """没有 workspace 就翻不了历史任务 —— 老实返回空，别硬编。"""
-        client = _client()
+        client = self._no_predef(_client())
         with mock.patch.object(client, "_request", side_effect=QzAPIError("404", 404)):
             self.assertEqual(client.list_specs("lcg-1"), [])
 
     def test_legacy_endpoint_wins_when_alive(self):
         """老接口还活着就用它 —— 它才是"规格清单"的权威来源，
         历史任务反推只能看到跑过的那些。"""
-        client = _client()
+        client = self._no_predef(_client())
         with mock.patch.object(
             client, "_request", return_value={"data": {"specs": [{"id": "s-1"}]}}
         ), mock.patch.object(client, "list_jobs_with_cookie") as hist:
@@ -432,3 +442,74 @@ class ListWorkspacesDisabledFilterTests(unittest.TestCase):
         )
         self.assertTrue(msgs, "跳过了却没有任何提示")
         self.assertIn("已禁用空间", msgs[0])
+
+
+class SpecsFromScheduleConfigTests(unittest.TestCase):
+    """预定义规格表 —— /openapi/v1/specs/list 已 404 后的正经替代。
+
+    真实故障：用户在一个**新建的计算组**（零历史任务）上提交，报
+    `无法解析规格 '67b10bc6...' 的 cpu/gpu/memory 信息`。因为当时只有
+    「历史任务反推」这一条路，而新组没有任何 job 可反推。
+    `GetScheduleConfig.predef_train_spec` 是工作空间级的，不依赖历史任务。
+    """
+
+    PREDEF = (
+        '[{"id":"q-8card","cellId":"q-8card","name":"8卡",'
+        '"cpu_count":150,"gpu_count":8,"memory_size":1500,"gpu_type":""}]'
+    )
+
+    def _client_with(self, predef=None, jobs=None):
+        c = _client()
+
+        def fake_v2(service, action, body, **kw):
+            if action == "GetScheduleConfig":
+                return {"schedule_config": {"predef_train_spec": predef}}
+            raise AssertionError(f"未预期的 action {action}")
+
+        c._request_v2 = fake_v2
+        c.list_jobs_with_cookie = lambda *a, **k: {"jobs": jobs or []}
+        c._request = mock.Mock(side_effect=QzAPIError("404", 404))
+        return c
+
+    def test_new_compute_group_without_job_history_still_resolves(self):
+        """核心回归：零历史任务的新计算组也要能拿到规格。"""
+        c = self._client_with(predef=self.PREDEF, jobs=[])
+        specs = c.list_specs("lcg-brand-new", "ws-1")
+        self.assertEqual(len(specs), 1)
+        self.assertEqual(specs[0]["id"], "q-8card")
+        self.assertEqual(specs[0]["gpu_count"], 8)
+        self.assertEqual(specs[0]["cpu_count"], 150)
+        self.assertEqual(specs[0]["memory_size_gib"], 1500)
+
+    def test_gpu_type_filled_from_job_history(self):
+        """predef_train_spec 的 gpu_type 常为空，但平台校验要完整型号串，
+        用历史任务按 quota_id 补上。"""
+        jobs = [
+            {
+                "framework_config": [
+                    {
+                        "instance_spec_price_info": {
+                            "quota_id": "q-8card",
+                            "gpu_info": {"gpu_type": "NVIDIA_H200_SXM_141G"},
+                        }
+                    }
+                ]
+            }
+        ]
+        c = self._client_with(predef=self.PREDEF, jobs=jobs)
+        specs = c.list_specs("lcg-brand-new", "ws-1")
+        self.assertEqual(specs[0]["gpu_type"], "NVIDIA_H200_SXM_141G")
+
+    def test_gpu_type_left_empty_when_unknown(self):
+        """补不到就留空 —— 让平台报错，好过我们瞎猜一个型号。"""
+        c = self._client_with(predef=self.PREDEF, jobs=[])
+        self.assertEqual(c.list_specs("lcg-x", "ws-1")[0]["gpu_type"], "")
+
+    def test_falls_through_when_schedule_config_empty(self):
+        """拿不到预定义表时不能炸，继续走后面的历史任务反推。"""
+        c = self._client_with(predef=None, jobs=[])
+        self.assertEqual(c.list_specs("lcg-x", "ws-1"), [])
+
+    def test_malformed_predef_json_does_not_crash(self):
+        c = self._client_with(predef="{不是合法 JSON", jobs=[])
+        self.assertEqual(c.list_specs("lcg-x", "ws-1"), [])

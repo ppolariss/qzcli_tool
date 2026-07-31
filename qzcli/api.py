@@ -1506,6 +1506,13 @@ class QzAPI:
             workspace_id: 工作空间 ID。留空则跳过第 2 级 —— 历史任务必须按
                 工作空间查。
         """
+        # 第 1 级：工作空间的预定义训练规格表。**这是 /openapi/v1/specs/list 的正经
+        # 替代** —— 工作空间级、权威、且**不依赖历史任务**，所以新建的计算组也能拿到。
+        if workspace_id:
+            predef = self._specs_from_schedule_config(workspace_id, compute_group_id)
+            if predef:
+                return predef
+
         try:
             result = self._request(
                 "/openapi/v1/specs/list", {"logic_compute_group_id": compute_group_id}
@@ -1520,6 +1527,97 @@ class QzAPI:
         if not workspace_id:
             return []
         return self._specs_from_job_history(compute_group_id, workspace_id)
+
+    def _specs_from_schedule_config(
+        self, workspace_id: str, compute_group_id: str = ""
+    ) -> List[Dict[str, Any]]:
+        """从 ``workspace GetScheduleConfig`` 的 ``predef_train_spec`` 取规格表。
+
+        平台把"这个工作空间有哪些预定义训练规格"放在调度配置里，字段是一个
+        **JSON 字符串**：``[{id, cellId, name, cpu_count, gpu_count, memory_size,
+        gpu_type}, ...]``。
+
+        比历史任务反推强的地方：**工作空间级、不依赖有没有跑过任务**。新建的计算组
+        没有任何历史 job，反推那条路直接返回空，用户就会撞上
+        "无法解析规格 ... 的 cpu/gpu/memory 信息"。这一级能覆盖。
+
+        注意 ``gpu_type`` 在这里常常是空串；而平台校验 ``resource_spec_price``
+        时要求完整型号串（如 ``NVIDIA_H200_SXM_141G``）。所以缺型号时会回头用
+        历史任务补 —— 见 ``_fill_gpu_type_from_history``。
+        """
+        try:
+            cfg = self._request_v2(
+                "workspace",
+                "GetScheduleConfig",
+                {"workspace_id": workspace_id},
+                referer_path=f"/jobs/spacesOverview?spaceId={workspace_id}",
+            )
+        except QzAPIError:
+            return []
+
+        raw = ((cfg or {}).get("schedule_config") or {}).get("predef_train_spec")
+        if not raw:
+            return []
+        try:
+            items = _json.loads(raw) if isinstance(raw, str) else raw
+        except ValueError:
+            return []
+        if not isinstance(items, list):
+            return []
+
+        specs = []
+        for it in items:
+            spec_id = it.get("id") or it.get("cellId")
+            if not spec_id:
+                continue
+            specs.append(
+                {
+                    "id": spec_id,
+                    "quota_id": spec_id,
+                    "name": it.get("name") or spec_id,
+                    "gpu_count": it.get("gpu_count") or 0,
+                    "cpu_count": it.get("cpu_count") or 0,
+                    "memory_size_gib": it.get("memory_size") or 0,
+                    "gpu_type": it.get("gpu_type") or "",
+                    # 规格是工作空间级的，对该空间任一计算组都可用
+                    "logic_compute_group_ids": (
+                        [compute_group_id] if compute_group_id else []
+                    ),
+                }
+            )
+        if specs:
+            self._fill_gpu_type_from_history(specs, workspace_id)
+        return specs
+
+    def _fill_gpu_type_from_history(
+        self, specs: List[Dict[str, Any]], workspace_id: str
+    ) -> None:
+        """给缺 ``gpu_type`` 的规格补上完整型号串（就地修改）。
+
+        ``predef_train_spec`` 里的 ``gpu_type`` 常为空，但平台校验 payload 时要求
+        完整串。历史任务的 ``instance_spec_price_info.gpu_info.gpu_type`` 有正确值，
+        按 quota_id 对上就能补。补不到就留空 —— 让平台去报错，好过我们瞎猜一个型号。
+        """
+        missing = {s["id"] for s in specs if not s.get("gpu_type")}
+        if not missing:
+            return
+        try:
+            data = self.list_jobs_with_cookie(workspace_id, "", page_size=200)
+        except QzAPIError:
+            return
+        found: Dict[str, str] = {}
+        for job in data.get("jobs") or []:
+            for fc in job.get("framework_config") or []:
+                info = fc.get("instance_spec_price_info") or {}
+                qid = info.get("quota_id")
+                gtype = (info.get("gpu_info") or {}).get("gpu_type")
+                if qid in missing and gtype:
+                    found[qid] = gtype
+            if len(found) == len(missing):
+                break
+        for s in specs:
+            if not s.get("gpu_type") and s["id"] in found:
+                s["gpu_type"] = found[s["id"]]
 
     def _specs_from_job_history(
         self, compute_group_id: str, workspace_id: str, page_size: int = 200
