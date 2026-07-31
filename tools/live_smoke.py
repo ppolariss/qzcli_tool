@@ -424,6 +424,9 @@ def main() -> int:
     @check("avail 默认形态", "qzcli avail")
     def _cli_avail():
         rc, out = run_cli("avail")
+        # rc 必须断言。以前只查输出关键词，命令 exit 1 但输出恰好没有 "429"
+        # 就会算通过 —— 等于这条用例可以静默失效。
+        assert_true(rc == 0, f"命令退出码 {rc}（非 0）：{out[-300:]}")
         assert_true("429" not in out, "撞上限流 429 —— 并发放大没控制住")
         assert_true(
             "AccessForbidden" not in out,
@@ -438,6 +441,7 @@ def main() -> int:
     @check("usage 默认形态", "qzcli usage")
     def _cli_usage():
         rc, out = run_cli("usage")
+        assert_true(rc == 0, f"命令退出码 {rc}（非 0）：{out[-300:]}")
         assert_true("429" not in out, "撞上限流 429")
         assert_true("AccessForbidden" not in out, "权限噪声未清理")
         return "无 429、无权限噪声"
@@ -450,6 +454,7 @@ def main() -> int:
         agent 场景下同一命令会被反复调用。"""
         for i in range(3):
             rc, out = run_cli("avail")
+            assert_true(rc == 0, f"第 {i+1} 次退出码 {rc}：{out[-200:]}")
             assert_true("429" not in out, f"第 {i+1} 次就撞上 429")
         return "连跑 3 次无 429"
 

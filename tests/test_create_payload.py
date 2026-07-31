@@ -505,3 +505,64 @@ class AutoSelectSpecFallbackTests(unittest.TestCase):
         ):
             sid, _ = cli._auto_select_spec_for_compute_group("ws-1", "lcg-1")
         self.assertIsNone(sid)
+
+
+class BatchDryRunTests(unittest.TestCase):
+    """`batch --dry-run` 必须走完整解析链路。
+
+    此前它在展开完模板就 `continue` 了，**完全不校验 workspace / project /
+    compute-group / spec 是否解析得出来** —— 用户拿它当提交前预检必然翻车，
+    因为 `cmd_create` 自己的 `--dry-run` 是走完整解析的，两者语义不一致。
+    """
+
+    def _cfg(self, tmp):
+        import json as _json
+
+        cfg = {
+            "defaults": {
+                "workspace": "ws-1",
+                "image": "img",
+                "compute_group": "lcg-1",
+            },
+            "matrix": {"step": ["100", "200"]},
+            "name_template": "job-{step}",
+            "command_template": "echo {step}",
+        }
+        path = tmp / "batch.json"
+        path.write_text(_json.dumps(cfg), encoding="utf-8")
+        return path
+
+    def _run(self, dry_run):
+        import tempfile
+        from pathlib import Path
+
+        from qzcli import cli
+
+        calls = []
+        with tempfile.TemporaryDirectory() as td:
+            path = self._cfg(Path(td))
+            args = argparse.Namespace(
+                config=str(path),
+                dry_run=dry_run,
+                delay=0,
+                continue_on_error=False,
+            )
+            with patch.object(
+                cli, "cmd_create", side_effect=lambda a: calls.append(a) or 0
+            ):
+                cli.cmd_batch(args)
+        return calls
+
+    def test_dry_run_still_calls_cmd_create(self):
+        """核心回归：dry-run 也要走到 cmd_create，才能校验资源解析。"""
+        calls = self._run(dry_run=True)
+        self.assertEqual(len(calls), 2, "dry-run 没有走到 cmd_create")
+
+    def test_dry_run_propagates_to_cmd_create(self):
+        """而且必须把 dry_run 透传下去 —— 否则预检会变成真提交。"""
+        calls = self._run(dry_run=True)
+        self.assertTrue(all(a.dry_run is True for a in calls))
+
+    def test_real_run_does_not_set_dry_run(self):
+        calls = self._run(dry_run=False)
+        self.assertTrue(all(a.dry_run is False for a in calls))
