@@ -2961,6 +2961,37 @@ def _resolve_cached_resource_value(
     return None, None
 
 
+def _compute_group_exists_on_platform(
+    api, workspace_id, compute_group_id, display=None
+):
+    """跟平台确认计算组是否真属于该工作空间（不看本地缓存）。
+
+    存在的意义：本地缓存**总会过期**。新建的计算组在缓存刷新前是查不到的，
+    而 `_validate_cached_resource_membership` 只看缓存，会把一个**真实存在、
+    此刻正在跑任务**的计算组判成「不属于当前工作空间」—— 报错内容本身是错的，
+    而且提示去 `res -u` 也未必解决（缓存刷新有自己的失败模式）。
+
+    所以缓存说「没有」时不能直接拒，要跟平台再确认一次。
+    `workspace ListLogicComputeGroups` 是权威来源，不依赖任何缓存。
+
+    返回 True/False；查询失败返回 None（此时按「不确定」处理，放行，
+    让平台自己去拒——总好过我们拿过期缓存误伤）。
+    """
+    try:
+        r = api._request_v2(
+            "workspace",
+            "ListLogicComputeGroups",
+            {"filter": {"workspace_id": workspace_id}, "page_num": 1, "page_size": 200},
+            referer_path=f"/jobs/spacesOverview?spaceId={workspace_id}",
+        )
+    except QzAPIError:
+        return None
+    groups = r.get("logic_compute_groups") or []
+    if not groups:
+        return None
+    return any(g.get("logic_compute_group_id") == compute_group_id for g in groups)
+
+
 def _validate_cached_resource_membership(
     workspace_id: str,
     resource_type: str,
@@ -5996,9 +6027,26 @@ def _run_create_interactive(args, display, api) -> int:
             )
             is False
         ):
-            display.print_error(
-                f"计算组 '{args.compute_group}' 不属于当前工作空间 '{ws_display or workspace_id}'"
+            # 缓存说「不属于」时**不能直接拒** —— 新建的计算组在缓存刷新前必然
+            # 查不到，而它可能正跑着任务。跟平台确认一次再决定。
+            on_platform = _compute_group_exists_on_platform(
+                api, workspace_id, resolved_compute_group_id, display
             )
+            if on_platform is True:
+                display.print(
+                    "[dim]计算组不在本地缓存里，但平台确认它属于该工作空间，继续。"
+                    "（缓存已过期，可稍后 qzcli res -u 更新）[/dim]"
+                )
+            elif on_platform is None:
+                display.print(
+                    "[dim]计算组不在本地缓存里，且无法向平台确认；继续提交，"
+                    "由平台校验。[/dim]"
+                )
+            else:
+                display.print_error(
+                    f"计算组 '{args.compute_group}' 不属于当前工作空间 "
+                    f"'{ws_display or workspace_id}'（已向平台确认）"
+                )
             display.print(
                 "[dim]请重新选择计算组，或重试 create -i 以刷新当前工作空间快照[/dim]"
             )
@@ -6369,13 +6417,29 @@ def cmd_create(args):
             )
             is False
         ):
-            display.print_error(
-                f"计算组 '{args.compute_group}' 不属于当前工作空间 '{ws_display}'"
+            # 同上：缓存说「不属于」不能直接拒，新建的计算组必然还没进缓存。
+            on_platform = _compute_group_exists_on_platform(
+                api, workspace_id, compute_group_id, display
             )
-            display.print(
-                "[dim]请先运行 qzcli res -w <workspace> -u 刷新缓存，或改用正确的计算组 ID[/dim]"
-            )
-            return 1
+            if on_platform is True:
+                display.print(
+                    "[dim]计算组不在本地缓存里，但平台确认它属于该工作空间，继续。"
+                    "（缓存已过期，可稍后 qzcli res -u 更新）[/dim]"
+                )
+            elif on_platform is None:
+                display.print(
+                    "[dim]计算组不在本地缓存里，且无法向平台确认；继续提交，"
+                    "由平台校验。[/dim]"
+                )
+            else:
+                display.print_error(
+                    f"计算组 '{args.compute_group}' 不属于当前工作空间 "
+                    f"'{ws_display}'（已向平台确认）"
+                )
+                display.print(
+                    "[dim]请先运行 qzcli res -w <workspace> -u 刷新缓存，或改用正确的计算组 ID[/dim]"
+                )
+                return 1
     else:
         compute_group_id, cg_display = _auto_select_resource(
             workspace_id, "compute_groups"

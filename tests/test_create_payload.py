@@ -10,6 +10,7 @@ import io
 import json
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
+from unittest.mock import MagicMock
 from unittest import mock
 
 from qzcli import cli
@@ -101,7 +102,8 @@ class CreatePayloadTests(unittest.TestCase):
         patches = [
             mock.patch("qzcli.cli.get_api", return_value=api),
             mock.patch(
-                "qzcli.cli.get_store", return_value=mock.MagicMock(add_job=lambda *_: None)
+                "qzcli.cli.get_store",
+                return_value=mock.MagicMock(add_job=lambda *_: None),
             ),
             mock.patch(
                 "qzcli.cli.get_workspace_resources",
@@ -109,9 +111,7 @@ class CreatePayloadTests(unittest.TestCase):
             ),
             mock.patch("qzcli.cli.find_workspace_by_name", return_value="ws-test"),
             # Force cookie auth path so we exercise create_job_with_cookie.
-            mock.patch(
-                "qzcli.cli.get_cookie", return_value={"cookie": "fake-cookie"}
-            ),
+            mock.patch("qzcli.cli.get_cookie", return_value={"cookie": "fake-cookie"}),
             mock.patch(
                 "qzcli.cli._auto_select_resource",
                 return_value=("project-test", "p"),
@@ -123,9 +123,7 @@ class CreatePayloadTests(unittest.TestCase):
                 "qzcli.cli._validate_cached_resource_membership",
                 return_value=True,
             ),
-            mock.patch(
-                "qzcli.cli._validate_cached_spec_membership", return_value=True
-            ),
+            mock.patch("qzcli.cli._validate_cached_spec_membership", return_value=True),
         ]
         for p in patches:
             p.start()
@@ -146,7 +144,8 @@ class CreatePayloadTests(unittest.TestCase):
         # including any nested location.
         serialized = json.dumps(api.last_payload)
         self.assertNotIn(
-            "spec_id", serialized,
+            "spec_id",
+            serialized,
             f"Legacy spec_id field leaked into payload: {serialized}",
         )
 
@@ -170,7 +169,8 @@ class CreatePayloadTests(unittest.TestCase):
 
         # framework_config sibling keys still carry image/instance/shm.
         self.assertEqual(
-            cli.DEFAULT_CREATE_IMAGE, fc["image"],
+            cli.DEFAULT_CREATE_IMAGE,
+            fc["image"],
         )
         self.assertEqual(1, fc["instance_count"])
         self.assertEqual(cli.DEFAULT_CREATE_SHM, fc["shm_gi"])
@@ -225,16 +225,30 @@ class CreatePayloadTests(unittest.TestCase):
         calls = {"v1": 0, "v2": 0}
         _v1 = api.create_job_with_cookie
         _v2 = api.create_job_v2
-        api.create_job_with_cookie = lambda c, p: calls.__setitem__("v1", calls["v1"] + 1) or _v1(c, p)
-        api.create_job_v2 = lambda c, p: calls.__setitem__("v2", calls["v2"] + 1) or _v2(c, p)
+        api.create_job_with_cookie = lambda c, p: calls.__setitem__(
+            "v1", calls["v1"] + 1
+        ) or _v1(c, p)
+        api.create_job_v2 = lambda c, p: calls.__setitem__(
+            "v2", calls["v2"] + 1
+        ) or _v2(c, p)
         patches = [
             mock.patch("qzcli.cli.get_api", return_value=api),
-            mock.patch("qzcli.cli.get_store", return_value=mock.MagicMock(add_job=lambda *_: None)),
-            mock.patch("qzcli.cli.get_workspace_resources", side_effect=lambda w: _FAKE_RESOURCES.get(w)),
+            mock.patch(
+                "qzcli.cli.get_store",
+                return_value=mock.MagicMock(add_job=lambda *_: None),
+            ),
+            mock.patch(
+                "qzcli.cli.get_workspace_resources",
+                side_effect=lambda w: _FAKE_RESOURCES.get(w),
+            ),
             mock.patch("qzcli.cli.find_workspace_by_name", return_value="ws-test"),
             mock.patch("qzcli.cli.get_cookie", return_value={"cookie": "fake"}),
-            mock.patch("qzcli.cli._auto_select_resource", return_value=("project-test", "p")),
-            mock.patch("qzcli.cli._validate_cached_resource_membership", return_value=True),
+            mock.patch(
+                "qzcli.cli._auto_select_resource", return_value=("project-test", "p")
+            ),
+            mock.patch(
+                "qzcli.cli._validate_cached_resource_membership", return_value=True
+            ),
             mock.patch("qzcli.cli._validate_cached_spec_membership", return_value=True),
         ]
         for p in patches:
@@ -258,3 +272,66 @@ class CreatePayloadTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ComputeGroupStaleCacheTests(unittest.TestCase):
+    """计算组不在本地缓存时，不能拿过期缓存直接拒。
+
+    真实故障：新建的计算组（`lcg-6eea9db9` MOVA2.0纯交付分区）**真实存在、
+    正跑着千卡任务**，但因为还没进本地缓存，create 报
+    「计算组 ... 不属于当前工作空间」—— 这句话本身是错的，而且提示去
+    `res -u` 也未必解决。缓存总会过期，新建的组必然有这个窗口期。
+
+    正解：缓存说「没有」时跟平台再确认一次（`workspace ListLogicComputeGroups`
+    是权威来源、不依赖缓存），确认存在就放行。
+    """
+
+    def _api(self, groups=None, fail=False):
+        from qzcli.api import QzAPIError
+
+        api = MagicMock()
+
+        def fake_v2(service, action, body, **kw):
+            if fail:
+                raise QzAPIError("boom")
+            return {
+                "logic_compute_groups": [
+                    {"logic_compute_group_id": g} for g in (groups or [])
+                ]
+            }
+
+        api._request_v2 = fake_v2
+        return api
+
+    def test_group_on_platform_is_accepted(self):
+        """缓存里没有、但平台确认存在 → 放行。"""
+        from qzcli.cli import _compute_group_exists_on_platform
+
+        got = _compute_group_exists_on_platform(
+            self._api(groups=["lcg-real"]), "ws-1", "lcg-real"
+        )
+        self.assertIs(got, True)
+
+    def test_group_absent_on_platform_is_rejected(self):
+        """平台也说没有 → 确实该拒，别修成放行一切。"""
+        from qzcli.cli import _compute_group_exists_on_platform
+
+        got = _compute_group_exists_on_platform(
+            self._api(groups=["lcg-other"]), "ws-1", "lcg-fake"
+        )
+        self.assertIs(got, False)
+
+    def test_query_failure_is_inconclusive_not_rejection(self):
+        """查不了平台时返回 None（不确定）→ 上层放行让平台自己拒，
+        总好过拿过期缓存误伤一个真实存在的计算组。"""
+        from qzcli.cli import _compute_group_exists_on_platform
+
+        got = _compute_group_exists_on_platform(self._api(fail=True), "ws-1", "lcg-x")
+        self.assertIsNone(got)
+
+    def test_empty_platform_list_is_inconclusive(self):
+        """平台返回空列表可能是分页/权限问题，不能据此判定「不存在」。"""
+        from qzcli.cli import _compute_group_exists_on_platform
+
+        got = _compute_group_exists_on_platform(self._api(groups=[]), "ws-1", "lcg-x")
+        self.assertIsNone(got)
