@@ -5,6 +5,7 @@
 import functools
 import inspect
 import json as _json
+import re
 import random
 import sys
 import threading
@@ -300,6 +301,53 @@ _V2_FALLBACK_STATUS = frozenset({404, 405, 501, 502, 503, 504})
 
 # 跨进程重登锁：等锁的最长秒数。超时就放行去自己登 —— 宁可多登一次，
 # 也不能让命令挂死在这里（比如上一个持锁进程被 kill -9 没释放）。
+#: CAS 登录页上真正用来显示错误的容器。页面其余地方的文案一律不能当判据。
+_CAS_ERROR_RE = re.compile(
+    r'<[^>]*class="[^"]*form-error[^"]*"[^>]*>(.*?)</', re.I | re.S
+)
+_TAG_RE = re.compile(r"<[^>]+>")
+
+
+def _describe_cas_login_failure(html: str) -> str:
+    """从 CAS 登录页的 HTML 里读出**真实**的失败原因。
+
+    以前这里是 ``if "验证码" in resp.text: raise "需要输入验证码"``。
+    问题是 CAS 登录页**永远**含"验证码"三个字 —— 它有 5 处，全部来自旁边那个
+    「短信验证码登录」标签页的固定文案（``<h3>验证码登录</h3>``、
+    ``placeholder="验证码"``、``发送验证码``、``动态验证码``），其中那个图形
+    验证码 ``<img>`` 指向的还是 ``mapp.suda.edu.cn``（苏州大学），是模板里没清
+    干净的死代码，启智根本没在用。
+
+    于是**任何**退回登录页的失败都被翻译成"需要输入验证码，请在浏览器中登录"。
+    用户照着提示跑去浏览器，发现压根没有验证码可过；而真实原因（多半是短时间内
+    登录过于频繁被 CAS 挡回）完全没被说出来，反而诱导用户反复重试。
+
+    现在只认 ``<div class="form-error">`` 里的文案 —— 那才是页面真正展示错误的
+    地方。读不到就如实说读不到，不编。
+    """
+    match = _CAS_ERROR_RE.search(html or "")
+    detail = ""
+    if match:
+        detail = _TAG_RE.sub("", match.group(1))
+        detail = " ".join(detail.split()).strip()
+
+    if detail:
+        if "验证码" in detail:
+            return (
+                f"CAS 要求验证码：{detail}。请在浏览器登录后用 `qzcli cookie` 手动设置"
+            )
+        if "密码" in detail or "账号" in detail or "用户名" in detail:
+            return f"用户名或密码错误：{detail}"
+        return f"登录失败：{detail}"
+
+    # 页面没给文案。**别猜**——尤其别再说成验证码。
+    return (
+        "登录失败：CAS 把请求退回了登录页，但页面未给出具体原因。"
+        "常见于短时间内登录过于频繁被挡，稍等片刻通常自行恢复；"
+        "若持续失败，可在浏览器登录后用 `qzcli cookie <cookie>` 手动设置"
+    )
+
+
 _RELOGIN_LOCK_TIMEOUT_S = 60
 
 #: CAS 登录失败后的冷却期。期间任何重登请求直接复用上次的错误，不再打 CAS。
@@ -2614,12 +2662,7 @@ class QzAPI:
 
         # Step 6: 检查登录结果
         if "cas.sii.edu.cn" in current_url and "login" in current_url:
-            # 仍然在登录页，可能是密码错误
-            if "用户名或密码错误" in resp.text or "账号或密码错误" in resp.text:
-                raise QzAPIError("用户名或密码错误")
-            if "验证码" in resp.text:
-                raise QzAPIError("需要输入验证码，请在浏览器中登录后手动获取 cookie")
-            raise QzAPIError("登录失败，请检查用户名和密码")
+            raise QzAPIError(_describe_cas_login_failure(resp.text))
 
         # Step 7: 确保完成所有重定向回到启智平台
         current_host = urlparse(current_url).netloc

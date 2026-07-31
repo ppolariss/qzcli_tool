@@ -63,14 +63,23 @@ class _CountingAPI(QzAPI):
 
 
 class _SilentDisplay:
+    """收集所有输出的假 display。
+
+    用 ``__getattr__`` 兜住 print_warning / print_success 之类：真 display 的方法
+    集合会变，写死几个方法会让用例因为一个无关的新方法而 AttributeError。
+    """
+
     def __init__(self):
         self.lines = []
+        self.progress = None
 
-    def print(self, msg=""):
+    def print(self, msg="", *args, **kwargs):
         self.lines.append(str(msg))
 
-    def print_error(self, msg=""):
-        self.lines.append(str(msg))
+    def __getattr__(self, name):
+        if name.startswith("print"):
+            return self.print
+        raise AttributeError(name)
 
 
 def _reset_notice():
@@ -122,7 +131,7 @@ class ReloginFanoutTests(unittest.TestCase):
 
         如果被压成"未找到有效 cookie"，用户只会反复重试 login，把锁定期越拖越长。
         """
-        api = _CountingAPI(fail_with=QzAPIError("需要输入验证码，请在浏览器中登录"))
+        api = _CountingAPI(fail_with=QzAPIError("CAS 要求验证码"))
         display = _SilentDisplay()
         with sandbox_home(**_STALE):
             with self.assertRaises(QzAPIError) as ctx:
@@ -212,3 +221,119 @@ class ReloginFanoutTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AvailWithExpiredCookieTests(unittest.TestCase):
+    """``qzcli avail -w <ws>`` 在 cookie 过期时的端到端行为。
+
+    **这是这次事故里最刺眼的覆盖缺口。** ``cmd_avail`` 本来就有 5 个单测，
+    ``live_smoke`` 也跑它 —— 但**没有一个是在 cookie 过期的前提下跑的**：
+    那些用例要么喂了能用的 cookie，要么把 ``get_credentials`` patch 成空
+    （于是自动重登根本不会触发）。
+
+    结果就是"avail 能用"被测得很足，"avail 在登录态挂掉时会怎样"零覆盖 ——
+    而放大只发生在后者。用户第一次撞上时，我们连一条会红的用例都没有。
+    """
+
+    def setUp(self):
+        _reset_notice()
+
+    def _run_avail(self, api, display):
+        import argparse
+
+        args = argparse.Namespace(
+            workspace="ci",
+            nodes=None,
+            group=None,
+            low_priority=True,
+            export=False,
+            verbose=False,
+        )
+        with patch.object(cli, "get_display", return_value=display), patch.object(
+            cli, "get_api", return_value=api
+        ), patch.object(cli, "get_credentials", return_value=("u", "p")), patch.object(
+            cli, "find_workspace_by_name", return_value="ws-1"
+        ), patch.object(
+            cli,
+            "list_cached_workspaces",
+            return_value=[
+                {
+                    "id": "ws-1",
+                    "name": "ci-空间",
+                    "updated_at": 0,
+                    "project_count": 0,
+                    "compute_group_count": 6,
+                    "spec_count": 0,
+                }
+            ],
+        ), patch.object(
+            cli,
+            "get_workspace_resources",
+            return_value={
+                "name": "ci-空间",
+                "compute_groups": {
+                    f"lcg-{i}": {"id": f"lcg-{i}", "name": f"组{i}"} for i in range(6)
+                },
+                "projects": {},
+                "specs": {},
+            },
+        ), patch.object(
+            cli, "save_resources"
+        ), patch.object(
+            cli, "set_workspace_name"
+        ), patch.object(
+            cli, "save_cookie"
+        ):
+            return cli.cmd_avail(args)
+
+    def test_expired_cookie_does_not_stampede_cas(self):
+        """6 个计算组并发查询，cookie 全线 401 —— CAS 最多被打 1 次。
+
+        修复前这里会打 6 次以上，正是把账号推进验证码锁定的那个动作。
+        """
+
+        class _ExpiredAPI(_CountingAPI):
+            def list_node_dimension(self, workspace_id, cookie, **kwargs):
+                raise QzAPIError(
+                    "Cookie 已过期或无效，请运行 `qzcli login` 重新获取", 401
+                )
+
+            def list_task_dimension(self, workspace_id, cookie, **kwargs):
+                raise QzAPIError("Cookie 已过期或无效", 401)
+
+            def list_workspaces(self, cookie):
+                return [{"id": "ws-1", "name": "ci-空间"}]
+
+        api = _ExpiredAPI(fail_with=QzAPIError("CAS 要求验证码"))
+        display = _SilentDisplay()
+        with sandbox_home(**_STALE):
+            try:
+                self._run_avail(api, display)
+            except QzAPIError:
+                pass  # 登录过不去，命令失败是对的；这里只关心打了几次 CAS
+        self.assertLessEqual(
+            api.cas_calls, 1, f"cookie 过期时 CAS 被打了 {api.cas_calls} 次"
+        )
+
+    def test_captcha_message_is_shown_to_the_user(self):
+        """验证码提示必须出现在输出里 —— 用户据此才知道要去浏览器手工取 cookie。"""
+
+        class _ExpiredAPI(_CountingAPI):
+            def list_node_dimension(self, workspace_id, cookie, **kwargs):
+                raise QzAPIError("Cookie 已过期或无效", 401)
+
+            def list_task_dimension(self, workspace_id, cookie, **kwargs):
+                raise QzAPIError("Cookie 已过期或无效", 401)
+
+            def list_workspaces(self, cookie):
+                return [{"id": "ws-1", "name": "ci-空间"}]
+
+        api = _ExpiredAPI(fail_with=QzAPIError("CAS 要求验证码"))
+        display = _SilentDisplay()
+        with sandbox_home(**_STALE):
+            try:
+                self._run_avail(api, display)
+            except QzAPIError:
+                pass
+        joined = "\n".join(display.lines)
+        self.assertIn("验证码", joined, "用户看不到验证码提示就不知道下一步做什么")
