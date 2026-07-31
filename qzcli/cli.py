@@ -28,6 +28,7 @@ from .config import (
     init_config,
     list_cached_workspaces,
     load_all_resources,
+    mark_workspace_unavailable,
     load_config,
     load_create_interactive_snapshot,
     save_config,
@@ -196,6 +197,21 @@ def _format_percent(numerator: int, denominator: int) -> str:
     if denominator <= 0:
         return "-"
     return f"{(numerator / denominator) * 100:.1f}%"
+
+
+def _note_workspace_unavailable(workspace_id, exc):
+    """撞到「已禁用 / 无权限」时把工作空间标记掉，后续命令不再查它。
+
+    这些空间会从本地缓存被反复枚举，每次刷一屏 AccessForbidden 警告，
+    把真正的问题淹掉。标一次，之后静默跳过；`res -u` 重刷时清标记再验证。
+    """
+    if getattr(exc, "api_code", None) not in _UNAVAILABLE_API_CODES:
+        return False
+    mark_workspace_unavailable(workspace_id, str(exc))
+    return True
+
+
+_UNAVAILABLE_API_CODES = {"AccessForbidden", "Forbidden", "PermissionDenied"}
 
 
 def cmd_init(args):
@@ -1652,6 +1668,9 @@ def cmd_avail(args):
         except QzAPIError as e:
             if progress and progress_task_id is not None:
                 progress.advance(progress_task_id, len(compute_groups))
+            if _note_workspace_unavailable(workspace_id, e):
+                # 已禁用 / 无权限：标记后静默跳过，别刷屏
+                return workspace_id, [], ""
             return workspace_id, [], f"查询 {ws_name} 节点数据失败: {e}"
 
         workspace_results = []
@@ -2484,7 +2503,8 @@ def cmd_usage(args):
             if "401" in str(e) or "过期" in str(e):
                 display.print_error("Cookie 已过期，请重新设置: qzcli login")
                 return 1
-            display.print_warning(f"查询 {ws_name or workspace_id} 失败: {e}")
+            if not _note_workspace_unavailable(workspace_id, e):
+                display.print_warning(f"查询 {ws_name or workspace_id} 失败: {e}")
             continue
 
     if not all_stats:
@@ -6817,7 +6837,8 @@ def cmd_hpc_usage(args):
             if "401" in str(e) or "过期" in str(e):
                 display.print_error("Cookie 已过期，请重新设置: qzcli login")
                 return 1
-            display.print_warning(f"查询 {ws_name or workspace_id} 失败: {e}")
+            if not _note_workspace_unavailable(workspace_id, e):
+                display.print_warning(f"查询 {ws_name or workspace_id} 失败: {e}")
 
     return 0
 

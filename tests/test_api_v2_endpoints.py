@@ -513,3 +513,78 @@ class SpecsFromScheduleConfigTests(unittest.TestCase):
     def test_malformed_predef_json_does_not_crash(self):
         c = self._client_with(predef="{不是合法 JSON", jobs=[])
         self.assertEqual(c.list_specs("lcg-x", "ws-1"), [])
+
+
+class RateLimitTests(unittest.TestCase):
+    """429 限流。
+
+    真实故障：`qzcli avail`（不带 -w，并发扫全部工作空间）撞上 APISIX 限流，
+    返回 429 + HTML 错误页。旧逻辑先嗅 content-type、判成「返回非 JSON」→
+    被当成路由不通 → 回落 v1 → **平台正让你慢下来，我们却把请求量翻倍** →
+    v1 也 429 → 全线失败。
+    """
+
+    def setUp(self):
+        api._V2_FALLBACK_WARNED.clear()
+
+    def _resp429(self, retry_after=None):
+        r = _Resp(429, None, content_type="text/html")
+        r.text = '<html><p><em>Powered by <a href="https://apisix.apache.org">'
+        if retry_after:
+            r.headers["Retry-After"] = retry_after
+        return r
+
+    def test_429_raises_rate_limit_error_not_non_json(self):
+        """429 必须在 content-type 嗅探之前判掉，否则会被误当成路由不通。"""
+        with mock.patch.object(
+            api, "_curl_post", return_value=self._resp429()
+        ), mock.patch.object(api._time, "sleep"):
+            with self.assertRaises(api.QzRateLimitError) as cm:
+                _client()._request_v2("train", "ListJobs", {})
+        self.assertEqual(cm.exception.code, 429)
+
+    def test_429_never_falls_back_to_v1(self):
+        """回落 = 在被限流时把 QPS 翻倍，只会让限流更严重。"""
+        v1 = mock.Mock()
+
+        def v2():
+            raise api.QzRateLimitError("limited", 429)
+
+        with self.assertRaises(api.QzRateLimitError):
+            api._v2_then_v1("t", v2, v1)
+        v1.assert_not_called()
+
+    def test_429_is_retried_with_backoff(self):
+        calls = []
+
+        def flaky(url, **kw):
+            calls.append(1)
+            if len(calls) < 3:
+                return self._resp429()
+            return _Resp(200, {"Result": {"ok": 1}})
+
+        with mock.patch.object(api, "_curl_post", side_effect=flaky), mock.patch.object(
+            api._time, "sleep"
+        ) as slept:
+            out = _client()._request_v2("train", "ListJobs", {})
+
+        self.assertEqual(out, {"ok": 1})
+        self.assertEqual(len(calls), 3)
+        self.assertTrue(slept.called, "没有退避直接重试 = 继续打爆平台")
+
+    def test_retry_after_header_is_respected(self):
+        with mock.patch.object(
+            api, "_curl_post", return_value=self._resp429(retry_after="7")
+        ), mock.patch.object(api._time, "sleep") as slept:
+            with self.assertRaises(api.QzRateLimitError):
+                _client()._request_v2("train", "ListJobs", {})
+        waits = [c.args[0] for c in slept.call_args_list]
+        self.assertTrue(all(w >= 7 for w in waits), f"没听平台的 Retry-After: {waits}")
+
+    def test_retry_gives_up_eventually(self):
+        """一直 429 就该抛出去，不能无限重试（那也是一种放大）。"""
+        with mock.patch.object(
+            api, "_curl_post", return_value=self._resp429()
+        ), mock.patch.object(api._time, "sleep"):
+            with self.assertRaises(api.QzRateLimitError):
+                _client()._request_v2("train", "ListJobs", {})

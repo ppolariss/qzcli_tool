@@ -63,6 +63,69 @@ class QzAPIError(Exception):
         self.api_code = api_code
 
 
+class QzRateLimitError(QzAPIError):
+    """触发平台限流（HTTP 429）。
+
+    单独一个类型，是因为它的处置方式和其他错误**相反**：不能回落 v1（那会把
+    请求量翻倍、让限流更严重），只能退避重试。``retry_after`` 是平台给的
+    建议等待秒数（``Retry-After`` 头），没给就按指数退避。
+    """
+
+    def __init__(self, message, code=429, retry_after=None):
+        super().__init__(message, code)
+        self.retry_after = retry_after
+
+
+def _parse_retry_after(value):
+    """解析 ``Retry-After`` 头（只认秒数形式；HTTP-date 形式忽略）。"""
+    if not value:
+        return None
+    try:
+        seconds = float(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+    return seconds if seconds >= 0 else None
+
+
+def with_rate_limit_retry(method):
+    """遇到 429 时退避重试，而不是把错误抛给调用方或回落 v1。
+
+    为什么必须有：``qzcli avail`` 会对**每个工作空间 × 每个计算组**并发查询，
+    请求量很容易撞上 APISIX 的限流。此前的行为是把 429（HTML 错误页）误判成
+    「路由不通」进而回落 v1，等于在被限流时把 QPS 翻倍 —— 结果 v1 也 429，
+    全线失败。
+
+    退避：优先用平台给的 ``Retry-After``；否则 1s → 2s → 4s（叠加抖动，
+    避免大量并发线程同时醒来又一起撞上去）。
+    """
+
+    @functools.wraps(method)
+    def wrapper(*args, **kwargs):
+        last = None
+        for attempt in range(_RATE_LIMIT_MAX_TRIES):
+            try:
+                return method(*args, **kwargs)
+            except QzRateLimitError as exc:
+                last = exc
+                if attempt == _RATE_LIMIT_MAX_TRIES - 1:
+                    break
+                delay = exc.retry_after
+                if delay is None:
+                    delay = _backoff_delay(attempt, base=1.0, cap=8.0)
+                else:
+                    # 平台给的值也要加抖动，否则所有线程会同时醒来
+                    delay += random.uniform(0, 0.5)
+                _time.sleep(delay)
+        raise last
+
+    return wrapper
+
+
+# 429 退避重试次数。给得比较克制：撞限流时更该让整体慢下来，而不是每个调用
+# 都自己疯狂重试 —— 那又变成另一种放大。
+_RATE_LIMIT_MAX_TRIES = 4
+
+
 class QzTransientError(QzAPIError):
     """瞬时故障（SSL EOF、连接重置、5xx/代理抖动），值得重试。
 
@@ -251,6 +314,10 @@ def _v2_then_v1(name: str, v2_call, v1_call, *, logger=None):
     """
     try:
         return v2_call()
+    except QzRateLimitError:
+        # 限流**绝不回落** —— 回落等于在平台喊「慢点」时把请求量翻倍。
+        # 重试已经在 `with_rate_limit_retry` 里做过了，到这里就该让调用方看见。
+        raise
     except QzAPIError as exc:
         if not (exc.code in _V2_FALLBACK_STATUS or "非 JSON" in str(exc)):
             raise
@@ -411,6 +478,7 @@ class QzAPI:
 
         return result
 
+    @with_rate_limit_retry
     @with_auth_retry
     def _request_v2(
         self,
@@ -466,6 +534,19 @@ class QzAPI:
             raise QzAPIError(
                 "Cookie 已过期或无效，请运行 `qzcli login` 重新获取",
                 401,
+            )
+
+        # 429 必须在 content-type 嗅探**之前**判掉。APISIX 限流返回的是一张
+        # HTML 错误页（`Powered by apisix`），若先走嗅探就会被判成「返回非 JSON」
+        # → 被 `_v2_then_v1` 当成路由不通 → 回落 v1 → **平台正让你慢下来，
+        # 我们却把请求量翻倍**，限流只会更严重（实测 `qzcli avail` 扫全部工作空间
+        # 时全线 429）。
+        # 这里抛可重试错误，交给 `with_rate_limit_retry` 退避重试，**绝不回落**。
+        if response.status_code == 429:
+            raise QzRateLimitError(
+                "触发平台限流（HTTP 429）",
+                429,
+                retry_after=_parse_retry_after(response.headers.get("Retry-After")),
             )
 
         # 网关对未注册路由回的是 `404 page not found`（text/plain），要和
@@ -559,6 +640,12 @@ class QzAPI:
         response = _curl_post(url, json=payload, headers=headers, timeout=60)
         if response.status_code == 401:
             raise QzAPIError("Cookie 已过期或无效，请重新获取", 401)
+        if response.status_code == 429:
+            raise QzRateLimitError(
+                "触发平台限流（HTTP 429）",
+                429,
+                retry_after=_parse_retry_after(response.headers.get("Retry-After")),
+            )
         if response.status_code != 200:
             raise QzAPIError(
                 f"请求失败: HTTP {response.status_code}", response.status_code
@@ -643,6 +730,12 @@ class QzAPI:
         )
         if response.status_code == 401:
             raise QzAPIError("Cookie 已过期或无效，请重新获取", 401)
+        if response.status_code == 429:
+            raise QzRateLimitError(
+                "触发平台限流（HTTP 429）",
+                429,
+                retry_after=_parse_retry_after(response.headers.get("Retry-After")),
+            )
         if response.status_code != 200:
             raise QzAPIError(
                 f"请求失败: HTTP {response.status_code}", response.status_code
@@ -836,6 +929,12 @@ class QzAPI:
         response = _curl_post(url, json=payload, headers=headers, timeout=60)
         if response.status_code == 401:
             raise QzAPIError("Cookie 已过期或无效，请重新获取", 401)
+        if response.status_code == 429:
+            raise QzRateLimitError(
+                "触发平台限流（HTTP 429）",
+                429,
+                retry_after=_parse_retry_after(response.headers.get("Retry-After")),
+            )
         if response.status_code != 200:
             raise QzAPIError(
                 f"请求失败: HTTP {response.status_code}", response.status_code
@@ -856,6 +955,7 @@ class QzAPI:
         result = self._request("/openapi/v1/train_job/create", config)
         return result.get("data", result)
 
+    @with_rate_limit_retry
     @with_auth_retry
     def create_job_with_cookie(
         self, cookie: str, config: Dict[str, Any]
@@ -874,6 +974,12 @@ class QzAPI:
         response = _curl_post(url, json=config, headers=headers, timeout=60)
         if response.status_code == 401:
             raise QzAPIError("Cookie 已过期或无效，请重新获取", 401)
+        if response.status_code == 429:
+            raise QzRateLimitError(
+                "触发平台限流（HTTP 429）",
+                429,
+                retry_after=_parse_retry_after(response.headers.get("Retry-After")),
+            )
         if response.status_code != 200:
             raise QzAPIError(
                 f"请求失败: HTTP {response.status_code}", response.status_code
@@ -902,6 +1008,7 @@ class QzAPI:
             referer_path=f"/jobs/distributedTraining?spaceId={workspace_id}",
         )
 
+    @with_rate_limit_retry
     @with_auth_retry
     def create_hpc_job(
         self,
@@ -997,6 +1104,12 @@ class QzAPI:
         response = _curl_post(url, json=payload, headers=headers, timeout=60)
         if response.status_code == 401:
             raise QzAPIError("Cookie 已过期或无效，请重新获取", 401)
+        if response.status_code == 429:
+            raise QzRateLimitError(
+                "触发平台限流（HTTP 429）",
+                429,
+                retry_after=_parse_retry_after(response.headers.get("Retry-After")),
+            )
         if response.status_code != 200:
             raise QzAPIError(
                 f"请求失败: HTTP {response.status_code}", response.status_code
@@ -1137,6 +1250,12 @@ class QzAPI:
         if response.status_code == 401:
             raise QzAPIError("Cookie 已过期或无效，请重新获取", 401)
 
+        if response.status_code == 429:
+            raise QzRateLimitError(
+                "触发平台限流（HTTP 429）",
+                429,
+                retry_after=_parse_retry_after(response.headers.get("Retry-After")),
+            )
         if response.status_code != 200:
             raise QzAPIError(
                 f"请求失败: HTTP {response.status_code}", response.status_code
@@ -1252,6 +1371,12 @@ class QzAPI:
         if response.status_code == 401:
             raise QzAPIError("Cookie 已过期或无效，请重新获取", 401)
 
+        if response.status_code == 429:
+            raise QzRateLimitError(
+                "触发平台限流（HTTP 429）",
+                429,
+                retry_after=_parse_retry_after(response.headers.get("Retry-After")),
+            )
         if response.status_code != 200:
             raise QzAPIError(
                 f"请求失败: HTTP {response.status_code}", response.status_code
@@ -1372,6 +1497,12 @@ class QzAPI:
         if response.status_code == 401:
             raise QzAPIError("Cookie 已过期或无效，请重新获取", 401)
 
+        if response.status_code == 429:
+            raise QzRateLimitError(
+                "触发平台限流（HTTP 429）",
+                429,
+                retry_after=_parse_retry_after(response.headers.get("Retry-After")),
+            )
         if response.status_code != 200:
             raise QzAPIError(
                 f"请求失败: HTTP {response.status_code}", response.status_code
@@ -1819,6 +1950,12 @@ class QzAPI:
         if response.status_code == 401:
             raise QzAPIError("Cookie 已过期或无效，请重新获取", 401)
 
+        if response.status_code == 429:
+            raise QzRateLimitError(
+                "触发平台限流（HTTP 429）",
+                429,
+                retry_after=_parse_retry_after(response.headers.get("Retry-After")),
+            )
         if response.status_code != 200:
             raise QzAPIError(
                 f"请求失败: HTTP {response.status_code}", response.status_code
@@ -1929,6 +2066,12 @@ class QzAPI:
         if response.status_code == 401:
             raise QzAPIError("Cookie 已过期或无效，请重新获取", 401)
 
+        if response.status_code == 429:
+            raise QzRateLimitError(
+                "触发平台限流（HTTP 429）",
+                429,
+                retry_after=_parse_retry_after(response.headers.get("Retry-After")),
+            )
         if response.status_code != 200:
             raise QzAPIError(
                 f"请求失败: HTTP {response.status_code}", response.status_code
@@ -2006,6 +2149,12 @@ class QzAPI:
         if response.status_code == 401:
             raise QzAPIError("Cookie 已过期或无效，请重新获取", 401)
 
+        if response.status_code == 429:
+            raise QzRateLimitError(
+                "触发平台限流（HTTP 429）",
+                429,
+                retry_after=_parse_retry_after(response.headers.get("Retry-After")),
+            )
         if response.status_code != 200:
             raise QzAPIError(
                 f"请求失败: HTTP {response.status_code}", response.status_code
@@ -2023,6 +2172,7 @@ class QzAPI:
 
         return result.get("data", {})
 
+    @with_rate_limit_retry
     @with_auth_retry
     def list_workspaces(self, cookie: str) -> List[Dict[str, Any]]:
         """
@@ -2069,6 +2219,12 @@ class QzAPI:
         if response.status_code == 401:
             raise QzAPIError("Cookie 已过期或无效，请重新获取", 401)
 
+        if response.status_code == 429:
+            raise QzRateLimitError(
+                "触发平台限流（HTTP 429）",
+                429,
+                retry_after=_parse_retry_after(response.headers.get("Retry-After")),
+            )
         if response.status_code != 200:
             raise QzAPIError(
                 f"请求失败: HTTP {response.status_code}", response.status_code

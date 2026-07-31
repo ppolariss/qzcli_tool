@@ -16,6 +16,7 @@ v1→v2 迁移最典型的翻车是"接口通了但语义变了"（过滤被忽�
 from __future__ import annotations
 
 import argparse
+import subprocess
 import sys
 import time
 import traceback
@@ -405,6 +406,54 @@ def main() -> int:
         return f"total={r['total']}"
 
     _hpc()
+
+    # ---------------- CLI 默认形态 ----------------
+    # **这一段是补测试方法论漏洞加的。**
+    # 之前所有用例都在 API 层、且都显式指定单个 workspace，于是完美避开了
+    # 「不带 -w 时并发扫全部工作空间」这条默认路径 —— 而那才是用户实际敲的命令。
+    # 真实后果：`qzcli avail` 并发放大撞上 APISIX 限流全线 429，我一次都没测出来。
+    # 所以这里**跑真命令、用默认参数**，不再走 API 层捷径。
+    print("\n【CLI 默认形态 — 不带 -w，扫全部工作空间】")
+
+    def run_cli(*args, timeout=900):
+        proc = subprocess.run(
+            ["qzcli", *args], capture_output=True, text=True, timeout=timeout
+        )
+        return proc.returncode, proc.stdout + proc.stderr
+
+    @check("avail 默认形态", "qzcli avail")
+    def _cli_avail():
+        rc, out = run_cli("avail")
+        assert_true("429" not in out, "撞上限流 429 —— 并发放大没控制住")
+        assert_true(
+            "AccessForbidden" not in out,
+            "已禁用/无权限的工作空间没被跳过，噪声会盖住真问题",
+        )
+        assert_true("查询完成" in out, f"没有任何工作空间查询成功: {out[:200]}")
+        done = out.count("查询完成")
+        return f"{done} 个工作空间查询完成，无 429、无权限噪声"
+
+    _cli_avail()
+
+    @check("usage 默认形态", "qzcli usage")
+    def _cli_usage():
+        rc, out = run_cli("usage")
+        assert_true("429" not in out, "撞上限流 429")
+        assert_true("AccessForbidden" not in out, "权限噪声未清理")
+        return "无 429、无权限噪声"
+
+    _cli_usage()
+
+    @check("连续调用不触发限流", "qzcli avail ×3")
+    def _cli_repeat():
+        """限流是**累积**的：单次跑通不代表连续跑通。
+        agent 场景下同一命令会被反复调用。"""
+        for i in range(3):
+            rc, out = run_cli("avail")
+            assert_true("429" not in out, f"第 {i+1} 次就撞上 429")
+        return "连跑 3 次无 429"
+
+    _cli_repeat()
 
     # ---------------- 写操作 ----------------
     if args.submit:
