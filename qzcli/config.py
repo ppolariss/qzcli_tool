@@ -418,10 +418,18 @@ def get_workspace_resources(workspace_id: str) -> Optional[Dict[str, Any]]:
         workspace_id: 工作空间 ID
 
     Returns:
-        资源配置字典，或 None（未缓存）
+        资源配置字典，或 None（未缓存 / 缓存内容不可用）
+
+    Note:
+        缓存被写坏时（半截写入、手工编辑、老格式残留）这里的值可能不是 dict。
+        原样返回会让下游的 ``.get(...)`` 抛 ``AttributeError`` 把整条命令打崩 ——
+        而调用方全都按"None 表示没缓存"来处理，所以这种情况当作没缓存即可。
     """
     all_resources = load_all_resources()
-    return all_resources.get(workspace_id)
+    cached = all_resources.get(workspace_id)
+    if cached is not None and not isinstance(cached, dict):
+        return None
+    return cached
 
 
 def set_workspace_name(workspace_id: str, name: str) -> bool:
