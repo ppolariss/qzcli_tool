@@ -332,16 +332,58 @@ def save_resources(
         json.dump(all_resources, f, indent=2, ensure_ascii=False)
 
 
-def load_all_resources() -> Dict[str, Any]:
-    """加载所有工作空间的资源缓存"""
+def load_all_resources(include_unavailable: bool = False) -> Dict[str, Any]:
+    """加载所有工作空间的资源缓存。
+
+    默认**跳过标记为不可用的工作空间**（已禁用 / 当前账号无权限）。
+    ``avail`` / ``usage`` / ``hpc-usage`` 这些命令都从这里枚举工作空间，
+    不过滤的话每次都会去查这些空间、然后刷一屏
+    ``AccessForbidden: 该空间已被禁用`` 警告 —— 噪声盖住真正的问题。
+
+    标记由 ``mark_workspace_unavailable`` 在实际撞到权限错误时写入，
+    ``res -u`` 刷新时会重新验证。
+    """
     if not RESOURCES_FILE.exists():
         return {}
 
     try:
         with open(RESOURCES_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
+            data = json.load(f)
     except (json.JSONDecodeError, IOError):
         return {}
+
+    if include_unavailable:
+        return data
+    return {
+        ws_id: ws
+        for ws_id, ws in data.items()
+        if not (isinstance(ws, dict) and ws.get("unavailable"))
+    }
+
+
+def mark_workspace_unavailable(workspace_id: str, reason: str = "") -> None:
+    """把某个工作空间标记为不可用，后续多空间命令直接跳过它。
+
+    在实际撞到 ``AccessForbidden``（已禁用 / 无权限）时调用。这样"第一次遇到
+    才知道"，不用预先维护一份黑名单；``res -u`` 重刷时会清掉标记重新验证。
+    """
+    if not RESOURCES_FILE.exists():
+        return
+    try:
+        with open(RESOURCES_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, IOError):
+        return
+    ws = data.get(workspace_id)
+    if not isinstance(ws, dict) or ws.get("unavailable"):
+        return
+    ws["unavailable"] = True
+    ws["unavailable_reason"] = reason[:200]
+    try:
+        with open(RESOURCES_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+    except IOError:
+        pass
 
 
 def save_create_interactive_snapshot(snapshot: Dict[str, Any]) -> None:
