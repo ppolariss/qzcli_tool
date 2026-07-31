@@ -5,6 +5,7 @@
 import functools
 import inspect
 import json as _json
+import re
 import random
 import sys
 import threading
@@ -300,7 +301,116 @@ _V2_FALLBACK_STATUS = frozenset({404, 405, 501, 502, 503, 504})
 
 # 跨进程重登锁：等锁的最长秒数。超时就放行去自己登 —— 宁可多登一次，
 # 也不能让命令挂死在这里（比如上一个持锁进程被 kill -9 没释放）。
+#: CAS 登录页上真正用来显示错误的容器。页面其余地方的文案一律不能当判据。
+_CAS_ERROR_RE = re.compile(
+    r'<[^>]*class="[^"]*form-error[^"]*"[^>]*>(.*?)</', re.I | re.S
+)
+_TAG_RE = re.compile(r"<[^>]+>")
+
+
+def _describe_cas_login_failure(html: str) -> str:
+    """从 CAS 登录页的 HTML 里读出**真实**的失败原因。
+
+    以前这里是 ``if "验证码" in resp.text: raise "需要输入验证码"``。
+    问题是 CAS 登录页**永远**含"验证码"三个字 —— 它有 5 处，全部来自旁边那个
+    「短信验证码登录」标签页的固定文案（``<h3>验证码登录</h3>``、
+    ``placeholder="验证码"``、``发送验证码``、``动态验证码``），其中那个图形
+    验证码 ``<img>`` 指向的还是 ``mapp.suda.edu.cn``（苏州大学），是模板里没清
+    干净的死代码，启智根本没在用。
+
+    于是**任何**退回登录页的失败都被翻译成"需要输入验证码，请在浏览器中登录"。
+    用户照着提示跑去浏览器，发现压根没有验证码可过；而真实原因（多半是短时间内
+    登录过于频繁被 CAS 挡回）完全没被说出来，反而诱导用户反复重试。
+
+    现在只认 ``<div class="form-error">`` 里的文案 —— 那才是页面真正展示错误的
+    地方。读不到就如实说读不到，不编。
+    """
+    match = _CAS_ERROR_RE.search(html or "")
+    detail = ""
+    if match:
+        detail = _TAG_RE.sub("", match.group(1))
+        detail = " ".join(detail.split()).strip()
+
+    if detail:
+        if "验证码" in detail:
+            # CAS 平时不要验证码，是短时间内登录失败几次之后才临时打开的。
+            # 所以第一建议是"等几分钟重试"，而不是"去浏览器手工取 cookie"——
+            # 后者等于承认工具坏了；何况已保存的 cookie 通常还有效，
+            # 多数情况下根本不需要重新登录。
+            return (
+                f"CAS 暂时要求验证码：{detail}"
+                "（短时间内登录过于频繁会触发，等几分钟通常自行恢复）。"
+                "若已保存的 cookie 仍有效，无需重新登录即可继续使用"
+            )
+        if "密码" in detail or "账号" in detail or "用户名" in detail:
+            return f"用户名或密码错误：{detail}"
+        return f"登录失败：{detail}"
+
+    # 页面没给文案。**别猜**——尤其别再说成验证码。
+    return (
+        "登录失败：CAS 把请求退回了登录页，但页面未给出具体原因。"
+        "常见于短时间内登录过于频繁被挡，稍等片刻通常自行恢复；"
+        "若持续失败，可在浏览器登录后用 `qzcli cookie <cookie>` 手动设置"
+    )
+
+
 _RELOGIN_LOCK_TIMEOUT_S = 60
+
+#: CAS 登录失败后的冷却期。期间任何重登请求直接复用上次的错误，不再打 CAS。
+#:
+#: 光有互斥锁挡不住失败路径：登录失败时没有新 cookie 落盘，于是每个等在锁上的
+#: 线程/进程重读后都发现"还是旧的"，就各自再打一次 CAS。一条并发命令能打出十几次
+#: **失败**尝试 —— 而 CAS 正是按失败次数判定异常并延长验证码锁定的。
+#: 结果是自动重登把自己锁死，用户只能去浏览器手工取 cookie。
+_RELOGIN_COOLDOWN_S = 60
+_RELOGIN_COOLDOWN_FILE = ".relogin.cooldown"
+
+# 进程内的失败记忆。跨进程那份写在 CONFIG_DIR 下的冷却文件里。
+_relogin_failure_lock = threading.Lock()
+_relogin_failure = {"at": 0.0, "message": ""}
+
+
+def _cooldown_path():
+    return Path(CONFIG_DIR) / _RELOGIN_COOLDOWN_FILE
+
+
+def _recent_relogin_failure():
+    """返回冷却期内的上次失败信息（``str``），不在冷却期则返回 ``None``。"""
+    now = _time.time()
+    with _relogin_failure_lock:
+        if now - _relogin_failure["at"] < _RELOGIN_COOLDOWN_S:
+            return _relogin_failure["message"]
+    # 进程内没有记录时看看别的进程有没有刚失败过
+    try:
+        raw = _cooldown_path().read_text(encoding="utf-8")
+        at_str, _, message = raw.partition("\n")
+        if now - float(at_str) < _RELOGIN_COOLDOWN_S:
+            return message or "上一次自动登录失败"
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def _record_relogin_failure(message):
+    now = _time.time()
+    with _relogin_failure_lock:
+        _relogin_failure["at"] = now
+        _relogin_failure["message"] = message
+    try:
+        Path(CONFIG_DIR).mkdir(parents=True, exist_ok=True)
+        _cooldown_path().write_text(f"{now}\n{message}", encoding="utf-8")
+    except OSError:
+        pass  # 写不了冷却文件不该让命令失败，进程内那份仍然生效
+
+
+def _clear_relogin_failure():
+    with _relogin_failure_lock:
+        _relogin_failure["at"] = 0.0
+        _relogin_failure["message"] = ""
+    try:
+        _cooldown_path().unlink()
+    except OSError:
+        pass
 
 
 @contextmanager
@@ -432,10 +542,14 @@ class QzAPI:
     def _post(self, url: str, **kwargs) -> _CurlResponse:
         return _curl_post(url, **kwargs)
 
-    def _relogin(self) -> Optional[str]:
+    def _relogin(self, propagate_errors: bool = False) -> Optional[str]:
         """用本地凭据走 CAS 重新登录并持久化新 cookie。
 
         返回新 cookie 字符串；没有凭据或登录失败时返回 ``None``。
+
+        ``propagate_errors=True`` 时改为把 ``QzAPIError`` 抛出去而不是吞成
+        ``None`` —— 交互式命令需要这个，否则"需要输入验证码"这种**用户能据此
+        行动**的信息会被压成一句笼统的"未找到有效 cookie"。
 
         **并发保护是两层的，缺一不可**：
 
@@ -449,6 +563,12 @@ class QzAPI:
 
         拿到锁之后会**再读一次盘上的 cookie**：别的进程可能刚刚已经登好了，
         这时直接用它的结果，全程只发生一次 CAS 登录。
+
+        **失败路径需要单独处理**：登录失败时没有新 cookie 落盘，上面那个"重读"
+        判据就永远为假，于是每个等在锁上的线程/进程都会各自再打一次 CAS。一条并发
+        命令能打出十几次**失败**尝试 —— 而 CAS 正是按失败次数延长验证码锁定的，
+        等于自动重登把自己越锁越死。所以失败要记进冷却期（``_RELOGIN_COOLDOWN_S``），
+        期间直接复用上次的错误，不再碰 CAS。
         """
         if not (self._username and self._password):
             return None
@@ -462,10 +582,20 @@ class QzAPI:
                 current = (get_cookie() or {}).get("cookie")
                 if current and current != stale:
                     return current
+                # 刚失败过就别再打了 —— 重试只会把锁定期拖得更长
+                recent = _recent_relogin_failure()
+                if recent is not None:
+                    if propagate_errors:
+                        raise QzAPIError(recent)
+                    return None
                 try:
                     cookie = self.login_with_cas(self._username, self._password)
-                except QzAPIError:
+                except QzAPIError as exc:
+                    _record_relogin_failure(str(exc))
+                    if propagate_errors:
+                        raise
                     return None
+                _clear_relogin_failure()
                 save_cookie(cookie, (get_cookie() or {}).get("workspace_id", ""))
                 return cookie
 
@@ -2538,12 +2668,7 @@ class QzAPI:
 
         # Step 6: 检查登录结果
         if "cas.sii.edu.cn" in current_url and "login" in current_url:
-            # 仍然在登录页，可能是密码错误
-            if "用户名或密码错误" in resp.text or "账号或密码错误" in resp.text:
-                raise QzAPIError("用户名或密码错误")
-            if "验证码" in resp.text:
-                raise QzAPIError("需要输入验证码，请在浏览器中登录后手动获取 cookie")
-            raise QzAPIError("登录失败，请检查用户名和密码")
+            raise QzAPIError(_describe_cas_login_failure(resp.text))
 
         # Step 7: 确保完成所有重定向回到启智平台
         current_host = urlparse(current_url).netloc

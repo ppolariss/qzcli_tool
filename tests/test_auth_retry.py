@@ -1,8 +1,14 @@
 """Tests for cookie auto-relogin (P0) and CAS login retry-with-backoff (P1)."""
 
 import argparse
+import os
+import sys
 import unittest
 from unittest.mock import MagicMock, patch
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from support.sandbox import sandbox_home  # noqa: E402
 
 from qzcli import api as qz_api
 from qzcli.api import QzAPI, QzAPIError, QzTransientError, with_auth_retry
@@ -77,6 +83,16 @@ class WithAuthRetryDecoratorTests(unittest.TestCase):
 
 class ReloginTests(unittest.TestCase):
     """`QzAPI._relogin`: persist a fresh cookie via CAS, or no-op without creds."""
+
+    def setUp(self):
+        # _relogin 现在带失败冷却（进程内 + CONFIG_DIR 下的冷却文件）。
+        # 沙箱把冷却文件挪进临时目录，清理清掉进程内那份 —— 否则本机上一次真实
+        # 登录失败会让这些用例读到残留状态而变红（真踩过）。
+        self._sandbox = sandbox_home()
+        self._sandbox.__enter__()
+        self.addCleanup(self._sandbox.__exit__, None, None, None)
+        qz_api._clear_relogin_failure()
+        self.addCleanup(qz_api._clear_relogin_failure)
 
     def test_relogin_logs_in_and_persists(self):
         api = QzAPI(username="u", password="p")
@@ -211,6 +227,16 @@ class CrossProcessReloginLockTests(unittest.TestCase):
     **所有人一起被锁在外面**，连"自动重登"本身也失效。
     进程内的 threading.Lock 完全挡不住这个。
     """
+
+    def setUp(self):
+        # _relogin 现在带失败冷却（进程内 + CONFIG_DIR 下的冷却文件）。
+        # 沙箱把冷却文件挪进临时目录，清理清掉进程内那份 —— 否则本机上一次真实
+        # 登录失败会让这些用例读到残留状态而变红（真踩过）。
+        self._sandbox = sandbox_home()
+        self._sandbox.__enter__()
+        self.addCleanup(self._sandbox.__exit__, None, None, None)
+        qz_api._clear_relogin_failure()
+        self.addCleanup(qz_api._clear_relogin_failure)
 
     def _client(self, login_fn):
         import threading
