@@ -302,6 +302,62 @@ _V2_FALLBACK_STATUS = frozenset({404, 405, 501, 502, 503, 504})
 # 也不能让命令挂死在这里（比如上一个持锁进程被 kill -9 没释放）。
 _RELOGIN_LOCK_TIMEOUT_S = 60
 
+#: CAS 登录失败后的冷却期。期间任何重登请求直接复用上次的错误，不再打 CAS。
+#:
+#: 光有互斥锁挡不住失败路径：登录失败时没有新 cookie 落盘，于是每个等在锁上的
+#: 线程/进程重读后都发现"还是旧的"，就各自再打一次 CAS。一条并发命令能打出十几次
+#: **失败**尝试 —— 而 CAS 正是按失败次数判定异常并延长验证码锁定的。
+#: 结果是自动重登把自己锁死，用户只能去浏览器手工取 cookie。
+_RELOGIN_COOLDOWN_S = 60
+_RELOGIN_COOLDOWN_FILE = ".relogin.cooldown"
+
+# 进程内的失败记忆。跨进程那份写在 CONFIG_DIR 下的冷却文件里。
+_relogin_failure_lock = threading.Lock()
+_relogin_failure = {"at": 0.0, "message": ""}
+
+
+def _cooldown_path():
+    return Path(CONFIG_DIR) / _RELOGIN_COOLDOWN_FILE
+
+
+def _recent_relogin_failure():
+    """返回冷却期内的上次失败信息（``str``），不在冷却期则返回 ``None``。"""
+    now = _time.time()
+    with _relogin_failure_lock:
+        if now - _relogin_failure["at"] < _RELOGIN_COOLDOWN_S:
+            return _relogin_failure["message"]
+    # 进程内没有记录时看看别的进程有没有刚失败过
+    try:
+        raw = _cooldown_path().read_text(encoding="utf-8")
+        at_str, _, message = raw.partition("\n")
+        if now - float(at_str) < _RELOGIN_COOLDOWN_S:
+            return message or "上一次自动登录失败"
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def _record_relogin_failure(message):
+    now = _time.time()
+    with _relogin_failure_lock:
+        _relogin_failure["at"] = now
+        _relogin_failure["message"] = message
+    try:
+        Path(CONFIG_DIR).mkdir(parents=True, exist_ok=True)
+        _cooldown_path().write_text(f"{now}\n{message}", encoding="utf-8")
+    except OSError:
+        pass  # 写不了冷却文件不该让命令失败，进程内那份仍然生效
+
+
+def _clear_relogin_failure():
+    with _relogin_failure_lock:
+        _relogin_failure["at"] = 0.0
+        _relogin_failure["message"] = ""
+    try:
+        _cooldown_path().unlink()
+    except OSError:
+        pass
+
 
 @contextmanager
 def _relogin_file_lock():
@@ -432,10 +488,14 @@ class QzAPI:
     def _post(self, url: str, **kwargs) -> _CurlResponse:
         return _curl_post(url, **kwargs)
 
-    def _relogin(self) -> Optional[str]:
+    def _relogin(self, propagate_errors: bool = False) -> Optional[str]:
         """用本地凭据走 CAS 重新登录并持久化新 cookie。
 
         返回新 cookie 字符串；没有凭据或登录失败时返回 ``None``。
+
+        ``propagate_errors=True`` 时改为把 ``QzAPIError`` 抛出去而不是吞成
+        ``None`` —— 交互式命令需要这个，否则"需要输入验证码"这种**用户能据此
+        行动**的信息会被压成一句笼统的"未找到有效 cookie"。
 
         **并发保护是两层的，缺一不可**：
 
@@ -449,6 +509,12 @@ class QzAPI:
 
         拿到锁之后会**再读一次盘上的 cookie**：别的进程可能刚刚已经登好了，
         这时直接用它的结果，全程只发生一次 CAS 登录。
+
+        **失败路径需要单独处理**：登录失败时没有新 cookie 落盘，上面那个"重读"
+        判据就永远为假，于是每个等在锁上的线程/进程都会各自再打一次 CAS。一条并发
+        命令能打出十几次**失败**尝试 —— 而 CAS 正是按失败次数延长验证码锁定的，
+        等于自动重登把自己越锁越死。所以失败要记进冷却期（``_RELOGIN_COOLDOWN_S``），
+        期间直接复用上次的错误，不再碰 CAS。
         """
         if not (self._username and self._password):
             return None
@@ -462,10 +528,20 @@ class QzAPI:
                 current = (get_cookie() or {}).get("cookie")
                 if current and current != stale:
                     return current
+                # 刚失败过就别再打了 —— 重试只会把锁定期拖得更长
+                recent = _recent_relogin_failure()
+                if recent is not None:
+                    if propagate_errors:
+                        raise QzAPIError(recent)
+                    return None
                 try:
                     cookie = self.login_with_cas(self._username, self._password)
-                except QzAPIError:
+                except QzAPIError as exc:
+                    _record_relogin_failure(str(exc))
+                    if propagate_errors:
+                        raise
                     return None
+                _clear_relogin_failure()
                 save_cookie(cookie, (get_cookie() or {}).get("workspace_id", ""))
                 return cookie
 

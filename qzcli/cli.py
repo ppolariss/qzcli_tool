@@ -7,6 +7,7 @@ import argparse
 import re
 import shlex
 import sys
+import threading
 import time
 import unicodedata
 import uuid
@@ -3090,19 +3091,57 @@ def _is_auth_related_error(error: Exception) -> bool:
     return any(keyword in message for keyword in keywords)
 
 
+#: 进程内只提示一次"正在刷新 cookie"。并发扇出时 N 个线程都会走到这里，
+#: 但实际只会发生一次 CAS 登录（去重在 ``_relogin`` 里），所以提示也该只有一条。
+_REFRESH_NOTICE_LOCK = threading.Lock()
+_refresh_notice_shown = False
+
+
 def _refresh_cookie_for_interactive(api, display, workspace_id: str = "") -> str:
-    """使用已保存的 CAS 凭证自动刷新 cookie。"""
-    if not hasattr(api, "login_with_cas"):
-        return ""
+    """使用已保存的 CAS 凭证自动刷新 cookie。
 
-    username, password = get_credentials()
-    if not username or not password:
-        return ""
+    **必须走 ``api._relogin()``，不能自己调 ``login_with_cas``。**
 
-    display.print("[dim]检测到登录态失效，正在自动刷新 cookie...[/dim]")
-    cookie = api.login_with_cas(username, password)
-    saved = get_cookie() or {}
-    save_cookie(cookie, workspace_id=workspace_id or saved.get("workspace_id", ""))
+    这个函数被 ``_with_live_cookie`` 调用，而后者出现在 11 个命令里，其中
+    ``avail`` / ``usage`` / ``list -c`` 都是**并发扇出**的 —— 每个计算组一个线程。
+    以前这里直接调 ``login_with_cas``，等于绕开了 ``_relogin`` 的三层保护：
+    进程内锁、跨进程文件锁、以及"拿到锁后重读 cookie 看别人是否已登好"的去重。
+
+    结果就是 cookie 一过期，一条 ``qzcli avail`` 会朝 CAS 打出十几次并发登录，
+    **CAS 判定为异常行为并要求输入验证码，然后连自动重登本身也失效** ——
+    账号被锁在外面，只能去浏览器手工取 cookie。
+
+    v0.4.1 加的锁只覆盖了 ``_relogin`` 和 ``qzcli login`` 两条路，恰恰漏掉了这条
+    最常触发的。这里补上。
+    """
+    global _refresh_notice_shown
+
+    relogin = getattr(api, "_relogin", None)
+    if relogin is None:
+        # 测试里的假 API 可能没有 _relogin，退回老路径（单线程场景不会放大）
+        if not hasattr(api, "login_with_cas"):
+            return ""
+        username, password = get_credentials()
+        if not username or not password:
+            return ""
+        display.print("[dim]检测到登录态失效，正在自动刷新 cookie...[/dim]")
+        cookie = api.login_with_cas(username, password)
+        saved = get_cookie() or {}
+        save_cookie(cookie, workspace_id=workspace_id or saved.get("workspace_id", ""))
+        return cookie
+
+    with _REFRESH_NOTICE_LOCK:
+        if not _refresh_notice_shown:
+            display.print("[dim]检测到登录态失效，正在自动刷新 cookie...[/dim]")
+            _refresh_notice_shown = True
+
+    # propagate_errors：把"需要输入验证码"这类用户能据此行动的信息透出去，
+    # 而不是压成一句笼统的"未找到有效 cookie"。
+    cookie = relogin(propagate_errors=True)
+    if not cookie:
+        return ""
+    if workspace_id:
+        save_cookie(cookie, workspace_id=workspace_id)
     return cookie
 
 
