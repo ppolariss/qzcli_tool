@@ -441,6 +441,8 @@ def _availability_result(
 def qz_auth_login(
     username: str = "", password: str = "", workspace_id: str = ""
 ) -> dict[str, Any]:
+    # 在做任何事之前先记下当前 cookie，作为下面 _relogin 的去重基准（原因见那里）
+    baseline_cookie = (get_cookie() or {}).get("cookie")
     if not username or not password:
         cfg_user, cfg_pwd = get_credentials()
         username = username or cfg_user
@@ -455,7 +457,22 @@ def qz_auth_login(
             "\n  - ~/.qzcli/config.json 的 username / password 字段(可加密)"
         )
     api = get_api()
-    cookie = api.login_with_cas(username, password)
+    # 必须走 _relogin，不能直连 login_with_cas —— 后者绕开进程内锁、跨进程文件锁、
+    # 失败冷却和"别人刚登好就复用"的去重。多 agent 通过 MCP 并发调本工具是常态，
+    # 裸连会让 N 个 agent 同时撞 CAS，触发验证码把所有人一起锁在外面。
+    #
+    # cmd_login 修过、_refresh_cookie_for_interactive 修过，这里是同一个坑的第三处。
+    relogin = getattr(api, "_relogin", None)
+    if relogin is not None:
+        api._username, api._password = username, password
+        # 基准要在**进入登录流程之前**取：别人若在这之后登好了，盘上就会不等于它，
+        # _relogin 直接复用那份结果。取晚了会读到别人刚写的新 cookie，反而判成
+        # "没人刷新过"而多登一次。
+        cookie = relogin(propagate_errors=True, failing_cookie=baseline_cookie)
+        if not cookie:
+            raise RuntimeError("登录失败：未能获取有效 cookie")
+    else:
+        cookie = api.login_with_cas(username, password)
     save_cookie(cookie, workspace_id)
     cookie_names = [
         segment.split("=", 1)[0].strip()

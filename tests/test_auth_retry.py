@@ -25,8 +25,11 @@ class WithAuthRetryDecoratorTests(unittest.TestCase):
             self.relogin_calls = 0
             self.cookies_seen = []
 
-        def _relogin(self):
+        def _relogin(self, propagate_errors=False, failing_cookie=None):
+            # 签名要跟真 QzAPI._relogin 保持一致：with_auth_retry 会把"刚刚失败的
+            # 那个 cookie"传进来当去重基准（见 test_relogin_dedup.py）。
             self.relogin_calls += 1
+            self.last_failing_cookie = failing_cookie
             return self._relogin_result
 
         @with_auth_retry

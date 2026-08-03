@@ -18,6 +18,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 from . import __version__
 from .api import (
     QzAPIError,
+    _clear_relogin_failure,
     _relogin_file_lock,
     build_resource_spec_price,
     get_api,
@@ -2213,7 +2214,7 @@ def fetch_all_task_dimensions(api, workspace_id, cookie, page_size=200, max_work
     化都不依赖任务顺序），避免逐页串行的高延迟。
     """
     first = api.list_task_dimension(
-        workspace_id, cookie, page_num=1, page_size=page_size
+        workspace_id, _live_cookie_for_paging(cookie), page_num=1, page_size=page_size
     )
     tasks = list(first.get("task_dimensions", []))
     total = first.get("total", 0) or 0
@@ -2226,7 +2227,10 @@ def fetch_all_task_dimensions(api, workspace_id, cookie, page_size=200, max_work
 
     def _fetch(page_num):
         return api.list_task_dimension(
-            workspace_id, cookie, page_num=page_num, page_size=page_size
+            workspace_id,
+            _live_cookie_for_paging(cookie),
+            page_num=page_num,
+            page_size=page_size,
         ).get("task_dimensions", [])
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -3174,6 +3178,21 @@ def _with_live_cookie(api, display, fn, workspace_id: str = ""):
             refreshed = True
 
 
+def _live_cookie_for_paging(fallback: str) -> str:
+    """分页 / 循环调用里取当前 cookie —— **不要闭包一个字符串**。
+
+    盘上那份是唯一事实来源。某一页触发自动重登后，新 cookie 会被写回磁盘；下一页
+    从磁盘取就自动用上了新的，不会再拿着已经失效的那个去白撞 401。
+
+    这是 inspire-skill 那套「凭据是可变对象、重登后原地刷新」的等价做法 ——
+    它靠对象引用让持有者自动看到新值，我们靠"每次回源读盘"达到同样效果，
+    不必把 qzcli 全链路的 cookie 字符串改造成对象。
+
+    读不到盘上 cookie 时退回入参，保持原行为（比如测试里直接传字符串的场景）。
+    """
+    return _get_cookie_value() or fallback
+
+
 def _fetch_all_node_dimensions(
     api,
     workspace_id: str,
@@ -3187,7 +3206,7 @@ def _fetch_all_node_dimensions(
     def _fetch_page(page_num: int) -> Dict[str, Any]:
         return api.list_node_dimension(
             workspace_id,
-            cookie,
+            _live_cookie_for_paging(cookie),
             logic_compute_group_id=logic_compute_group_id,
             compute_group_id=compute_group_id,
             page_num=page_num,
@@ -3235,7 +3254,7 @@ def _fetch_all_jobs_with_cookie(
     while True:
         data = api.list_jobs_with_cookie(
             workspace_id,
-            cookie,
+            _live_cookie_for_paging(cookie),
             page_num=page_num,
             page_size=page_size,
             created_by=created_by,
@@ -7828,6 +7847,9 @@ def cmd_login(args):
 
         # 保存 cookie
         save_cookie(cookie, workspace_id=args.workspace)
+        # 登录成功就清掉失败冷却，与 api._relogin 的收尾一致。少了这一步，手工
+        # `qzcli login` 成功之后的 60s 内，自动重登仍会被上一次失败的冷却挡着。
+        _clear_relogin_failure()
 
         display.print_success("登录成功！Cookie 已保存")
 
