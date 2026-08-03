@@ -84,6 +84,18 @@ _ENV_TO_CLEAR = (
     "QZCLI_USERNAME",
     "QZCLI_PASSWORD",
     "QZCLI_BASE_URL",
+    # 代理变量同样要清。开发机上常年挂着 Clash 之类（ALL_PROXY=socks5h://…:7897），
+    # 不清的话 get_proxy() 会读到它，代理相关用例的结果就因人而异 —— 在我机器上
+    # 绿、在 CI 上红，或者反过来。真踩到过：一条断言"无代理时 get_proxy 返回空"
+    # 的用例，在本机拿到了 shell 里的 Clash 地址。
+    "ALL_PROXY",
+    "all_proxy",
+    "HTTPS_PROXY",
+    "https_proxy",
+    "HTTP_PROXY",
+    "http_proxy",
+    "NO_PROXY",
+    "no_proxy",
 )
 
 

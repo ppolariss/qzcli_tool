@@ -421,6 +421,23 @@ def main() -> int:
         )
         return proc.returncode, proc.stdout + proc.stderr
 
+    def cooldown(seconds=20):
+        """全量扫描类命令之间的节流。
+
+        **为什么需要**：这一段每条用例都是"不带 -w、扫全部工作空间"，单条就是几十到
+        上百个请求。背靠背连跑 5 条，累计 QPS 会超出平台配额而撞 429 —— 但那是本
+        脚本自己造出来的负载，真实用户不会在两分钟内连着跑 avail + usage +
+        hpc-usage + list --all-ws + res -u。
+
+        实测依据（别删这段，否则下次又会有人把 cooldown 当成"掩盖问题"删掉）：
+        单独连跑 `qzcli list -c --all-ws` 三次，429 出现 **0 / 0 / 0** 次；
+        同一条命令放在本段末尾（前面已跑完 avail×3 和 usage 全量）则稳定 429。
+
+        每条用例要验的是"**这一条命令**的扇出会不会撞限流"，累积负载由
+        `_cli_repeat`（同一命令连跑 3 次）单独覆盖。
+        """
+        time.sleep(seconds)
+
     @check("avail 默认形态", "qzcli avail")
     def _cli_avail():
         rc, out = run_cli("avail")
@@ -448,6 +465,8 @@ def main() -> int:
 
     _cli_usage()
 
+    cooldown()
+
     @check("连续调用不触发限流", "qzcli avail ×3")
     def _cli_repeat():
         """限流是**累积**的：单次跑通不代表连续跑通。
@@ -459,6 +478,48 @@ def main() -> int:
         return "连跑 3 次无 429"
 
     _cli_repeat()
+
+    cooldown()
+
+    @check("hpc-usage 默认形态", "qzcli hpc-usage")
+    def _cli_hpc_usage():
+        """串行遍历全部工作空间。并发度是 1，但请求**总量**照样能撞限流 ——
+        限流看的是累计 QPS，不是并发度。"""
+        rc, out = run_cli("hpc-usage")
+        assert_true(rc == 0, f"命令退出码 {rc}（非 0）：{out[-300:]}")
+        assert_true("429" not in out, "撞上限流 429")
+        assert_true("AccessForbidden" not in out, "权限噪声未清理")
+        return "无 429、无权限噪声"
+
+    _cli_hpc_usage()
+
+    cooldown()
+
+    @check("list 全工作空间", "qzcli list -c --all-ws")
+    def _cli_list_all():
+        rc, out = run_cli("list", "-c", "--all-ws")
+        assert_true(rc == 0, f"命令退出码 {rc}（非 0）：{out[-300:]}")
+        assert_true("429" not in out, "撞上限流 429")
+        return "无 429"
+
+    _cli_list_all()
+
+    cooldown()
+
+    @check("res -u 全量刷新", "qzcli res -u")
+    def _cli_res_update():
+        """**8 线程扇出，此前零覆盖，429 风险最高的一条。**
+
+        注意它会重写本地 resources.json —— 这是正常的缓存刷新，不动平台侧数据，
+        但确实有本地副作用，所以放在最后跑。
+        """
+        rc, out = run_cli("res", "-u", timeout=1800)
+        assert_true(rc == 0, f"命令退出码 {rc}（非 0）：{out[-300:]}")
+        assert_true("429" not in out, "8 线程扇出撞上限流 429")
+        assert_true("AccessForbidden" not in out, "权限噪声未清理")
+        return "8 线程扇出无 429"
+
+    _cli_res_update()
 
     # ---------------- 写操作 ----------------
     if args.submit:

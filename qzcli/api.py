@@ -812,12 +812,25 @@ class QzAPI:
         return result if raw else _unwrap_v2_result(result)
 
     def get_job_detail(self, job_id: str) -> Dict[str, Any]:
-        """查询任务详情（使用 cookie 认证，优先于 token）"""
+        """查询任务详情（使用 cookie 认证，优先于 token）
+
+        **限流不回落**：``QzRateLimitError`` 直接抛出去，不去打 v1 openapi。
+
+        以前这里是裸 ``except QzAPIError: pass``，而 ``QzRateLimitError`` 是
+        ``QzAPIError`` 的子类 —— 于是 429 被静默吞掉、转头再打一发 v1，
+        等于平台喊"慢点"的时候把请求量翻倍。``_v2_then_v1`` 里明令禁止过这件事，
+        但这是另一条独立路径，当时没一起改。
+
+        实测后果：``qzcli list -c --all-ws``（每个工作空间 5 线程扇出批量查详情）
+        在全量形态下稳定撞 429 —— 是 live_smoke 补上"默认形态"用例之后才暴露的。
+        """
         cookie_data = get_cookie()
         cookie = cookie_data.get("cookie") if cookie_data else None
         if cookie:
             try:
                 return self.get_job_detail_with_cookie(job_id, cookie)
+            except QzRateLimitError:
+                raise
             except QzAPIError:
                 pass
         result = self._request("/openapi/v1/train_job/detail", {"job_id": job_id})
