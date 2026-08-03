@@ -1379,7 +1379,14 @@ def qz_create_job(
     )
 
 
-@server.tool()
+@server.tool(
+    description=(
+        "提交 HPC / CPU 任务（Slurm 类作业，非 GPU 训练任务）。"
+        "注意 HPC 的 priority 方向与训练任务**相反**：数字越大优先级越高"
+        "（1→LOW(11)、5→HIGH(30)、10→HIGH(35)，有效范围 1-10），"
+        "而训练任务是 10=低优。默认 1(LOW)，与生产 HPC 任务一致。"
+    )
+)
 def qz_create_hpc_job(
     name: str,
     entrypoint: str,
@@ -1502,7 +1509,13 @@ def qz_create_hpc_job(
     )
 
 
-@server.tool()
+@server.tool(
+    description=(
+        "查询 HPC 节点利用率（CPU 分区的空闲/繁忙节点分布）。"
+        "不指定 workspace 时会遍历全部已缓存的工作空间。"
+        "与 GPU 的 qz_get_availability 是两套资源，别混用。"
+    )
+)
 def qz_get_hpc_usage(
     workspace: str = "",
     compute_group: str = "",
