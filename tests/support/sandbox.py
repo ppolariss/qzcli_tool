@@ -45,6 +45,21 @@ from qzcli import api, cli, config
 # 算出来的"真实 HOME"就是沙箱自己，自检会把每一条都误判成漏网。
 _REAL_HOME = Path(os.path.expanduser("~")).resolve()
 
+
+def real_home():
+    """沙箱**之外**的真实 HOME。
+
+    自检类用例（"确认没写到用户真实目录"）必须用它，**不能**在沙箱里现算
+    ``Path.home()`` / ``os.path.expanduser("~")`` —— 那时 ``$HOME`` 已经被指向
+    沙箱，算出来的"真实 HOME"就是沙箱自己，于是自检要么恒假绿、要么把沙箱文件
+    误报成泄漏。
+
+    这个坑已经踩过两次（``config_paths_are_sandboxed`` 一次、``jobs.json``
+    隔离自检一次），所以在这里固化成一个函数，别再各自 expanduser。
+    """
+    return _REAL_HOME
+
+
 # config.py 里所有由 CONFIG_DIR 派生的模块级常量。新增常量时必须同步加到这里，
 # 否则该常量会绕过沙箱指向真实 HOME。相对路径写法便于在沙箱里重建。
 _CONFIG_PATH_ATTRS = {
