@@ -13,7 +13,11 @@ from pathlib import Path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from support import cache_states  # noqa: E402
-from support.sandbox import config_paths_are_sandboxed, sandbox_home  # noqa: E402
+from support.sandbox import (  # noqa: E402
+    config_paths_are_sandboxed,
+    real_home,
+    sandbox_home,
+)
 
 from qzcli import api, cli, config  # noqa: E402
 
@@ -90,7 +94,7 @@ class SandboxIsolationTests(unittest.TestCase):
 
         这是计划里点名要的那条 —— 直接比对目录内容，不依赖前面几条的推理。
         """
-        real_dir = Path(os.path.expanduser("~")) / ".qzcli"
+        real_dir = real_home() / ".qzcli"
         if not real_dir.exists():
             self.skipTest("本机没有 ~/.qzcli，跳过")
 

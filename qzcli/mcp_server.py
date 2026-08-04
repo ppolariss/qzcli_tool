@@ -441,6 +441,8 @@ def _availability_result(
 def qz_auth_login(
     username: str = "", password: str = "", workspace_id: str = ""
 ) -> dict[str, Any]:
+    # 在做任何事之前先记下当前 cookie，作为下面 _relogin 的去重基准（原因见那里）
+    baseline_cookie = (get_cookie() or {}).get("cookie")
     if not username or not password:
         cfg_user, cfg_pwd = get_credentials()
         username = username or cfg_user
@@ -455,7 +457,22 @@ def qz_auth_login(
             "\n  - ~/.qzcli/config.json 的 username / password 字段(可加密)"
         )
     api = get_api()
-    cookie = api.login_with_cas(username, password)
+    # 必须走 _relogin，不能直连 login_with_cas —— 后者绕开进程内锁、跨进程文件锁、
+    # 失败冷却和"别人刚登好就复用"的去重。多 agent 通过 MCP 并发调本工具是常态，
+    # 裸连会让 N 个 agent 同时撞 CAS，触发验证码把所有人一起锁在外面。
+    #
+    # cmd_login 修过、_refresh_cookie_for_interactive 修过，这里是同一个坑的第三处。
+    relogin = getattr(api, "_relogin", None)
+    if relogin is not None:
+        api._username, api._password = username, password
+        # 基准要在**进入登录流程之前**取：别人若在这之后登好了，盘上就会不等于它，
+        # _relogin 直接复用那份结果。取晚了会读到别人刚写的新 cookie，反而判成
+        # "没人刷新过"而多登一次。
+        cookie = relogin(propagate_errors=True, failing_cookie=baseline_cookie)
+        if not cookie:
+            raise RuntimeError("登录失败：未能获取有效 cookie")
+    else:
+        cookie = api.login_with_cas(username, password)
     save_cookie(cookie, workspace_id)
     cookie_names = [
         segment.split("=", 1)[0].strip()
@@ -1362,7 +1379,14 @@ def qz_create_job(
     )
 
 
-@server.tool()
+@server.tool(
+    description=(
+        "提交 HPC / CPU 任务（Slurm 类作业，非 GPU 训练任务）。"
+        "注意 HPC 的 priority 方向与训练任务**相反**：数字越大优先级越高"
+        "（1→LOW(11)、5→HIGH(30)、10→HIGH(35)，有效范围 1-10），"
+        "而训练任务是 10=低优。默认 1(LOW)，与生产 HPC 任务一致。"
+    )
+)
 def qz_create_hpc_job(
     name: str,
     entrypoint: str,
@@ -1485,7 +1509,13 @@ def qz_create_hpc_job(
     )
 
 
-@server.tool()
+@server.tool(
+    description=(
+        "查询 HPC 节点利用率（CPU 分区的空闲/繁忙节点分布）。"
+        "不指定 workspace 时会遍历全部已缓存的工作空间。"
+        "与 GPU 的 qz_get_availability 是两套资源，别混用。"
+    )
+)
 def qz_get_hpc_usage(
     workspace: str = "",
     compute_group: str = "",

@@ -168,11 +168,17 @@ def with_auth_retry(method):
         except QzAPIError as exc:
             if exc.code != 401 or not getattr(self, "_auto_relogin", True):
                 raise
-            new_cookie = self._relogin()
+            # 把**刚刚失败的那个 cookie** 交给 _relogin 当去重基准。少了它，
+            # 调用方攥着旧 cookie 反复调用时（典型是分页循环），每次都会被判成
+            # "还没人刷新过"而重新走一遍 CAS —— N 页 N 次登录。
+            bound = sig.bind(self, *args, **kwargs) if takes_cookie else None
+            if bound is not None:
+                bound.apply_defaults()
+            failing_cookie = bound.arguments.get("cookie") if bound else None
+            new_cookie = self._relogin(failing_cookie=failing_cookie)
             if not new_cookie:
                 raise
             if takes_cookie:
-                bound = sig.bind(self, *args, **kwargs)
                 bound.arguments["cookie"] = new_cookie
                 return method(*bound.args, **bound.kwargs)
             return method(self, *args, **kwargs)
@@ -542,7 +548,11 @@ class QzAPI:
     def _post(self, url: str, **kwargs) -> _CurlResponse:
         return _curl_post(url, **kwargs)
 
-    def _relogin(self, propagate_errors: bool = False) -> Optional[str]:
+    def _relogin(
+        self,
+        propagate_errors: bool = False,
+        failing_cookie: Optional[str] = None,
+    ) -> Optional[str]:
         """用本地凭据走 CAS 重新登录并持久化新 cookie。
 
         返回新 cookie 字符串；没有凭据或登录失败时返回 ``None``。
@@ -572,15 +582,27 @@ class QzAPI:
         """
         if not (self._username and self._password):
             return None
-        stale = (get_cookie() or {}).get("cookie")
+        # 去重基准：**刚刚失败的那个 cookie**，而不是"我进函数时盘上是什么"。
+        #
+        # 用后者会漏掉一整类场景：调用方（比如分页循环）把 cookie 闭包了，别人已经
+        # 刷新过、盘上早就是新的，但它手里还攥着旧的。这时 stale == current，
+        # 判据认为"没人刷新过"，于是又打一次完整 CAS —— N 页就是 N 次登录，
+        # 而 CAS 正是按登录次数判定异常并锁验证码。
+        #
+        # 不传 failing_cookie 时退化为原行为（读盘取基准），向后兼容。
+        baseline = (
+            failing_cookie
+            if failing_cookie is not None
+            else (get_cookie() or {}).get("cookie")
+        )
         with self._relogin_lock:
             current = (get_cookie() or {}).get("cookie")
-            if current and current != stale:
+            if current and current != baseline:
                 return current  # 同进程其他线程已经刷新过了
             with _relogin_file_lock():
                 # 拿到跨进程锁后重读：可能别的进程已经登好了
                 current = (get_cookie() or {}).get("cookie")
-                if current and current != stale:
+                if current and current != baseline:
                     return current
                 # 刚失败过就别再打了 —— 重试只会把锁定期拖得更长
                 recent = _recent_relogin_failure()
@@ -790,12 +812,25 @@ class QzAPI:
         return result if raw else _unwrap_v2_result(result)
 
     def get_job_detail(self, job_id: str) -> Dict[str, Any]:
-        """查询任务详情（使用 cookie 认证，优先于 token）"""
+        """查询任务详情（使用 cookie 认证，优先于 token）
+
+        **限流不回落**：``QzRateLimitError`` 直接抛出去，不去打 v1 openapi。
+
+        以前这里是裸 ``except QzAPIError: pass``，而 ``QzRateLimitError`` 是
+        ``QzAPIError`` 的子类 —— 于是 429 被静默吞掉、转头再打一发 v1，
+        等于平台喊"慢点"的时候把请求量翻倍。``_v2_then_v1`` 里明令禁止过这件事，
+        但这是另一条独立路径，当时没一起改。
+
+        实测后果：``qzcli list -c --all-ws``（每个工作空间 5 线程扇出批量查详情）
+        在全量形态下稳定撞 429 —— 是 live_smoke 补上"默认形态"用例之后才暴露的。
+        """
         cookie_data = get_cookie()
         cookie = cookie_data.get("cookie") if cookie_data else None
         if cookie:
             try:
                 return self.get_job_detail_with_cookie(job_id, cookie)
+            except QzRateLimitError:
+                raise
             except QzAPIError:
                 pass
         result = self._request("/openapi/v1/train_job/detail", {"job_id": job_id})
@@ -2383,10 +2418,16 @@ class QzAPI:
 
     @with_rate_limit_retry
     @with_auth_retry
-    @with_rate_limit_retry
-    @with_auth_retry
     def _project_list_items(self, cookie: str = "") -> List[Dict[str, Any]]:
-        """``POST /api/v1/project/list`` → ``data.items``。"""
+        """``POST /api/v1/project/list`` → ``data.items``。
+
+        ``cookie`` 省略时**从磁盘兜底**，与 ``_request_v2`` 同构。少了这一步，
+        ``list_projects_raw()`` 这种不传 cookie 的调用会把空串塞进 header ——
+        必然 401，于是触发一次纯属浪费的完整 CAS 登录，然后才重试成功。
+        ``qzcli create`` 的项目归属复核每次都走这里，也就每次都白登一次。
+        """
+        if not cookie:
+            cookie = (get_cookie() or {}).get("cookie", "")
         url = f"{self.base_url}/api/v1/project/list"
 
         payload = {"page": 1, "page_size": 100, "filter": {}}
