@@ -210,6 +210,50 @@ def get_session_id() -> str:
     return _AUTO_SESSION_ID
 
 
+#: 不显式 ``--priority`` 时用的优先级。数字越小越低优（1/3→LOW、4→NORMAL、
+#: 9/10→HIGH，实测 1494 个真实任务，跨全部工作空间一致）。
+#:
+#: 取 3（LOW）而不是 10：不指定优先级的多半是调试 / 试跑 / 脚本随手提的任务，
+#: 让它默认拿最高优去抢生产的卡是不合理的默认。
+FALLBACK_DEFAULT_PRIORITY = 3
+
+
+def get_default_priority() -> int:
+    """``qzcli create`` 不带 ``--priority`` 时用哪个优先级。
+
+    **这是一个可覆盖的默认值，不是硬编码。** 历史上这里是 10（最高优），改成 3
+    对「原来不写 --priority、靠默认拿高优」的脚本是行为变更 —— 那些任务会从直接
+    跑变成排队。所以给一条不用改调用点就能恢复原状的路：
+
+    优先级顺序（与 ``get_session_id`` / ``get_credentials`` 同构）：
+
+    1. 环境变量 ``QZCLI_DEFAULT_PRIORITY``
+    2. ``~/.qzcli/.env`` 里的 ``QZCLI_DEFAULT_PRIORITY``
+    3. ``config.json`` 的 ``default_priority``
+    4. 兜底 ``FALLBACK_DEFAULT_PRIORITY``（3）
+
+    要恢复旧行为，加一行 ``QZCLI_DEFAULT_PRIORITY=10`` 即可。
+
+    非法值（非整数、超出 1-10）一律忽略并回落到兜底值 —— 配错了不该让提交失败，
+    但也不能拿一个平台会拒的值去提交。
+    """
+    config = load_config()
+    env_file_values = load_env_file()
+    raw = (
+        os.environ.get("QZCLI_DEFAULT_PRIORITY")
+        or env_file_values.get("QZCLI_DEFAULT_PRIORITY")
+        or config.get("default_priority")
+        or ""
+    )
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return FALLBACK_DEFAULT_PRIORITY
+    if 1 <= value <= 10:
+        return value
+    return FALLBACK_DEFAULT_PRIORITY
+
+
 def init_config(
     username: str, password: str, api_base_url: Optional[str] = None
 ) -> None:
@@ -220,6 +264,42 @@ def init_config(
     if api_base_url:
         config["api_base_url"] = api_base_url
     save_config(config)
+
+
+def _atomic_write_json(path: Path, data: Any) -> None:
+    """原子写 JSON：先写同目录临时文件，再 ``os.replace`` 换上去。
+
+    **不能直接 ``open(path, "w")`` 再 dump。** 那样在截断和写完之间有一个窗口，
+    文件是空的或半截的；并发读的进程/线程这时 ``json.load`` 会失败，而各个读取点
+    都把失败当成"没有这个文件"处理。
+
+    真实后果（实测复现）：8 个并发登录里偶发 2 次真实 CAS 登录 —— 因为某个线程
+    在这个窗口里读 cookie 拿到 ``None``，于是重登去重判据失效、又打了一次 CAS。
+    在别处则可能表现为莫名其妙的「未设置 cookie」。
+
+    ``os.replace`` 在同一文件系统上是原子的，读者要么看到旧内容、要么看到新内容，
+    不会看到中间态。
+    """
+    # 临时文件名必须**每次调用唯一**。只用 PID 是不够的 —— 同一进程的多个线程
+    # 会撞同一个名字，然后互相把对方还没 replace 的临时文件删掉
+    # （我第一版就这么写的，8 线程并发直接 FileNotFoundError）。
+    # mkstemp 由内核保证唯一，且建在同目录下以确保 os.replace 是同文件系统的原子操作。
+    import tempfile
+
+    fd, tmp_name = tempfile.mkstemp(prefix=path.name + ".tmp.", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_name, path)
+    except BaseException:
+        # 只在失败时清理；成功路径上临时文件已经被 replace 掉了
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
 
 
 def get_token_cache() -> Optional[Dict[str, Any]]:
@@ -252,8 +332,7 @@ def save_token_cache(token: str, expires_in: int) -> None:
         "expires_at": time.time() + expires_in,
     }
 
-    with open(TOKEN_CACHE_FILE, "w", encoding="utf-8") as f:
-        json.dump(cache, f)
+    _atomic_write_json(TOKEN_CACHE_FILE, cache)
 
 
 def clear_token_cache() -> None:
@@ -274,8 +353,7 @@ def save_cookie(cookie: str, workspace_id: str = "") -> None:
         "saved_at": time.time(),
     }
 
-    with open(COOKIE_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
+    _atomic_write_json(COOKIE_FILE, data)
 
 
 def get_cookie() -> Optional[Dict[str, Any]]:

@@ -24,20 +24,22 @@ from .api import (
     get_api,
 )
 from .config import (
-    CONFIG_DIR,
     clear_cookie,
+    CONFIG_DIR,
+    FALLBACK_DEFAULT_PRIORITY,
     find_resource_by_name,
     find_workspace_by_name,
     get_cookie,
     get_credentials,
+    get_default_priority,
     get_session_id,
     get_workspace_resources,
     init_config,
     list_cached_workspaces,
     load_all_resources,
-    mark_workspace_unavailable,
     load_config,
     load_create_interactive_snapshot,
+    mark_workspace_unavailable,
     save_config,
     save_cookie,
     save_create_interactive_snapshot,
@@ -104,7 +106,12 @@ DEFAULT_CREATE_SHM = 1200
 #: 默认取 3（LOW）而不是 10：不显式指定优先级的多半是调试 / 试跑 / 脚本随手提的
 #: 任务，用最高优去和别人的生产任务抢卡是不合理的默认。要抢卡请显式写
 #: ``--priority``，让这件事是个明确的决定而不是默认副作用。
-DEFAULT_CREATE_PRIORITY = 3
+#:
+#: **这个值可以被覆盖**（``QZCLI_DEFAULT_PRIORITY`` / ``.env`` / ``config.json``
+#: 的 ``default_priority``），见 ``config.get_default_priority``。改默认值对
+#: 「原来不写 --priority 靠默认拿高优」的老脚本是行为变更，得给一条不改调用点
+#: 就能恢复原状的路。
+DEFAULT_CREATE_PRIORITY = FALLBACK_DEFAULT_PRIORITY
 DEFAULT_CREATE_FRAMEWORK = "pytorch"
 
 
@@ -6485,7 +6492,14 @@ def cmd_create(args):
     if args.shm is None:
         args.shm = DEFAULT_CREATE_SHM
     if args.priority is None:
-        args.priority = DEFAULT_CREATE_PRIORITY
+        args.priority = get_default_priority()
+        # 行为变过（曾经默认 10=最高优），就不能悄悄变 —— 明确说清用了什么、
+        # 怎么改。否则老脚本会从"直接跑"变成"排队"而用户找不到原因。
+        display.print(
+            f"[dim]未指定 --priority，使用默认 {args.priority}"
+            f"（{'LOW' if args.priority <= 3 else 'NORMAL' if args.priority <= 4 else 'HIGH'}）。"
+            f"需要更高优先级请显式 --priority，或设 QZCLI_DEFAULT_PRIORITY[/dim]"
+        )
     if args.framework is None:
         args.framework = DEFAULT_CREATE_FRAMEWORK
 
