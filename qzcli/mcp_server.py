@@ -1198,7 +1198,7 @@ def qz_create_job(
     image_type: str = "SOURCE_PRIVATE",
     instances: int = 1,
     shm: int = 1200,
-    priority: int = 10,
+    priority: int = 3,  # 数字越小越低优；默认 LOW，别拿最高优抢生产的卡
     framework: str = "pytorch",
     track: bool = True,
 ) -> dict[str, Any]:
