@@ -483,9 +483,15 @@ class SpecsFromScheduleConfigTests(unittest.TestCase):
 
     def test_gpu_type_filled_from_job_history(self):
         """predef_train_spec 的 gpu_type 常为空，但平台校验要完整型号串，
-        用历史任务按 quota_id 补上。"""
+        用历史任务按 quota_id 补上。
+
+        fixture 里的任务必须带 logic_compute_group_id —— 真实任务都有，而且补
+        gpu_type 时**只认目标计算组的历史**（规格是工作空间级的，同一个 quota_id
+        在别的组跑过不代表卡型一样，见 test_spec_gpu_type_scope.py）。
+        """
         jobs = [
             {
+                "logic_compute_group_id": "lcg-brand-new",
                 "framework_config": [
                     {
                         "instance_spec_price_info": {
@@ -493,7 +499,7 @@ class SpecsFromScheduleConfigTests(unittest.TestCase):
                             "gpu_info": {"gpu_type": "NVIDIA_H200_SXM_141G"},
                         }
                     }
-                ]
+                ],
             }
         ]
         c = self._client_with(predef=self.PREDEF, jobs=jobs)
