@@ -2,7 +2,7 @@
 
 ## 病理
 
-``predef_train_spec`` 里的 ``gpu_type`` 常为空，``_fill_gpu_type_from_history``
+``predef_train_spec`` 里的 ``gpu_type`` 常为空，``_fill_missing_gpu_type``
 负责从历史任务里补。但它**只按 quota_id 匹配，不看任务跑在哪个计算组**。
 
 而规格是**工作空间级**的（同一个 quota_id 对该空间任一计算组都可用），所以
@@ -50,7 +50,7 @@ class GpuTypeScopeTests(unittest.TestCase):
         api = QzAPI(username="u", password="p")
         specs = [{"id": _SPEC_ID, "gpu_type": ""}]
         with patch.object(api, "list_jobs_with_cookie", return_value={"jobs": jobs}):
-            api._fill_gpu_type_from_history(specs, "ws-1", compute_group_id)
+            api._fill_missing_gpu_type(specs, "ws-1", compute_group_id)
         return specs[0]["gpu_type"]
 
     def test_does_not_borrow_gpu_type_from_another_compute_group(self):
@@ -86,3 +86,68 @@ class GpuTypeScopeTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class GpuTypeFromComputeGroupNodesTests(unittest.TestCase):
+    """本组历史里查不到时，用**该计算组节点上的真实卡型**兜底。
+
+    只按计算组过滤历史是不够的：新组、或者该 spec 在本组还没跑过时，历史里
+    根本没有对应记录，于是 gpu_type 留空。而平台校验 payload 时要完整型号串 ——
+    留空可能被直接拒。
+
+    实测这就是「训练区-H200-1号机房」+「8卡160核」的处境：本组历史里没有这个
+    quota_id，但**该组 180 个节点全是 NVIDIA_H200_SXM_141G**。节点信息是权威
+    来源，比历史任务可靠得多 —— 卡型是机器的属性，不是任务的属性。
+    """
+
+    def _fill(self, jobs, nodes, compute_group_id=_TARGET_LCG):
+        api = QzAPI(username="u", password="p")
+        specs = [{"id": _SPEC_ID, "gpu_type": ""}]
+        with patch.object(
+            api, "list_jobs_with_cookie", return_value={"jobs": jobs}
+        ), patch.object(
+            api, "list_node_dimension", return_value={"node_dimensions": nodes}
+        ):
+            api._fill_missing_gpu_type(specs, "ws-1", compute_group_id)
+        return specs[0]["gpu_type"]
+
+    def _node(self, gpu_type):
+        return {"gpu_info": {"gpu_type": gpu_type}}
+
+    def test_falls_back_to_node_gpu_type(self):
+        """历史查不到 → 用本组节点的卡型。修复前这里会留空。"""
+        self.assertEqual(
+            self._fill([], [self._node("NVIDIA_H200_SXM_141G")] * 3),
+            "NVIDIA_H200_SXM_141G",
+        )
+
+    def test_history_wins_over_nodes(self):
+        """本组历史里有就用历史 —— 那是这个 spec 实际用过的型号，更精确。"""
+        jobs = [_job(_TARGET_LCG, _SPEC_ID, "NVIDIA_H100_SXM_80G")]
+        self.assertEqual(
+            self._fill(jobs, [self._node("NVIDIA_H200_SXM_141G")]),
+            "NVIDIA_H100_SXM_80G",
+        )
+
+    def test_picks_the_dominant_type_in_a_mixed_group(self):
+        """混合卡型的组取多数派，不被个别异类带偏。"""
+        nodes = [self._node("NVIDIA_H200_SXM_141G")] * 5 + [
+            self._node("NVIDIA_H100_SXM_80G")
+        ]
+        self.assertEqual(self._fill([], nodes), "NVIDIA_H200_SXM_141G")
+
+    def test_leaves_empty_when_nodes_give_nothing(self):
+        """节点也问不出来就留空 —— 让平台报错，好过瞎猜。"""
+        self.assertEqual(self._fill([], []), "")
+
+    def test_node_query_failure_is_not_fatal(self):
+        """查节点失败不能让整个规格解析崩掉。"""
+        api = QzAPI(username="u", password="p")
+        specs = [{"id": _SPEC_ID, "gpu_type": ""}]
+        from qzcli.api import QzAPIError
+
+        with patch.object(
+            api, "list_jobs_with_cookie", return_value={"jobs": []}
+        ), patch.object(api, "list_node_dimension", side_effect=QzAPIError("boom")):
+            api._fill_missing_gpu_type(specs, "ws-1", _TARGET_LCG)
+        self.assertEqual(specs[0]["gpu_type"], "")

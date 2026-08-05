@@ -1918,7 +1918,7 @@ class QzAPI:
 
         注意 ``gpu_type`` 在这里常常是空串；而平台校验 ``resource_spec_price``
         时要求完整型号串（如 ``NVIDIA_H200_SXM_141G``）。所以缺型号时会回头用
-        历史任务补 —— 见 ``_fill_gpu_type_from_history``。
+        历史任务或计算组节点补 —— 见 ``_fill_missing_gpu_type``。
         """
         try:
             cfg = self._request_v2(
@@ -1961,10 +1961,36 @@ class QzAPI:
                 }
             )
         if specs:
-            self._fill_gpu_type_from_history(specs, workspace_id, compute_group_id)
+            self._fill_missing_gpu_type(specs, workspace_id, compute_group_id)
         return specs
 
-    def _fill_gpu_type_from_history(
+    def _compute_group_gpu_type(self, workspace_id: str, compute_group_id: str) -> str:
+        """目标计算组节点上的卡型（取多数派）。
+
+        **卡型是机器的属性，不是任务的属性** —— 所以直接问节点，比从历史任务里
+        反推可靠得多，对没跑过任务的新计算组也一样有效。
+
+        问不出来就返回空串；调用方据此留空，让平台去报错。
+        """
+        try:
+            data = self.list_node_dimension(
+                workspace_id,
+                "",
+                logic_compute_group_id=compute_group_id,
+                page_size=100,
+            )
+        except QzAPIError:
+            return ""
+        counts: Dict[str, int] = {}
+        for node in data.get("node_dimensions") or []:
+            gtype = (node.get("gpu_info") or {}).get("gpu_type")
+            if gtype:
+                counts[gtype] = counts.get(gtype, 0) + 1
+        if not counts:
+            return ""
+        return max(counts.items(), key=lambda kv: kv[1])[0]
+
+    def _fill_missing_gpu_type(
         self,
         specs: List[Dict[str, Any]],
         workspace_id: str,
@@ -1987,6 +2013,11 @@ class QzAPI:
         "好过我们瞎猜一个型号"要避免的事。
 
         ``compute_group_id`` 为空时不过滤（维持旧行为，向后兼容）。
+
+        **历史查不到时用该计算组节点上的真实卡型兜底。** 只过滤不兜底会让新组、
+        或该 spec 在本组还没跑过的情况留空，而平台校验要完整型号串 —— 留空可能
+        被直接拒。实测「训练区-H200-1号机房」+「8卡160核」正是这个处境：本组历史
+        里没有这个 quota_id，但该组 180 个节点全是 ``NVIDIA_H200_SXM_141G``。
         """
         missing = {s["id"] for s in specs if not s.get("gpu_type")}
         if not missing:
@@ -2013,6 +2044,14 @@ class QzAPI:
         for s in specs:
             if not s.get("gpu_type") and s["id"] in found:
                 s["gpu_type"] = found[s["id"]]
+
+        # 历史补不到的，退而问该计算组的节点 —— 卡型是机器属性，节点才是权威来源
+        still_missing = [s for s in specs if not s.get("gpu_type")]
+        if still_missing and compute_group_id:
+            gtype = self._compute_group_gpu_type(workspace_id, compute_group_id)
+            if gtype:
+                for s in still_missing:
+                    s["gpu_type"] = gtype
 
     def _specs_from_job_history(
         self, compute_group_id: str, workspace_id: str, page_size: int = 200

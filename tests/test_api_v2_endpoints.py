@@ -458,7 +458,7 @@ class SpecsFromScheduleConfigTests(unittest.TestCase):
         '"cpu_count":150,"gpu_count":8,"memory_size":1500,"gpu_type":""}]'
     )
 
-    def _client_with(self, predef=None, jobs=None):
+    def _client_with(self, predef=None, jobs=None, nodes=None):
         c = _client()
 
         def fake_v2(service, action, body, **kw):
@@ -468,6 +468,10 @@ class SpecsFromScheduleConfigTests(unittest.TestCase):
 
         c._request_v2 = fake_v2
         c.list_jobs_with_cookie = lambda *a, **k: {"jobs": jobs or []}
+        # 历史补不到 gpu_type 时会退而问计算组节点；这里默认给空，
+        # 让「补不到就留空」那条用例保持原意。想测节点兜底的用例见
+        # test_spec_gpu_type_scope.py。
+        c.list_node_dimension = lambda *a, **k: {"node_dimensions": nodes or []}
         c._request = mock.Mock(side_effect=QzAPIError("404", 404))
         return c
 
