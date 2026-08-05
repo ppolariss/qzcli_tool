@@ -1951,6 +1951,22 @@ class QzAPI:
             spec_id = it.get("id") or it.get("cellId")
             if not spec_id:
                 continue
+            # **归属用平台给的，不要自己假设。**
+            #
+            # 这里以前写的是 ``[compute_group_id]`` —— 即把工作空间级的整张规格表
+            # 无差别地当成"每个计算组都能用"。平台不认这个假设：拿别的分区的规格去
+            # 提交会被直接拒（``quota_id ... does not belong to
+            # logic_compute_group ...``）。
+            #
+            # 而 ``predef_train_spec`` 每条记录**本来就带 logic_compute_group_ids**，
+            # 明确说了它属于哪些计算组。实测 5/5 与平台的接受/拒绝完全吻合。
+            #
+            # 后果不只是列表不准：自动选规格挑的是 GPU 数最小的那个，而小规格恰恰
+            # 常常属于开发分区 —— 于是在训练分区上 ``qzcli create`` 不带 ``--spec``
+            # 会选中一个必被拒的规格。
+            owned = it.get("logic_compute_group_ids") or []
+            if compute_group_id and owned and compute_group_id not in owned:
+                continue  # 这条规格不属于目标计算组，别列出来误导用户
             specs.append(
                 {
                     "id": spec_id,
@@ -1960,10 +1976,15 @@ class QzAPI:
                     "cpu_count": it.get("cpu_count") or 0,
                     "memory_size_gib": it.get("memory_size") or 0,
                     "gpu_type": it.get("gpu_type") or "",
-                    # 规格是工作空间级的，对该空间任一计算组都可用
+                    # 平台没给归属时才回落到"假定属于目标组"（老数据 / 新分区）
                     "logic_compute_group_ids": (
-                        [compute_group_id] if compute_group_id else []
+                        list(owned)
+                        if owned
+                        else ([compute_group_id] if compute_group_id else [])
                     ),
+                    # 平台对该规格允许的优先级档位。训练分区上的散卡规格通常是
+                    # ['low'] —— 拿它提高优会被拒。空列表表示不限制。
+                    "allowed_priority_levels": it.get("allowed_priority_levels") or [],
                 }
             )
         if specs:
