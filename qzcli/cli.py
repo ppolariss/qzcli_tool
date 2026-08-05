@@ -4388,13 +4388,41 @@ def _lookup_spec_for_payload(
         normalized = _normalize_spec_item(raw, compute_group_id) if raw else None
         return normalized or {}
 
+    def _belongs_to_target_group(spec: Dict[str, Any]) -> bool:
+        """这条缓存记录是不是给**目标计算组**缓存的。
+
+        规格是工作空间级的，同一个 id 在别的计算组缓存过 —— 直接拿来用会把那边的
+        ``gpu_type`` 带进 payload。实测向「训练区-H200-1号机房」提交时，缓存里那条
+        8卡160核 归属的是开发区-H100-183核，于是 payload 写成
+        ``NVIDIA_H100_SXM_80G``，而目标组 180 个节点全是 H200。
+
+        **这比报错更糟**：任务会一直排队等一种该组里不存在的卡，看起来"成功进入
+        排队"，实际永远起不来。
+
+        没有归属字段时返回 True（维持旧行为）—— 判不出来不等于不属于，
+        这跟缓存残缺矩阵那条纪律一致：缓存无从判断时放行，别造假错误。
+
+        **必须看原始缓存记录，不能看规范化之后的。** ``_normalize_spec_item``
+        会把目标计算组当 fallback 注入进去，规范化之后再判断就永远为真。
+        """
+        if not compute_group_id:
+            return True
+        cached = get_workspace_resources(workspace_id) or {}
+        raw = (cached.get("specs") or {}).get(spec_id) or {}
+        owned = raw.get("logic_compute_group_ids") or (
+            [raw["logic_compute_group_id"]] if raw.get("logic_compute_group_id") else []
+        )
+        if not owned:
+            return True  # 缓存没说归属，无从判断 → 放行
+        return compute_group_id in owned
+
     spec_obj = _read_normalized_spec(workspace_id, spec_id)
     has_resource_fields = bool(
         spec_obj.get("cpu_count")
         or spec_obj.get("gpu_count")
         or spec_obj.get("memory_gb")
     )
-    if has_resource_fields:
+    if has_resource_fields and _belongs_to_target_group(spec_obj):
         return spec_obj
 
     # 缓存里没有可用的 cpu/gpu/mem 字段，尝试一次实时刷新。
