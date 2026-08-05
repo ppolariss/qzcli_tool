@@ -1281,7 +1281,7 @@ class QzAPI:
         ``priority`` 是**必填**：平台后来加了这个校验，不传直接被拒
         （``API 请求失败: priority must be set``），导致 `qzcli hpc` 整个不可用。
 
-        ⚠️ **HPC 的优先级方向和训练任务相反，别照抄。** 实测提交值→平台档位：
+        实测提交值→平台档位：
 
         ==========  ==========  ======
         提交值       存储值       档位
@@ -1293,9 +1293,15 @@ class QzAPI:
         ==========  ==========  ======
 
         即**数字越大优先级越高**；有效范围 1–10（0/11/12 会被拒
-        ``无效的优先级值``）。而训练任务的 ``task_priority`` 是反的 ——
-        那边 10 表示低优。所以这里默认取 **1（LOW）**，与集群上现有生产
-        HPC 任务一致（它们存储值都是 11/LOW），不抢资源。
+        ``无效的优先级值``）。
+
+        **训练任务是同一个方向**（此前这里写着"训练任务是反的、10 表示低优"，
+        是错的，且那条错误还进过 v0.4.4 的发布说明）。实测训练任务：
+        1→11 LOW、3→13 LOW、4→20 NORMAL、9→34 HIGH、10→35 HIGH ——
+        与上表逐档吻合。
+
+        所以这里默认取 **1（LOW）**，与集群上现有生产 HPC 任务一致
+        （它们存储值都是 11/LOW），不抢资源。
 
         Returns:
             API 响应 data 字段（含 job_id 等）
@@ -1918,7 +1924,7 @@ class QzAPI:
 
         注意 ``gpu_type`` 在这里常常是空串；而平台校验 ``resource_spec_price``
         时要求完整型号串（如 ``NVIDIA_H200_SXM_141G``）。所以缺型号时会回头用
-        历史任务补 —— 见 ``_fill_gpu_type_from_history``。
+        历史任务或计算组节点补 —— 见 ``_fill_missing_gpu_type``。
         """
         try:
             cfg = self._request_v2(
@@ -1945,6 +1951,22 @@ class QzAPI:
             spec_id = it.get("id") or it.get("cellId")
             if not spec_id:
                 continue
+            # **归属用平台给的，不要自己假设。**
+            #
+            # 这里以前写的是 ``[compute_group_id]`` —— 即把工作空间级的整张规格表
+            # 无差别地当成"每个计算组都能用"。平台不认这个假设：拿别的分区的规格去
+            # 提交会被直接拒（``quota_id ... does not belong to
+            # logic_compute_group ...``）。
+            #
+            # 而 ``predef_train_spec`` 每条记录**本来就带 logic_compute_group_ids**，
+            # 明确说了它属于哪些计算组。实测 5/5 与平台的接受/拒绝完全吻合。
+            #
+            # 后果不只是列表不准：自动选规格挑的是 GPU 数最小的那个，而小规格恰恰
+            # 常常属于开发分区 —— 于是在训练分区上 ``qzcli create`` 不带 ``--spec``
+            # 会选中一个必被拒的规格。
+            owned = it.get("logic_compute_group_ids") or []
+            if compute_group_id and owned and compute_group_id not in owned:
+                continue  # 这条规格不属于目标计算组，别列出来误导用户
             specs.append(
                 {
                     "id": spec_id,
@@ -1954,24 +1976,75 @@ class QzAPI:
                     "cpu_count": it.get("cpu_count") or 0,
                     "memory_size_gib": it.get("memory_size") or 0,
                     "gpu_type": it.get("gpu_type") or "",
-                    # 规格是工作空间级的，对该空间任一计算组都可用
+                    # 平台没给归属时才回落到"假定属于目标组"（老数据 / 新分区）
                     "logic_compute_group_ids": (
-                        [compute_group_id] if compute_group_id else []
+                        list(owned)
+                        if owned
+                        else ([compute_group_id] if compute_group_id else [])
                     ),
+                    # 平台对该规格允许的优先级档位。训练分区上的散卡规格通常是
+                    # ['low'] —— 拿它提高优会被拒。空列表表示不限制。
+                    "allowed_priority_levels": it.get("allowed_priority_levels") or [],
                 }
             )
         if specs:
-            self._fill_gpu_type_from_history(specs, workspace_id)
+            self._fill_missing_gpu_type(specs, workspace_id, compute_group_id)
         return specs
 
-    def _fill_gpu_type_from_history(
-        self, specs: List[Dict[str, Any]], workspace_id: str
+    def _compute_group_gpu_type(self, workspace_id: str, compute_group_id: str) -> str:
+        """目标计算组节点上的卡型（取多数派）。
+
+        **卡型是机器的属性，不是任务的属性** —— 所以直接问节点，比从历史任务里
+        反推可靠得多，对没跑过任务的新计算组也一样有效。
+
+        问不出来就返回空串；调用方据此留空，让平台去报错。
+        """
+        try:
+            data = self.list_node_dimension(
+                workspace_id,
+                "",
+                logic_compute_group_id=compute_group_id,
+                page_size=100,
+            )
+        except QzAPIError:
+            return ""
+        counts: Dict[str, int] = {}
+        for node in data.get("node_dimensions") or []:
+            gtype = (node.get("gpu_info") or {}).get("gpu_type")
+            if gtype:
+                counts[gtype] = counts.get(gtype, 0) + 1
+        if not counts:
+            return ""
+        return max(counts.items(), key=lambda kv: kv[1])[0]
+
+    def _fill_missing_gpu_type(
+        self,
+        specs: List[Dict[str, Any]],
+        workspace_id: str,
+        compute_group_id: str = "",
     ) -> None:
         """给缺 ``gpu_type`` 的规格补上完整型号串（就地修改）。
 
         ``predef_train_spec`` 里的 ``gpu_type`` 常为空，但平台校验 payload 时要求
         完整串。历史任务的 ``instance_spec_price_info.gpu_info.gpu_type`` 有正确值，
         按 quota_id 对上就能补。补不到就留空 —— 让平台去报错，好过我们瞎猜一个型号。
+
+        **只认目标计算组的历史。** 规格是**工作空间级**的（同一个 quota_id 对该
+        空间任一计算组都可用），所以同一个 spec 可能在 H100 组和 H200 组都跑过。
+        不按计算组过滤就会把别处的卡型抄过来 —— 实测给「训练区-H200-1号机房」
+        （180 个节点全是 ``NVIDIA_H200_SXM_141G``）解析规格时，填进去的是
+        ``NVIDIA_H100_SXM_80G``。
+
+        这比直接报错更糟：任务会一直排队等一种该组里根本不存在的卡，
+        **看起来"成功进入排队"，实际永远起不来**。跨组去猜，正是上面那句
+        "好过我们瞎猜一个型号"要避免的事。
+
+        ``compute_group_id`` 为空时不过滤（维持旧行为，向后兼容）。
+
+        **历史查不到时用该计算组节点上的真实卡型兜底。** 只过滤不兜底会让新组、
+        或该 spec 在本组还没跑过的情况留空，而平台校验要完整型号串 —— 留空可能
+        被直接拒。实测「训练区-H200-1号机房」+「8卡160核」正是这个处境：本组历史
+        里没有这个 quota_id，但该组 180 个节点全是 ``NVIDIA_H200_SXM_141G``。
         """
         missing = {s["id"] for s in specs if not s.get("gpu_type")}
         if not missing:
@@ -1982,6 +2055,11 @@ class QzAPI:
             return
         found: Dict[str, str] = {}
         for job in data.get("jobs") or []:
+            if (
+                compute_group_id
+                and job.get("logic_compute_group_id") != compute_group_id
+            ):
+                continue
             for fc in job.get("framework_config") or []:
                 info = fc.get("instance_spec_price_info") or {}
                 qid = info.get("quota_id")
@@ -1993,6 +2071,14 @@ class QzAPI:
         for s in specs:
             if not s.get("gpu_type") and s["id"] in found:
                 s["gpu_type"] = found[s["id"]]
+
+        # 历史补不到的，退而问该计算组的节点 —— 卡型是机器属性，节点才是权威来源
+        still_missing = [s for s in specs if not s.get("gpu_type")]
+        if still_missing and compute_group_id:
+            gtype = self._compute_group_gpu_type(workspace_id, compute_group_id)
+            if gtype:
+                for s in still_missing:
+                    s["gpu_type"] = gtype
 
     def _specs_from_job_history(
         self, compute_group_id: str, workspace_id: str, page_size: int = 200

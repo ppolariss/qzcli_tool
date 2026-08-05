@@ -16,6 +16,7 @@ v1→v2 迁移最典型的翻车是"接口通了但语义变了"（过滤被忽�
 from __future__ import annotations
 
 import argparse
+import os
 import subprocess
 import sys
 import time
@@ -31,7 +32,9 @@ from qzcli.api import QzAPIError, get_api  # noqa: E402
 from qzcli.config import (  # noqa: E402
     find_workspace_by_name,
     get_cookie,
+    get_credentials,
     get_workspace_resources,
+    load_env_file,
 )
 
 RESULTS: List[Dict[str, Any]] = []
@@ -98,6 +101,19 @@ def main() -> int:
     ap.add_argument(
         "--image",
         default="docker.sii.shaipower.online/inspire-studio/dhyu-wan-torch29:0.4",
+    )
+    ap.add_argument(
+        "--queue-compute-group",
+        help=(
+            "低优排队用例的目标计算组 lcg-<uuid>。挑一个低优空位远少于 "
+            "--queue-instances 的分区，这样任务必定停在排队、不会真占资源"
+        ),
+    )
+    ap.add_argument(
+        "--queue-instances",
+        type=int,
+        default=72,
+        help="低优排队用例的节点数（默认 72，对齐真实训练规模）",
     )
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args()
@@ -551,7 +567,11 @@ def main() -> int:
                 "workspace_id": ws,
                 "framework": "pytorch",
                 "command": "echo QZCLI_V2_SMOKE_OK && sleep 5",
-                "task_priority": 10,  # 低优，不抢生产资源
+                # ⚠️ **1 才是低优，10 是最高优。** 实测提交值→平台档位：
+                # 1→存储 11→LOW、4→存储 20→NORMAL。训练任务和 HPC 同向，
+                # 数字小 = 低优。这里以前写的是 10 并注释成"低优，不抢生产资源" ——
+                # 方向反了，等于冒烟测试一直在提最高优的任务和生产抢卡。
+                "task_priority": 1,
                 "auto_fault_tolerance": False,
                 "framework_config": [
                     {
@@ -607,6 +627,123 @@ def main() -> int:
                 return f"已发停止指令，当前 status={d.get('status')}"
 
             _stop()
+
+        # ---- 低优大规模任务能否进入排队
+        #
+        # 这条是照**用户真实提交场景**加的：72 节点的 MoVA2 训练，低优，投到
+        # 目标计算组只有个位数低优空位的分区。它一定排不上，验的就是"能不能正确
+        # 进入排队"——即整条提交链路（spec 解析、卡型、优先级、节点数）是通的。
+        #
+        # **为什么必须验卡型**：规格是工作空间级的，同一个 spec id 在别的计算组
+        # 缓存/跑过时，卡型会被抄错（实测给 H200 组填了 H100）。带着错卡型提交，
+        # 任务会一直排队等一种该组里不存在的卡 —— 看起来"成功进入排队"，实际永远
+        # 起不来，正好骗过这条用例的验收。所以下面把卡型和该组节点的实际卡型对了。
+        #
+        # **账号门控**：这条会真的提交一个 72 节点任务，只在明确授权的账号下跑。
+        # 在 ~/.qzcli/.env 里设 QZCLI_SMOKE_QUEUE_ACCOUNT=<你的用户名> 才启用，
+        # 未设置就跳过（不算失败）——避免别人跑本脚本时莫名其妙提交大任务。
+        allowed_account = (
+            os.environ.get("QZCLI_SMOKE_QUEUE_ACCOUNT")
+            or (load_env_file() or {}).get("QZCLI_SMOKE_QUEUE_ACCOUNT")
+            or ""
+        ).strip()
+        current_account = (get_credentials()[0] or "").strip()
+
+        if not allowed_account:
+            print("  ⊘ 低优排队（未设 QZCLI_SMOKE_QUEUE_ACCOUNT，跳过）")
+        elif current_account != allowed_account:
+            print(f"  ⊘ 低优排队（当前账号 {current_account[:4]}*** 非授权账号，跳过）")
+        else:
+
+            @check("低优大任务能进排队", "qzcli create --priority 1")
+            def _lowpri_queue():
+                lcg = args.queue_compute_group
+                assert_true(lcg, "需要 --queue-compute-group 指定目标计算组")
+
+                specs = a.list_specs(lcg, ws)
+                cand = [x for x in specs if (x.get("gpu_count") or 0) == 8]
+                assert_true(cand, f"计算组 {lcg} 下没有 8 卡规格")
+                spec = max(cand, key=lambda x: x.get("cpu_count") or 0)
+
+                # 卡型必须和该计算组节点的实际卡型一致，否则会排一辈子队
+                node_gpu = a._compute_group_gpu_type(ws, lcg)
+                assert_true(node_gpu, "拿不到该计算组节点的卡型")
+                assert_true(
+                    spec.get("gpu_type") == node_gpu,
+                    f"规格卡型 {spec.get('gpu_type')!r} 与该组节点实际卡型 "
+                    f"{node_gpu!r} 不符 —— 这样提交会永远排队等一种不存在的卡",
+                )
+
+                proj = (get_workspace_resources(ws) or {}).get("projects") or {}
+                project_id = next(iter(proj), None)
+                assert_true(project_id, "拿不到 project_id")
+
+                payload = {
+                    "name": f"qzcli-lowpri-queue-smoke-{int(time.time())}",
+                    "logic_compute_group_id": lcg,
+                    "project_id": project_id,
+                    "workspace_id": ws,
+                    "framework": "pytorch",
+                    "command": "echo QZCLI_LOWPRI_QUEUE_SMOKE && sleep 5",
+                    "task_priority": 1,  # 1 = LOW，见上面那段注释
+                    "auto_fault_tolerance": False,
+                    "framework_config": [
+                        {
+                            "cpu": spec["cpu_count"],
+                            "gpu_count": spec["gpu_count"],
+                            "mem_gi": spec.get("memory_size_gib") or 0,
+                            "resource_spec_price": {
+                                "cpu_type": "",
+                                "cpu_count": spec["cpu_count"],
+                                "gpu_type": spec["gpu_type"],
+                                "gpu_count": spec["gpu_count"],
+                                "memory_size_gib": spec.get("memory_size_gib") or 0,
+                                "logic_compute_group_id": lcg,
+                                "quota_id": spec["id"],
+                            },
+                            "image": args.image,
+                            "image_type": "SOURCE_PUBLIC",
+                            "instance_count": args.queue_instances,
+                            "shm_gi": 64,
+                        }
+                    ],
+                }
+                job_id = a.create_job_v2(cookie, payload)
+                assert_true(job_id, "创建未返回 job_id")
+                state["lowpri_job"] = job_id
+
+                time.sleep(8)
+                d = a._get_job_detail_v2(job_id, cookie)
+                status = d.get("status")
+                assert_true(
+                    status == "job_queuing",
+                    f"期望 job_queuing，实际 {status}（可能被参数问题拒了）",
+                )
+                assert_true(
+                    d.get("priority_level") == "LOW",
+                    f"优先级档位是 {d.get('priority_level')!r}，不是 LOW —— "
+                    "提成高优会抢生产资源",
+                )
+                return (
+                    f"{args.queue_instances} 节点已排队，档位 LOW，" f"卡型 {node_gpu}"
+                )
+
+            _lowpri_queue()
+
+            @check("排队任务能停掉", "qzcli stop")
+            def _lowpri_stop():
+                job_id = state.get("lowpri_job")
+                assert_true(job_id, "上一步没拿到 job_id")
+                assert_true(a.stop_job_with_cookie(job_id, cookie), "stop 返回 False")
+                time.sleep(6)
+                d = a._get_job_detail_v2(job_id, cookie)
+                assert_true(
+                    d.get("status") == "job_stopped",
+                    f"停止后状态是 {d.get('status')}，未回到 job_stopped",
+                )
+                return "已停止，未占用资源"
+
+            _lowpri_stop()
 
         # ---- HPC：这条路**没有**迁 v2，仍走 /api/v1/hpc_jobs。
         # 正因为没迁才更要测：确认 v1 这条腿在本次改动后依然是通的。

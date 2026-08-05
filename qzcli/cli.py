@@ -24,20 +24,22 @@ from .api import (
     get_api,
 )
 from .config import (
-    CONFIG_DIR,
     clear_cookie,
+    CONFIG_DIR,
+    FALLBACK_DEFAULT_PRIORITY,
     find_resource_by_name,
     find_workspace_by_name,
     get_cookie,
     get_credentials,
+    get_default_priority,
     get_session_id,
     get_workspace_resources,
     init_config,
     list_cached_workspaces,
     load_all_resources,
-    mark_workspace_unavailable,
     load_config,
     load_create_interactive_snapshot,
+    mark_workspace_unavailable,
     save_config,
     save_cookie,
     save_create_interactive_snapshot,
@@ -96,7 +98,20 @@ DEFAULT_CREATE_IMAGE = "docker.sii.shaipower.online/inspire-studio/dhyu-wan-torc
 DEFAULT_CREATE_IMAGE_TYPE = "SOURCE_PRIVATE"
 DEFAULT_CREATE_INSTANCES = 1
 DEFAULT_CREATE_SHM = 1200
-DEFAULT_CREATE_PRIORITY = 10
+#: ``qzcli create`` 不带 ``--priority`` 时用的优先级。
+#:
+#: **数字越小优先级越低。** 实测提交值 → 平台档位：1→LOW、3→LOW、4→NORMAL、
+#: 9/10→HIGH（和 HPC 完全同向，不是相反）。
+#:
+#: 默认取 3（LOW）而不是 10：不显式指定优先级的多半是调试 / 试跑 / 脚本随手提的
+#: 任务，用最高优去和别人的生产任务抢卡是不合理的默认。要抢卡请显式写
+#: ``--priority``，让这件事是个明确的决定而不是默认副作用。
+#:
+#: **这个值可以被覆盖**（``QZCLI_DEFAULT_PRIORITY`` / ``.env`` / ``config.json``
+#: 的 ``default_priority``），见 ``config.get_default_priority``。改默认值对
+#: 「原来不写 --priority 靠默认拿高优」的老脚本是行为变更，得给一条不改调用点
+#: 就能恢复原状的路。
+DEFAULT_CREATE_PRIORITY = FALLBACK_DEFAULT_PRIORITY
 DEFAULT_CREATE_FRAMEWORK = "pytorch"
 
 
@@ -4388,13 +4403,41 @@ def _lookup_spec_for_payload(
         normalized = _normalize_spec_item(raw, compute_group_id) if raw else None
         return normalized or {}
 
+    def _belongs_to_target_group(spec: Dict[str, Any]) -> bool:
+        """这条缓存记录是不是给**目标计算组**缓存的。
+
+        规格是工作空间级的，同一个 id 在别的计算组缓存过 —— 直接拿来用会把那边的
+        ``gpu_type`` 带进 payload。实测向「训练区-H200-1号机房」提交时，缓存里那条
+        8卡160核 归属的是开发区-H100-183核，于是 payload 写成
+        ``NVIDIA_H100_SXM_80G``，而目标组 180 个节点全是 H200。
+
+        **这比报错更糟**：任务会一直排队等一种该组里不存在的卡，看起来"成功进入
+        排队"，实际永远起不来。
+
+        没有归属字段时返回 True（维持旧行为）—— 判不出来不等于不属于，
+        这跟缓存残缺矩阵那条纪律一致：缓存无从判断时放行，别造假错误。
+
+        **必须看原始缓存记录，不能看规范化之后的。** ``_normalize_spec_item``
+        会把目标计算组当 fallback 注入进去，规范化之后再判断就永远为真。
+        """
+        if not compute_group_id:
+            return True
+        cached = get_workspace_resources(workspace_id) or {}
+        raw = (cached.get("specs") or {}).get(spec_id) or {}
+        owned = raw.get("logic_compute_group_ids") or (
+            [raw["logic_compute_group_id"]] if raw.get("logic_compute_group_id") else []
+        )
+        if not owned:
+            return True  # 缓存没说归属，无从判断 → 放行
+        return compute_group_id in owned
+
     spec_obj = _read_normalized_spec(workspace_id, spec_id)
     has_resource_fields = bool(
         spec_obj.get("cpu_count")
         or spec_obj.get("gpu_count")
         or spec_obj.get("memory_gb")
     )
-    if has_resource_fields:
+    if has_resource_fields and _belongs_to_target_group(spec_obj):
         return spec_obj
 
     # 缓存里没有可用的 cpu/gpu/mem 字段，尝试一次实时刷新。
@@ -6449,7 +6492,14 @@ def cmd_create(args):
     if args.shm is None:
         args.shm = DEFAULT_CREATE_SHM
     if args.priority is None:
-        args.priority = DEFAULT_CREATE_PRIORITY
+        args.priority = get_default_priority()
+        # 行为变过（曾经默认 10=最高优），就不能悄悄变 —— 明确说清用了什么、
+        # 怎么改。否则老脚本会从"直接跑"变成"排队"而用户找不到原因。
+        display.print(
+            f"[dim]未指定 --priority，使用默认 {args.priority}"
+            f"（{'LOW' if args.priority <= 3 else 'NORMAL' if args.priority <= 4 else 'HIGH'}）。"
+            f"需要更高优先级请显式 --priority，或设 QZCLI_DEFAULT_PRIORITY[/dim]"
+        )
     if args.framework is None:
         args.framework = DEFAULT_CREATE_FRAMEWORK
 
@@ -8308,7 +8358,7 @@ def main():
     create_parser.add_argument(
         "--priority",
         type=int,
-        help=f"任务优先级 1-10（默认 {DEFAULT_CREATE_PRIORITY}）",
+        help=f"任务优先级 1-10，**数字越小越低优**（默认 {DEFAULT_CREATE_PRIORITY}=LOW；10 是最高优，会和生产任务抢卡）",
     )
     create_parser.add_argument(
         "--framework", help=f"框架类型（默认 {DEFAULT_CREATE_FRAMEWORK}）"

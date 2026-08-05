@@ -458,7 +458,7 @@ class SpecsFromScheduleConfigTests(unittest.TestCase):
         '"cpu_count":150,"gpu_count":8,"memory_size":1500,"gpu_type":""}]'
     )
 
-    def _client_with(self, predef=None, jobs=None):
+    def _client_with(self, predef=None, jobs=None, nodes=None):
         c = _client()
 
         def fake_v2(service, action, body, **kw):
@@ -468,6 +468,10 @@ class SpecsFromScheduleConfigTests(unittest.TestCase):
 
         c._request_v2 = fake_v2
         c.list_jobs_with_cookie = lambda *a, **k: {"jobs": jobs or []}
+        # 历史补不到 gpu_type 时会退而问计算组节点；这里默认给空，
+        # 让「补不到就留空」那条用例保持原意。想测节点兜底的用例见
+        # test_spec_gpu_type_scope.py。
+        c.list_node_dimension = lambda *a, **k: {"node_dimensions": nodes or []}
         c._request = mock.Mock(side_effect=QzAPIError("404", 404))
         return c
 
@@ -483,9 +487,15 @@ class SpecsFromScheduleConfigTests(unittest.TestCase):
 
     def test_gpu_type_filled_from_job_history(self):
         """predef_train_spec 的 gpu_type 常为空，但平台校验要完整型号串，
-        用历史任务按 quota_id 补上。"""
+        用历史任务按 quota_id 补上。
+
+        fixture 里的任务必须带 logic_compute_group_id —— 真实任务都有，而且补
+        gpu_type 时**只认目标计算组的历史**（规格是工作空间级的，同一个 quota_id
+        在别的组跑过不代表卡型一样，见 test_spec_gpu_type_scope.py）。
+        """
         jobs = [
             {
+                "logic_compute_group_id": "lcg-brand-new",
                 "framework_config": [
                     {
                         "instance_spec_price_info": {
@@ -493,7 +503,7 @@ class SpecsFromScheduleConfigTests(unittest.TestCase):
                             "gpu_info": {"gpu_type": "NVIDIA_H200_SXM_141G"},
                         }
                     }
-                ]
+                ],
             }
         ]
         c = self._client_with(predef=self.PREDEF, jobs=jobs)
