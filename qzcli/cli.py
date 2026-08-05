@@ -96,7 +96,15 @@ DEFAULT_CREATE_IMAGE = "docker.sii.shaipower.online/inspire-studio/dhyu-wan-torc
 DEFAULT_CREATE_IMAGE_TYPE = "SOURCE_PRIVATE"
 DEFAULT_CREATE_INSTANCES = 1
 DEFAULT_CREATE_SHM = 1200
-DEFAULT_CREATE_PRIORITY = 10
+#: ``qzcli create`` 不带 ``--priority`` 时用的优先级。
+#:
+#: **数字越小优先级越低。** 实测提交值 → 平台档位：1→LOW、3→LOW、4→NORMAL、
+#: 9/10→HIGH（和 HPC 完全同向，不是相反）。
+#:
+#: 默认取 3（LOW）而不是 10：不显式指定优先级的多半是调试 / 试跑 / 脚本随手提的
+#: 任务，用最高优去和别人的生产任务抢卡是不合理的默认。要抢卡请显式写
+#: ``--priority``，让这件事是个明确的决定而不是默认副作用。
+DEFAULT_CREATE_PRIORITY = 3
 DEFAULT_CREATE_FRAMEWORK = "pytorch"
 
 
@@ -8336,7 +8344,7 @@ def main():
     create_parser.add_argument(
         "--priority",
         type=int,
-        help=f"任务优先级 1-10（默认 {DEFAULT_CREATE_PRIORITY}）",
+        help=f"任务优先级 1-10，**数字越小越低优**（默认 {DEFAULT_CREATE_PRIORITY}=LOW；10 是最高优，会和生产任务抢卡）",
     )
     create_parser.add_argument(
         "--framework", help=f"框架类型（默认 {DEFAULT_CREATE_FRAMEWORK}）"

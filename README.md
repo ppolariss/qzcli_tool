@@ -58,8 +58,9 @@ qzcli res -u
 # 3. 查看空余节点
 qzcli avail
 
-# 4. 查看运行中的任务
-qzcli ls -c -r
+# 4. 查看运行中的任务（-c 模式必须指定工作空间，或用 --all-ws 查全部）
+qzcli ls -c -r -w <工作空间名称或ID>
+qzcli ls -c -r --all-ws
 ```
 
 如果没有显式设置 `QZCLI_ENV_FILE`，`qzcli` 会默认尝试从 `~/.qzcli/.env` 读取 CAS 凭据；如果你的凭据文件在别处，先导出 `QZCLI_ENV_FILE=/path/to/.env`：
