@@ -240,9 +240,24 @@ def compare_pair(
 
 
 def build_endpoints(a, cookie) -> List[dict]:
-    """已迁端点的 v1/v2 配对表。每项：名字、两个调用、列表键、主键字段。"""
+    """已迁端点的 v1/v2 配对表。每项：名字、两个调用、列表键、主键字段。
+
+    ``global_scope=True`` 的端点**不按工作空间分**（比如项目列表，
+    ``GetProjectForPage`` 根本不收 workspace 参数），只跑一次，不进
+    「工作空间 × 端点」的笛卡尔积。
+    """
     now = int(time.time())
     return [
+        {
+            # 项目列表是工作空间枚举的数据源 —— 它要是悄悄变了形状，
+            # `qzcli ws` 会静默列不出空间，而不是报错。所以必须进体检。
+            "name": "projects",
+            "list_keys": ("items",),
+            "id_field": "id",
+            "global_scope": True,
+            "v1": lambda _ws: {"items": a._project_list_items_v1(cookie)},
+            "v2": lambda _ws: {"items": a._project_list_items_v2(cookie)},
+        },
         {
             "name": "jobs",
             "list_keys": ("jobs",),
@@ -358,7 +373,11 @@ def main() -> int:
             return 1
         workspaces = [{"id": wid, "name": args.workspace}]
     else:
-        workspaces = a.list_workspaces(cookie)
+        # ⚠️ **枚举工作空间必须固定走 v1 腿。**
+        # list_workspaces 现在默认走 v2（project GetProjectForPage），而项目列表
+        # 本身就是本工具要验的对象之一 —— 拿被测对象来驱动测试，它真坏了的话，
+        # 这里可能只扫到部分空间却报「全部一致」，是最难发现的一种假绿。
+        workspaces = a._workspaces_from_project_items(a._project_list_items_v1(cookie))
 
     endpoints = build_endpoints(a, cookie)
     if args.only:
@@ -372,9 +391,15 @@ def main() -> int:
     )
 
     findings: List[Finding] = []
+    done_global = set()
     for ws in workspaces:
         wid, wname = ws["id"], (ws.get("name") or ws["id"])[:20]
         for ep in endpoints:
+            if ep.get("global_scope"):
+                if ep["name"] in done_global:
+                    continue
+                done_global.add(ep["name"])
+                wname = "（全局）"
 
             def run(fn: Callable):
                 try:

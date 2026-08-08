@@ -2688,7 +2688,7 @@ class QzAPI:
         )
 
     def list_projects_raw(self, cookie: str = "") -> List[Dict[str, Any]]:
-        """项目列表原始条目（``/api/v1/project/list`` 的 ``data.items``）。
+        """项目列表原始条目。
 
         每条含 ``id`` / ``name`` / ``space_list[]``，即**项目 → 它属于哪些工作空间**
         的权威映射。``list_workspaces`` 和「项目归属核实」都基于它。
@@ -2711,7 +2711,18 @@ class QzAPI:
         Returns:
             工作空间列表 [{"id": "ws-xxx", "name": "工作空间名称"}, ...]
         """
-        items = self._project_list_items(cookie)
+        return self._workspaces_from_project_items(self._project_list_items(cookie))
+
+    def _workspaces_from_project_items(
+        self, items: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """项目条目 → 去重后的工作空间列表。
+
+        单独抽出来，是为了让**需要绕开分发器的调用方**能直接喂 v1 或 v2 的结果。
+        典型是 ``tools/parity_sweep.py``：它要验的对象之一就是项目列表，如果枚举
+        工作空间也走默认分发器，就成了拿被测对象驱动测试 —— 真坏了的话可能只扫到
+        部分空间却报「全部一致」。
+        """
         # 从项目的 space_list 中提取工作空间（去重）
         #
         # 注意 project/list 会把**你不是成员的项目**也返回回来，其 space_list 里

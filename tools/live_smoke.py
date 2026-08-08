@@ -21,6 +21,8 @@ import subprocess
 import sys
 import time
 import traceback
+
+import requests
 from pathlib import Path
 from typing import Any, Callable, Dict, List
 
@@ -56,6 +58,38 @@ class _QuietDisplay:
         if name.startswith("print"):
             return self.print
         raise AttributeError(name)
+
+
+def pick_submittable_project(a, ws: str, cookie: str):
+    """挑一个**当前账号真能往里提任务**的项目。
+
+    以前这里是 `next(iter(cached_projects))` —— 从本地缓存随便拿第一个。
+    问题是缓存里可能混着你已经退出的项目，拿到它提交就报
+    ``AccessForbidden: 您已离开所选项目，无法创建``。低优排队用例就是栽在这个上。
+
+    换到 v2 ``GetProjectForPage`` 之后，平台侧只返回「当前用户所属」的项目，
+    所以**优先问平台**，而不是信缓存 —— 缓存是不是新鲜的，这里控制不了。
+    平台问不到才退回缓存（离线 / 权限异常时至少还能跑）。
+
+    返回 ``(project_id, 来源说明)``，拿不到返回 ``(None, 原因)``。
+    """
+    try:
+        items = a.list_projects_raw(cookie)
+    except (QzAPIError, requests.RequestException) as exc:
+        items = []
+        why = f"平台查询失败({type(exc).__name__})"
+    else:
+        why = "平台无匹配项目"
+    # 平台返回的项目里，挑挂在目标工作空间下的那个
+    for proj in items:
+        for space in proj.get("space_list") or []:
+            if space.get("id") == ws and not space.get("usage_status"):
+                return proj.get("id"), f"平台确认属于本空间：{proj.get('name')}"
+    cached = (get_workspace_resources(ws) or {}).get("projects") or {}
+    fallback = next(iter(cached), None)
+    if fallback:
+        return fallback, f"{why}，退回缓存（可能已失效，建议 qzcli res -u）"
+    return None, why
 
 
 RESULTS: List[Dict[str, Any]] = []
@@ -662,9 +696,8 @@ def main() -> int:
                 args.compute_group or (spec.get("logic_compute_group_ids") or [None])[0]
             )
             assert_true(lcg, "拿不到计算组")
-            proj = (get_workspace_resources(ws) or {}).get("projects") or {}
-            project_id = next(iter(proj), None)
-            assert_true(project_id, "拿不到 project_id")
+            project_id, why = pick_submittable_project(a, ws, cookie)
+            assert_true(project_id, f"拿不到可提交的 project_id：{why}")
 
             payload = {
                 "name": f"qzcli-v2-smoke-{int(time.time())}",
@@ -780,9 +813,8 @@ def main() -> int:
                     f"{node_gpu!r} 不符 —— 这样提交会永远排队等一种不存在的卡",
                 )
 
-                proj = (get_workspace_resources(ws) or {}).get("projects") or {}
-                project_id = next(iter(proj), None)
-                assert_true(project_id, "拿不到 project_id")
+                project_id, why = pick_submittable_project(a, ws, cookie)
+                assert_true(project_id, f"拿不到可提交的 project_id：{why}")
 
                 payload = {
                     "name": f"qzcli-lowpri-queue-smoke-{int(time.time())}",
