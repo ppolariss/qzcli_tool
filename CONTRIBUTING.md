@@ -23,8 +23,17 @@ feature/xxx  ──PR──▶  dev  ──攒够一个版本、验收通过─�
 
 1. `python3 -m unittest discover -s tests` 全绿
 2. `python3 tools/live_smoke.py --workspace <某个真实工作空间>` 全绿（只读）
-3. `python3 tools/parity_sweep.py` —— **v1/v2 对齐扫描 SCHEMA 差异必须为 0**。
-   SCHEMA 类差异意味着 v2 换了字段名，代码不会报错、只会静默返回空
+3. `python3 tools/parity_sweep.py` —— **未复核的 SCHEMA 差异必须为 0**（退出码即信号）。
+   SCHEMA 类差异意味着 v2 换了字段名，代码不会报错、只会静默返回空。
+
+   口径不是"报告里 SCHEMA 那一栏必须是 0"，而是"**没有你没查过的字段名差异**"。
+   查清确实无害的，写进 `parity_sweep.py` 的 `REVIEWED_SCHEMA_DIFFS`，
+   **value 里必须写明为什么无害**（"无人消费"要能指出 grep 结果，不能写"应该没事"）。
+   它们仍会以 `SCHEMA_REVIEWED` 印在报告里，不会因为进了白名单就从视野消失。
+
+   ⚠️ **不许为了让数字变绿而往 `VOLATILE_FIELDS` 里塞东西。** 那一栏的语义是
+   "这个值天然随时间变"，把一个"v2 压根没有的字段"标成波动是撒谎，
+   下次真出问题时没人会再信这个闸门。
 4. 发版前额外跑一次 `live_smoke.py --submit`（会真提交任务，跑完记得停掉）
 
 **各阶段之间要隔开至少 5 分钟。** 这几个工具都是"扫全部工作空间"的全量形态，
