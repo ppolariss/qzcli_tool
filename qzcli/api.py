@@ -2651,18 +2651,30 @@ class QzAPI:
     def _project_list_items_v2(self, cookie: str = "") -> List[Dict[str, Any]]:
         """v2 ``project GetProjectForPage`` → ``items``。
 
-        **只返回当前用户仍是成员的项目**，这正是它比 v1 强的地方：v1 的
-        ``ListProjects`` 会把 ``is_member=False`` / ``status=FINISHED`` 的项目
-        （已退出 / 已结束）也吐出来，用户选中就报
-        ``AccessForbidden: 您已离开所选项目，无法创建``。
+        比 v1 的 ``ListProjects`` 干净，但**不是**"只返回你所属的项目" ——
+        这条断言曾经写在这里，是错的，实测推翻了它。真实情况：
 
-        实测本账号：v2 返回 11 条、v1 返回 12 条。**两边不是子集关系** —— v2 排除了
-        2 个「已结束且用户不在其中」的项目，又补上 1 个 v1 没给的。另外 ``is_member``
-        这个字段在 v1 里恒为 ``False``（不可信），v2 才真正填了值。
+        - v2 返回 11 条、v1 返回 12 条，**两边不是子集关系**：v2 排除了 2 个
+          「已结束且用户不在其中」的项目，又补上 1 个 v1 没给的。
+        - v2 返回的 11 条里**有 1 条 ``is_member=False``**（状态
+          ``PASS_MODIFY_RESOURCE``）。所以调用方要按成员身份过滤的话，
+          **必须自己滤**，不能指望平台滤过了。
+        - ``is_member`` 只在 v2 可信：v1 对全部 12 条一律返回 ``False``，
+          包括用户明显是成员的项目。拿 v1 的这个字段过滤会一个都不剩。
 
-        逐字段对过，下游依赖的 ``name`` / ``space_list[].id`` /
-        ``space_list[].usage_status`` 与 v1 完全一致；v1 仅多一个
-        ``member_remain_budget``，全仓无人使用。
+        下游依赖的 ``name`` / ``space_list[].id`` / ``space_list[].usage_status``
+        与 v1 逐字段一致。
+
+        **v2 丢了预算数据**（已知缺口，非本仓可修）：
+
+        - ``remain_budget`` 键在，但值是空字符串 ``''``；v1 有真实数值
+        - ``member_remain_budget``（**你个人**在该项目下的剩余额度）v2 直接没有
+
+        这两个不是一回事：实测「公共科研项目」v1 的 ``remain_budget`` 是
+        9.98 亿而 ``member_remain_budget`` 只有 673 —— 前者是项目池，后者是
+        你个人配额。目前全仓无人消费这两个字段，所以迁 v2 无功能损失；但
+        「提交前提示你在该项目还剩多少额度」这类功能在 v2 上做不了，
+        需要平台侧补齐。
 
         分页：一次取 200，覆盖现有规模（本账号 11 个）。上游 spec 里 v1 的
         ``ListProjects`` 已被移除，这条是唯一正式接口。
