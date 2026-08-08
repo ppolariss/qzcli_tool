@@ -32,6 +32,7 @@ from .config import (
     save_token_cache,
 )
 from .crypto import encrypt_password
+from .diag import swallowed
 
 # /api/v2/* requires this header — without it APISIX gateway redirects to
 # Keycloak login (returning HTML) even when the Bearer token is valid.
@@ -465,12 +466,13 @@ def _relogin_file_lock():
                     import fcntl as _f
 
                     _f.flock(fh.fileno(), _f.LOCK_UN)
-            except Exception:
-                pass
+            except OSError as exc:
+                # 解锁失败也要继续走到 close()；进程退出时内核会释放锁。
+                swallowed("锁/解锁", exc)
             try:
                 fh.close()
-            except Exception:
-                pass
+            except OSError as exc:
+                swallowed("锁/关闭句柄", exc)
 
 
 def _v2_then_v1(name: str, v2_call, v1_call, *, logger=None):
@@ -2944,8 +2946,10 @@ class QzAPI:
                 for cookie in session.cookies:
                     if "qz.sii.edu.cn" in cookie.domain:
                         all_cookies[cookie.name] = cookie.value
-            except Exception:
-                pass
+            except requests.RequestException as exc:
+                # 只兜网络问题。以前这里是 except Exception —— 属性名写错之类的
+                # 真 bug 会被吞成「拿不到 session cookie」，把人往登录态失效上引。
+                swallowed("登录/预热会话", exc)
 
         if not all_cookies or not self._has_session_cookie(all_cookies):
             raise QzAPIError("登录成功但未获取到 session cookie")
