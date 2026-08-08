@@ -15,6 +15,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+import requests
+
 from . import __version__
 from .api import (
     QzAPIError,
@@ -48,6 +50,7 @@ from .config import (
     update_workspace_compute_groups,
     update_workspace_projects,
 )
+from .diag import last_reason, swallowed
 from .display import get_display
 from .store import JobRecord, get_store
 
@@ -689,8 +692,9 @@ def cmd_status(args):
                     if sched:
                         r, m = sched
                         display.print(f"[yellow]排队原因[/yellow]: {r} — {m}")
-            except Exception:
-                pass  # 诊断是附加信息，绝不打断 status 主流程
+            except (QzAPIError, requests.RequestException) as exc:
+                # 诊断是附加信息，绝不打断 status 主流程；但原因要留痕。
+                swallowed("status/排队原因诊断", exc)
 
         if args.json:
             import json
@@ -2164,41 +2168,48 @@ def cmd_avail(args):
         ws_label = (cached or {}).get("name", "") or str(
             workspace_option.get("name", "") or workspace_id
         )
+        # try 只包住**取数**。以前它连后面的统计一起包了，于是字段改名、除零、
+        # 某个空间没权限，都会让「HPC 节点 CPU/内存利用率」整段静默消失 ——
+        # 退出码还是 0，看着像"今天就是没有 HPC 节点"。
         try:
-            hpc_nodes = [
-                node
-                for node in _with_live_cookie(
+            all_nodes = _with_live_cookie(
+                api,
+                display,
+                lambda live_cookie: _fetch_all_node_dimensions(
                     api,
-                    display,
-                    lambda live_cookie: _fetch_all_node_dimensions(
-                        api,
-                        workspace_id,
-                        live_cookie,
-                        logic_compute_group_id=lcg_filter,
-                        page_size=200,
-                    ),
-                    workspace_id=workspace_id,
-                )
-                if node.get("node_type") == "hpc"
-            ]
-            if not hpc_nodes:
-                continue
-            if not hpc_any:
-                display.print("\n[bold]HPC 节点 CPU/内存利用率[/bold]")
-                hpc_any = True
-            total_hpc = len(hpc_nodes)
-            cpu_rates = [n.get("cpu", {}).get("usage_rate", 0) for n in hpc_nodes]
-            mem_rates = [n.get("memory", {}).get("usage_rate", 0) for n in hpc_nodes]
-            avg_cpu = sum(cpu_rates) / total_hpc * 100
-            avg_mem = sum(mem_rates) / total_hpc * 100
-            busy = sum(1 for r in cpu_rates if r > 0.05)
-            display.print(
-                f"  {ws_label}: 节点 {total_hpc} | 忙碌 {busy} "
-                f"| 平均CPU [cyan]{avg_cpu:.1f}%[/cyan] "
-                f"| 平均MEM [cyan]{avg_mem:.1f}%[/cyan]"
+                    workspace_id,
+                    live_cookie,
+                    logic_compute_group_id=lcg_filter,
+                    page_size=200,
+                ),
+                workspace_id=workspace_id,
             )
-        except Exception:
-            pass
+        except (QzAPIError, requests.RequestException) as exc:
+            # 单个空间取不到不该拖垮整张表，但要让人看见少了谁。
+            swallowed("avail/HPC 节点取数", exc)
+            display.print(
+                f"  [dim]{ws_label}: 节点利用率取数失败"
+                f"（{type(exc).__name__}），已跳过[/dim]"
+            )
+            continue
+
+        hpc_nodes = [n for n in all_nodes if n.get("node_type") == "hpc"]
+        if not hpc_nodes:
+            continue
+        if not hpc_any:
+            display.print("\n[bold]HPC 节点 CPU/内存利用率[/bold]")
+            hpc_any = True
+        total_hpc = len(hpc_nodes)
+        cpu_rates = [n.get("cpu", {}).get("usage_rate", 0) for n in hpc_nodes]
+        mem_rates = [n.get("memory", {}).get("usage_rate", 0) for n in hpc_nodes]
+        avg_cpu = sum(cpu_rates) / total_hpc * 100
+        avg_mem = sum(mem_rates) / total_hpc * 100
+        busy = sum(1 for r in cpu_rates if r > 0.05)
+        display.print(
+            f"  {ws_label}: 节点 {total_hpc} | 忙碌 {busy} "
+            f"| 平均CPU [cyan]{avg_cpu:.1f}%[/cyan] "
+            f"| 平均MEM [cyan]{avg_mem:.1f}%[/cyan]"
+        )
     return 0
 
 
@@ -2993,9 +3004,9 @@ def _project_belongs_to_workspace_on_platform(api, workspace_id, project_id):
     逻辑，之前只给计算组加了平台复核，项目这条漏了，于是**新建/新加入的项目
     会原样重演那个 bug**：报「项目 X 不属于当前工作空间」，而它其实属于。
 
-    数据源是 `/api/v1/project/list` 的 `items[].space_list[]`，即"项目 → 它属于
-    哪些工作空间"。用 v1 是因为 v2 的 `project ListProjects` 对普通账号是
-    `AccessForbidden`，全域也没有别的接口给得出这个映射。
+    数据源是项目列表的 `items[].space_list[]`，即"项目 → 它属于哪些工作空间"。
+    走 v2 `project GetProjectForPage`（上游 2026-08 放开了普通用户权限；在那之前
+    它是 `AccessForbidden`，只能用 v1），v2 路由不通时自动回落。
 
     返回 True/False；查询失败或列表为空返回 None（不确定 → 上层放行，
     让平台自己拒，总好过拿过期缓存误伤一个真实项目）。
@@ -4450,8 +4461,10 @@ def _lookup_spec_for_payload(
             display=display,
             emit_messages=False,
         )
-    except Exception:
-        pass
+    except (QzAPIError, requests.RequestException) as exc:
+        # 预加载失败不致命：下面读缓存还有机会命中。但真拿不到规格时的报错
+        # 要能回溯到这里，别只剩一句「找不到规格」。
+        swallowed("create/规格预加载", exc)
 
     spec_obj = _read_normalized_spec(workspace_id, spec_id)
     if not (
@@ -7338,48 +7351,51 @@ def _resolve_notebook_id_by_name(target, cookie, display):
     return None
 
 
-def _get_jupyter_info(notebook_id, cookie, display):
-    """notebook_id → /api/v1/notebook/lab/<id> 301 → 抽 base_url + token。"""
-    import requests as _requests
+#: Jupyter 访问地址的形状：
+#: ``https://{domain}/{ws}/{proj}/{user}/jupyter/{nb_id}/{token}/lab?token={token}``
+#: v1 的 301 Location 和 v2 的 ``jupyter_url`` **是同一条 URL**（实测同 host、同路径、
+#: 同 token），所以两条路共用这一个正则。
+_JUPYTER_URL_RE = re.compile(
+    r"(https://[^/]+/[^/]+/[^/]+/[^/]+/jupyter/[^/]+/([^/]+))/lab"
+)
 
+
+def _get_jupyter_info(notebook_id, cookie, display):
+    """notebook_id → Jupyter ``base_url`` + ``token``。
+
+    数据源是 ``api.get_notebook_access_url``（v2 ``notebook GetNotebookAccessUrl``，
+    v2 不通时它自己回落 v1 的 301）。
+
+    **上游 2026-08 之前 v2 全域拿不到 Jupyter 地址**，这里只能直接打 v1 的
+    ``/api/v1/notebook/lab/{id}`` 读 301 响应头 —— 那是 qzcli 最后一个 v1 依赖。
+    现在下沉到 api 层了，这里只负责把 URL 解析成 exec 要的三个键。
+
+    返回 ``{base_url, token, notebook_id}``；下游 ``_exec_launch`` / ``_exec_poll`` /
+    MCP 的 exec 工具全靠这三个键，**形状不能变**。
+    """
     try:
-        resp = _requests.get(
-            f"https://qz.sii.edu.cn/api/v1/notebook/lab/{notebook_id}",
-            headers={
-                "cookie": cookie,
-                "user-agent": "Mozilla/5.0",
-                "accept": "text/html",
-            },
-            allow_redirects=False,
-            timeout=15,
-        )
+        urls = get_api().get_notebook_access_url(notebook_id, cookie)
+    except QzAPIError:
+        raise
     except Exception as e:
         display.print_error(f"请求失败: {e}")
         return None
 
-    if resp.status_code in (301, 302, 303, 307):
-        location = resp.headers.get("Location", "")
-        if "keycloak" in location:
-            raise QzAPIError("Cookie 已过期", 401)
-        # URL 格式: https://{domain}/{ws}/{proj}/{user}/jupyter/{nb_id}/{token}/lab?token={token}
-        match = re.search(
-            r"(https://[^/]+/[^/]+/[^/]+/[^/]+/jupyter/[^/]+/([^/]+))/lab",
-            location,
-        )
-        if match:
-            return {
-                "base_url": match.group(1),
-                "token": match.group(2),
-                "notebook_id": notebook_id,
-            }
-        display.print_error(f"解析 Jupyter URL 失败: {location[:200]}")
+    jupyter_url = (urls or {}).get("jupyter_url") or ""
+    if not jupyter_url:
+        display.print_error("平台没有返回 Jupyter 访问地址（开发机可能未在运行）")
         return None
 
-    if resp.status_code == 401:
-        raise QzAPIError("Cookie 已过期", 401)
+    match = _JUPYTER_URL_RE.search(jupyter_url)
+    if not match:
+        display.print_error(f"解析 Jupyter URL 失败: {jupyter_url[:200]}")
+        return None
 
-    display.print_error(f"获取 Jupyter URL 失败: HTTP {resp.status_code}")
-    return None
+    return {
+        "base_url": match.group(1),
+        "token": match.group(2),
+        "notebook_id": notebook_id,
+    }
 
 
 def _find_notebook_jupyter_info(target, display):
@@ -7514,8 +7530,10 @@ def _exec_launch(jupyter_info, cmd_str, display, job_id=None):
             json={"type": "directory"},
             timeout=10,
         )
-    except Exception:
-        pass
+    except _requests.RequestException as exc:
+        # 目录多半已存在；真建不出来的话，后面读 exit 文件会一路 404 到超时，
+        # 那时 last_reason() 能把这条捞回去。
+        swallowed("exec/建中转目录", exc)
 
     # 2. 通过 Terminal 发送一条复合命令（fire-and-forget）
     #    输出写到 /tmp/.qzcli/<session>/，通过 symlink 让 Contents API 可读
@@ -7603,8 +7621,8 @@ def _delete_terminal(base_http, headers, term_name):
         _requests.delete(
             f"{base_http}/api/terminals/{term_name}", headers=headers, timeout=10
         )
-    except Exception:
-        pass
+    except _requests.RequestException as exc:
+        swallowed("exec/关闭 terminal", exc)
 
 
 def _exec_poll(jupyter_info, job_id, display, timeout=120, cleanup_on_done=True):
@@ -7631,8 +7649,8 @@ def _exec_poll(jupyter_info, job_id, display, timeout=120, cleanup_on_done=True)
                 _requests.delete(
                     f"{base_http}/api/contents/{fname}", headers=headers, timeout=5
                 )
-            except Exception:
-                pass
+            except _requests.RequestException as exc:
+                swallowed("exec/清理临时文件", exc)
 
     deadline = _time.time() + timeout
     exit_code = 1
@@ -7662,8 +7680,11 @@ def _exec_poll(jupyter_info, job_id, display, timeout=120, cleanup_on_done=True)
                 if cleanup_on_done:
                     cleanup()
                 return exit_code, output, True
-        except Exception:
-            pass
+        except (_requests.RequestException, ValueError) as exc:
+            # 单轮失败不该中断轮询（命令可能还没写出 exit 文件）。但**必须留痕**：
+            # 这里以前是 except Exception: pass，结果 403 / 坏 JSON 连吞 120 秒，
+            # 最后只报一句「超时」，跟真实原因毫无关系。ValueError 覆盖 json 解析失败。
+            swallowed("exec/轮询", exc)
 
         poll_interval = min(poll_interval * 1.5, 5)
 
@@ -7681,8 +7702,10 @@ def _exec_via_jupyter(jupyter_info, cmd_str, display, timeout=120):
         jupyter_info, job_id, display, timeout=timeout
     )
     if not finished:
+        why = last_reason("exec/")
+        hint = f"\n  轮询期间最后一次失败: {why}" if why else ""
         display.print_warning(
-            f"命令执行超时（{timeout}s），远端命令仍在运行，输出可能不完整。"
+            f"命令执行超时（{timeout}s），远端命令仍在运行，输出可能不完整。{hint}"
             f"\n  继续拉取剩余输出: qzcli exec-attach {jupyter_info['notebook_id']} {job_id}"
         )
     return exit_code, output

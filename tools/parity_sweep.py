@@ -47,6 +47,23 @@ VOLUME_DRIFT_TOLERANCE = 0.10
 
 # 已核实无害的 v1/v2 差异：写在这里，报告里降级成 BENIGN 不再刷屏。
 # **加进来必须附核实结论** —— 否则这个列表会变成掩盖真问题的地毯。
+#: **已复核的结构差异**：v1/v2 字段名集合确实不同，但已查明无害。
+#: key 是 ``(端点, 字段名)``，value 必须写清**为什么无害** ——
+#: 「无人消费」要能指出全仓 grep 的结果，不能只写"应该没事"。
+#:
+#: 这不是"把红灯调绿"的开关。放进来的前提是**已经查过**：
+#: 该字段有没有被代码读、缺了会不会让某个功能静默失效。
+#: 没查清的一律留在报告里红着。
+REVIEWED_SCHEMA_DIFFS = {
+    ("projects", "member_remain_budget"): (
+        "v1 独有，v2 无对应。含义是「你个人在该项目下的剩余额度」"
+        "（区别于项目池的 remain_budget —— 实测公共科研项目 9.98 亿 vs 673）。"
+        "全仓 grep 无任何消费点，迁 v2 无功能损失；"
+        "但 v2 全 169 个 action 里也没有替代接口，点券可见性在 v2 上归零，"
+        "已记在 _project_list_items_v2 的 docstring 里。"
+    ),
+}
+
 KNOWN_BENIGN = {
     # v2 补了中文品牌名，v1 是空串。全量 96 对比对里唯一的实质差异，
     # 系统性出现在所有工作空间；我们代码只读 gpu_type，不读它。
@@ -203,14 +220,40 @@ def compare_pair(
         return out
 
     # ---- 元素字段名 ----
-    e1, e2 = _keys(r1[0]), _keys(r2[0])
-    if e1 != e2:
+    #
+    # 以前这里是 `_keys(r1[0])` vs `_keys(r2[0])` —— **只拿第一条记录比**。
+    # 可选字段（只有运行中的任务才有 running_time_ms 之类）会让它随机报假差异：
+    # 实测 running_time_ms 在 v1 的 15/20 条、v2 的 14/20 条里都出现，两边根本
+    # 没有 schema 差异，只是第一条恰好一边有一边没有。假红比不报还糟 ——
+    # 它会训练人忽略这个闸门。
+    #
+    # 改成**所有记录的字段名并集**，再扣掉已声明的波动字段：一个字段在两次调用
+    # 之间出现/消失（任务跑完了）不是接口换名，不该占用 SCHEMA 这个最高告警级别。
+    e1 = set().union(*(_keys(x) for x in r1)) if r1 else set()
+    e2 = set().union(*(_keys(x) for x in r2)) if r2 else set()
+    only1 = sorted((e1 - e2) - VOLATILE_FIELDS - set(KNOWN_BENIGN))
+    only2 = sorted((e2 - e1) - VOLATILE_FIELDS - set(KNOWN_BENIGN))
+    unreviewed1 = [f for f in only1 if (endpoint, f) not in REVIEWED_SCHEMA_DIFFS]
+    unreviewed2 = [f for f in only2 if (endpoint, f) not in REVIEWED_SCHEMA_DIFFS]
+    if unreviewed1 or unreviewed2:
         out.append(
             Finding(
                 "SCHEMA",
                 endpoint,
                 ws_name,
-                f"元素字段不同：只在 v1={sorted(e1 - e2)} 只在 v2={sorted(e2 - e1)}",
+                f"元素字段不同：只在 v1={unreviewed1} 只在 v2={unreviewed2}",
+            )
+        )
+    reviewed = [f for f in only1 + only2 if (endpoint, f) in REVIEWED_SCHEMA_DIFFS]
+    if reviewed:
+        out.append(
+            Finding(
+                "SCHEMA_REVIEWED",
+                endpoint,
+                ws_name,
+                "；".join(
+                    f"{f}：{REVIEWED_SCHEMA_DIFFS[(endpoint, f)]}" for f in reviewed
+                ),
             )
         )
 
@@ -240,9 +283,24 @@ def compare_pair(
 
 
 def build_endpoints(a, cookie) -> List[dict]:
-    """已迁端点的 v1/v2 配对表。每项：名字、两个调用、列表键、主键字段。"""
+    """已迁端点的 v1/v2 配对表。每项：名字、两个调用、列表键、主键字段。
+
+    ``global_scope=True`` 的端点**不按工作空间分**（比如项目列表，
+    ``GetProjectForPage`` 根本不收 workspace 参数），只跑一次，不进
+    「工作空间 × 端点」的笛卡尔积。
+    """
     now = int(time.time())
     return [
+        {
+            # 项目列表是工作空间枚举的数据源 —— 它要是悄悄变了形状，
+            # `qzcli ws` 会静默列不出空间，而不是报错。所以必须进体检。
+            "name": "projects",
+            "list_keys": ("items",),
+            "id_field": "id",
+            "global_scope": True,
+            "v1": lambda _ws: {"items": a._project_list_items_v1(cookie)},
+            "v2": lambda _ws: {"items": a._project_list_items_v2(cookie)},
+        },
         {
             "name": "jobs",
             "list_keys": ("jobs",),
@@ -303,13 +361,16 @@ def render(findings: List[Finding], scanned: int, endpoints: List[str]) -> str:
             f"（SCHEMA {len(by_kind.get('SCHEMA', []))} / "
             f"VALUE {len(by_kind.get('VALUE', []))} / "
             f"VOLUME {len(by_kind.get('VOLUME', []))} / "
-            f"ERROR {len(by_kind.get('ERROR', []))}）",
+            f"ERROR {len(by_kind.get('ERROR', []))} / "
+            f"SCHEMA_REVIEWED {len(by_kind.get('SCHEMA_REVIEWED', []))}）",
             "",
             "> **判据分档**（混在一起看会淹没真问题）：",
             "> - `SCHEMA` 字段名不一致 —— **最危险**。v2 换字段名不会报错，只会静默返回空，代码照跑",
             "> - `VALUE`  同记录同字段值不同 —— 要人判断是真差异还是实时波动",
             "> - `VOLUME` 条目数/total 不一致 —— 分页或过滤语义不同",
             "> - `ERROR`  只有一边报错 —— 通常是 v2 权限更严或路由缺失",
+            "> - `SCHEMA_REVIEWED` 字段名不一致但**已逐条查明无害** —— 不让闸门变红，"
+            "但仍然印在这里，免得进了白名单就从视野里消失",
             "",
             "> 已核实无害、不再计入的差异：",
         ]
@@ -322,7 +383,7 @@ def render(findings: List[Finding], scanned: int, endpoints: List[str]) -> str:
         lines += ["**未发现差异。** v1 下线后 v2 的行为应与现状一致。", ""]
         return "\n".join(lines)
 
-    for kind in ("SCHEMA", "ERROR", "VOLUME", "VALUE"):
+    for kind in ("SCHEMA", "ERROR", "VOLUME", "VALUE", "SCHEMA_REVIEWED"):
         items = by_kind.get(kind)
         if not items:
             continue
@@ -358,7 +419,11 @@ def main() -> int:
             return 1
         workspaces = [{"id": wid, "name": args.workspace}]
     else:
-        workspaces = a.list_workspaces(cookie)
+        # ⚠️ **枚举工作空间必须固定走 v1 腿。**
+        # list_workspaces 现在默认走 v2（project GetProjectForPage），而项目列表
+        # 本身就是本工具要验的对象之一 —— 拿被测对象来驱动测试，它真坏了的话，
+        # 这里可能只扫到部分空间却报「全部一致」，是最难发现的一种假绿。
+        workspaces = a._workspaces_from_project_items(a._project_list_items_v1(cookie))
 
     endpoints = build_endpoints(a, cookie)
     if args.only:
@@ -372,9 +437,15 @@ def main() -> int:
     )
 
     findings: List[Finding] = []
+    done_global = set()
     for ws in workspaces:
         wid, wname = ws["id"], (ws.get("name") or ws["id"])[:20]
         for ep in endpoints:
+            if ep.get("global_scope"):
+                if ep["name"] in done_global:
+                    continue
+                done_global.add(ep["name"])
+                wname = "（全局）"
 
             def run(fn: Callable):
                 try:
@@ -404,11 +475,14 @@ def main() -> int:
         encoding="utf-8",
     )
     schema = sum(1 for f in findings if f.kind == "SCHEMA")
+    reviewed = sum(1 for f in findings if f.kind == "SCHEMA_REVIEWED")
     print(
-        f"\n✓ 完成：{len(findings)} 处差异（SCHEMA {schema}）"
+        f"\n✓ 完成：{len(findings)} 处差异"
+        f"（未复核 SCHEMA {schema} / 已复核 {reviewed}）"
         f" → {args.out_dir}/v1_v2_parity_report.md"
     )
-    # SCHEMA 类是真会导致静默故障的，用退出码把它变成可 gate 的信号
+    # 只有**未复核**的 SCHEMA 才让闸门红。已复核的仍然逐条印在报告里，
+    # 不会因为"进了白名单"就从视野里消失。
     return 1 if schema else 0
 
 

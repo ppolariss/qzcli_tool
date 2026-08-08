@@ -23,8 +23,17 @@ feature/xxx  ──PR──▶  dev  ──攒够一个版本、验收通过─�
 
 1. `python3 -m unittest discover -s tests` 全绿
 2. `python3 tools/live_smoke.py --workspace <某个真实工作空间>` 全绿（只读）
-3. `python3 tools/parity_sweep.py` —— **v1/v2 对齐扫描 SCHEMA 差异必须为 0**。
-   SCHEMA 类差异意味着 v2 换了字段名，代码不会报错、只会静默返回空
+3. `python3 tools/parity_sweep.py` —— **未复核的 SCHEMA 差异必须为 0**（退出码即信号）。
+   SCHEMA 类差异意味着 v2 换了字段名，代码不会报错、只会静默返回空。
+
+   口径不是"报告里 SCHEMA 那一栏必须是 0"，而是"**没有你没查过的字段名差异**"。
+   查清确实无害的，写进 `parity_sweep.py` 的 `REVIEWED_SCHEMA_DIFFS`，
+   **value 里必须写明为什么无害**（"无人消费"要能指出 grep 结果，不能写"应该没事"）。
+   它们仍会以 `SCHEMA_REVIEWED` 印在报告里，不会因为进了白名单就从视野消失。
+
+   ⚠️ **不许为了让数字变绿而往 `VOLATILE_FIELDS` 里塞东西。** 那一栏的语义是
+   "这个值天然随时间变"，把一个"v2 压根没有的字段"标成波动是撒谎，
+   下次真出问题时没人会再信这个闸门。
 4. 发版前额外跑一次 `live_smoke.py --submit`（会真提交任务，跑完记得停掉）
 
 **各阶段之间要隔开至少 5 分钟。** 这几个工具都是"扫全部工作空间"的全量形态，
@@ -73,6 +82,23 @@ git diff --check
 - 新增命令或参数时同步更新 `README.md`。
 - 修改认证、任务提交、资源查询等共享路径时补测试。
 - 避免把真实 cookie、用户名、workspace UUID、内部项目名、完整日志贴进仓库；必要时请脱敏。
+
+### 凭据（真踩过，别重蹈）
+
+**从真机响应里粘贴样例时，凭据会跟着一起进来，而写的当下一点都不觉得是在写凭据。**
+
+实际发生过：把开发机的 Jupyter 访问 URL 抄进测试 fixture —— 而 **Jupyter 的 token
+就写在那条 URL 里**，等于把该开发机的门钥匙提交进了仓库（拿到它就能在上面执行任意
+命令）。被 GitGuardian 拦下。
+
+规矩：
+
+- 测试 fixture 的值**必须是编造的**，形状照真实的即可。用 `fake` /
+  `example.invalid` 这类一眼可辨的词，别用真值改两个字符
+- 提交前跑 `python3 -m unittest tests.test_no_secrets_in_repo`（它也在全量测试里）
+- **万一提交了：不要只删掉再提交一次** —— 历史里还在。要 `--amend` 或 rebase
+  重写那个提交，`--force-with-lease` 覆盖，然后**轮换该凭据**
+- 凭据同样不许进 commit message 和 PR 正文（那两处扫描器管不到，只能靠人）
 
 ## Issue 建议
 

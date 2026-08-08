@@ -10,8 +10,9 @@ qz spec 版本 `cf22fdbe`。每一行都用 `qzcli` 的 CAS cookie 实际打过�
    这是最容易踩的坑：按 `qz spec` 的字面描述，`cluster.ListNodeDimension` 和
    `workspace.ListNodeDimension` 描述几乎一样，但前者是集群管理员权限，后者才是工作空间级。
    qzcli 是工作空间级工具，**一律用 `workspace.*`**。
-3. **`project.ListProjects` 对当前账号是 `AccessForbidden`，而 v1 `/api/v1/project/list` 正常**
-   —— 这是 v1 兜底存在的直接理由，不是理论风险。
+3. ~~`project.ListProjects` 对当前账号是 `AccessForbidden`~~ —— **2026-08 上游已放开**，
+   并改名为 `project GetProjectForPage`。它还顺带修掉一个 bug：v1 会把用户**已退出 /
+   已结束**的项目也返回（`is_member=False`），选中就报「您已离开所选项目」。
 
 ## 映射表
 
@@ -28,8 +29,8 @@ qz spec 版本 `cf22fdbe`。每一行都用 `qzcli` 的 CAS cookie 实际打过�
 | 9 | `POST /api/v1/cluster_metric/overview_task_metric` | **`workspace GetOverviewTaskMetric`** | `{filter:{workspace_id}, time_range:{start_timestamp, end_timestamp, interval_second}}` | `Result.task_groups` |
 | 10 | `POST /openapi/v1/specs/list`（**已 404**） | **`workspace GetLogicComputeGroupNodeSpecs`** | `{workspace_id, logic_compute_group_id}` | `Result.node_specs[]` ⚠️ **无 `spec_id`** |
 | 11 | `POST /api/v1/hpc_jobs/list` | `hpc ListJobs` | `{workspace_id, page_num, page_size}` | `Result.jobs[]` + `total` |
-| 12 | `POST /api/v1/project/list` | `project ListProjects` → ❌ **AccessForbidden** | — | **保持 v1** |
-| 13 | `GET /api/v1/notebook/lab/{id}` | ❌ **无任何 v2 对应** | — | **保持 v1** |
+| 12 | `POST /api/v1/project/list` | `project GetProjectForPage` ✅ 已迁 | `{page, page_size}` | `Result.items[]` + `Result.total` |
+| 13 | `GET /api/v1/notebook/lab/{id}` | `notebook GetNotebookAccessUrl` ✅ 已迁 | `{notebook_id}` | `Result.{jupyter_url, vscode_url}` |
 | 14 | `POST /api/v2/train?Action=CreateJobConsole` | 已是 v2，**不动** | — | 已真机验证（commit `0a9902a`） |
 | 15 | `POST /api/v2/train?Action=GetJobLog` | 已是 v2，**不动** | — | — |
 
@@ -68,7 +69,9 @@ qz spec 版本 `cf22fdbe`。每一行都用 `qzcli` 的 CAS cookie 实际打过�
 | 缺口 | 说明 | 影响 |
 |---|---|---|
 | **无 action 返回 `spec_id`** | `spec_id` 在 v2 里只作请求字段存在；`node_specs[]` 只有硬件规格没有 id。唯一来源是历史任务的 `framework_config[].predef_id` | `qzcli create` 无法自助发现可用规格 |
-| **无 `ListWorkspaces`** | workspace 枚举只能从 `project.ListProjects` 的 `items[].space_list[]` 推导，而该 action 普通用户 `AccessForbidden` | qzcli 只能继续用 v1 `/api/v1/project/list` |
-| **notebook 无 lab/proxy URL** | 全量 grep 过 notebook schema，只有 `extra_info.ProxyJump`，拿不到 Jupyter 访问地址 | `qzcli exec` 无法迁 v2 |
+| ~~**无 `ListWorkspaces`**~~ | ~~workspace 枚举只能从 `project.ListProjects` 推导，而该 action 普通用户 `AccessForbidden`~~ **2026-08 已解决**：上游改为 `project.GetProjectForPage` 并放开普通用户权限，工作空间仍从 `items[].space_list[]` 推导，但已走 v2 | ✅ 已迁（v0.4.7） |
+| ~~**notebook 无 lab/proxy URL**~~ | ~~只有 `extra_info.ProxyJump`，拿不到 Jupyter 访问地址~~ **2026-08 已解决**：上游新增 `notebook.GetNotebookAccessUrl`，返回 `{jupyter_url, vscode_url}` | ✅ 已迁（v0.4.7） |
+| **v2 拿不到点券 / 预算** | `project.GetProjectForPage` 的 `remain_budget` 键在但值恒为空字符串 `''`；`member_remain_budget`（个人额度）直接没有。全 169 个 action 里 `budget`/`billing` 零命中；`workspace` 下 10 个 quota 接口返回的是**资源配额**（cpu_count/gpu_count，单位是卡和核，不是钱），`ListProjectQuotas` 对普通用户返回 0 条、`ListUserQuotas` 要 workspace admin | 目前全仓无消费点，无功能损失；但「提交前提示项目额度不足/已欠费」在纯 v2 上做不出来。实测某项目 `member_remain_budget` 已是 **-0.99** |
+| **spec 无响应体定义** | `api_spec_v2.json` 每个 action 只有 `parameters`（请求参数），没有响应字段定义 | 客户端无法据此判断字段是否应被填充，也做不了兼容性校验 —— 这正是 SCHEMA 差异危险的根源 |
 | **`qz audit` / `qz file` 零 action** | spec 里注册为 service 但没有任何 action | 安全审计、文件挂载无 v2 入口 |
 | **`inference-serving` 路由 404** | spec 声明 18 个 action，网关上打不通 | 推理服务无法通过 v2 管理 |

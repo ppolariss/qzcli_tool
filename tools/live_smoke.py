@@ -21,6 +21,8 @@ import subprocess
 import sys
 import time
 import traceback
+
+import requests
 from pathlib import Path
 from typing import Any, Callable, Dict, List
 
@@ -31,11 +33,84 @@ from qzcli import api as qzapi  # noqa: E402
 from qzcli.api import QzAPIError, get_api  # noqa: E402
 from qzcli.config import (  # noqa: E402
     find_workspace_by_name,
+    load_all_resources,
     get_cookie,
     get_credentials,
     get_workspace_resources,
     load_env_file,
 )
+
+
+class _QuietDisplay:
+    """收集输出的假 display —— exec 内部会 print 一堆进度，别打乱 smoke 的表格。
+
+    用 ``__getattr__`` 兜住 print_* 家族：真 display 的方法集合会变，
+    写死几个会因为一个无关的新方法而 AttributeError。
+    """
+
+    def __init__(self):
+        self.lines = []
+
+    def print(self, msg="", *a, **kw):
+        self.lines.append(str(msg))
+
+    def __getattr__(self, name):
+        if name.startswith("print"):
+            return self.print
+        raise AttributeError(name)
+
+
+def pick_submittable_project(a, ws: str, cookie: str):
+    """挑一个**当前账号真能往里提任务**的项目。
+
+    以前这里是 `next(iter(cached_projects))` —— 从本地缓存随便拿第一个。
+    问题是缓存里可能混着你已经退出的项目，拿到它提交就报
+    ``AccessForbidden: 您已离开所选项目，无法创建``。低优排队用例就是栽在这个上。
+
+    换到 v2 ``GetProjectForPage`` 之后**优先问平台**，而不是信缓存 ——
+    缓存新不新鲜这里控制不了。平台问不到才退回缓存（离线时至少还能跑）。
+
+    ⚠️ v2 **不是**只返回你所属的项目。实测 11 个里有 1 个 ``is_member=False``
+    （状态 ``PASS_MODIFY_RESOURCE``）。所以这里必须自己按 ``is_member`` 过滤，
+    不能假设"平台已经帮你滤过了"。
+
+    ``is_member`` 只在 v2 可信：v1 对全部 12 个项目一律返回 ``False``（包括你
+    明显是成员的那些），拿它过滤会一个都不剩。因此字段缺失时**不过滤**，
+    宁可选到一个可能不能提交的项目（后续会明确报错），也不要静默返回"没有项目"。
+
+    返回 ``(project_id, 来源说明)``，拿不到返回 ``(None, 原因)``。
+    """
+    try:
+        items = a.list_projects_raw(cookie)
+    except (QzAPIError, requests.RequestException) as exc:
+        items = []
+        why = f"平台查询失败({type(exc).__name__})"
+    else:
+        why = "平台无匹配项目"
+    # 平台返回的项目里，挑挂在目标工作空间下、且你确实是成员的那个。
+    # 分两轮：先要 is_member 为真的；一个都没有再放宽 —— 见上面 docstring
+    # 里关于 v1 的 is_member 恒为 False 的说明。
+    for require_member in (True, False):
+        for proj in items:
+            if require_member and not proj.get("is_member"):
+                continue
+            for space in proj.get("space_list") or []:
+                if space.get("id") == ws and not space.get("usage_status"):
+                    tag = (
+                        "成员项目"
+                        if proj.get("is_member")
+                        else "非成员项目(可能提交失败)"
+                    )
+                    return (
+                        proj.get("id"),
+                        f"平台确认属于本空间的{tag}：{proj.get('name')}",
+                    )
+    cached = (get_workspace_resources(ws) or {}).get("projects") or {}
+    fallback = next(iter(cached), None)
+    if fallback:
+        return fallback, f"{why}，退回缓存（可能已失效，建议 qzcli res -u）"
+    return None, why
+
 
 RESULTS: List[Dict[str, Any]] = []
 
@@ -107,6 +182,13 @@ def main() -> int:
         help=(
             "低优排队用例的目标计算组 lcg-<uuid>。挑一个低优空位远少于 "
             "--queue-instances 的分区，这样任务必定停在排队、不会真占资源"
+        ),
+    )
+    ap.add_argument(
+        "--exec-notebook",
+        help=(
+            "exec 用例的目标开发机（notebook_id 或名字）。不传则自动挑："
+            "优先 CI 空间里 RUNNING 的 mova-base*，再退回任一 RUNNING 的"
         ),
     )
     ap.add_argument(
@@ -495,6 +577,84 @@ def main() -> int:
 
     _cli_repeat()
 
+    # ---- exec：能不能在真实开发机上执行命令
+    #
+    # **这条是补测试方法论漏洞加的。** 上一轮把 exec 的 Jupyter 地址迁到 v2
+    # (notebook GetNotebookAccessUrl) 时，我给它配的是把真机响应抄成常量的单测 ——
+    # 结果把真实 Jupyter token 提交进了仓库（token 就写在那条 URL 里）。
+    #
+    # 正确做法是**动态发现**：现找一台在跑的开发机，直接 exec。凭据全程不落盘，
+    # 而且因为是动态的也不会过期。
+    #
+    # 而且单测只能证明「URL 能解析成三个字段」，证明不了「这个地址真能连上、
+    # 命令真能执行」。那一半只有真机能验。
+    @check("exec 在真实开发机上执行命令", "qzcli exec")
+    def _exec_real():
+        import uuid as _uuid
+
+        display_stub = _QuietDisplay()
+
+        from qzcli.cli import _exec_via_jupyter, _find_notebook_jupyter_info
+
+        # 挑目标：优先用户日常在用的那台，它最能代表真实使用
+        candidates = []
+        if args.exec_notebook:
+            candidates = [(args.exec_notebook, "命令行指定")]
+        else:
+            preferred, others = [], []
+            for wid, wsinfo in load_all_resources().items():
+                try:
+                    r = a.list_notebooks_with_cookie(wid, cookie, page_size=100)
+                except QzAPIError:
+                    continue
+                for n in r.get("list") or []:
+                    if n.get("status") != "RUNNING":
+                        continue
+                    nid = n.get("notebook_id") or n.get("id") or ""
+                    name = str(n.get("name") or "")
+                    if not nid:
+                        continue
+                    if "CI-情境智能" == wsinfo.get("name") and name.startswith(
+                        "mova-base"
+                    ):
+                        preferred.append((nid, name))
+                    else:
+                        others.append((nid, name))
+            candidates = preferred + others
+        assert_true(candidates, "所有工作空间里都没有 RUNNING 的开发机")
+
+        marker = f"QZSMOKE_{_uuid.uuid4().hex[:10]}"
+        failures = []
+        # 逐个试到跑通为止。开发机可能个别不响应（终端起不来 / 负载高），
+        # 那是单台的问题，不代表 exec 这条路坏了 —— 所以要扫，不能试一台就下结论。
+        for nid, name in candidates[:5]:
+            try:
+                info = _find_notebook_jupyter_info(nid, display_stub)
+                if not info:
+                    failures.append(f"{name}: 拿不到 Jupyter 地址")
+                    continue
+                # 不变量：地址要能解析出 exec 需要的三个键
+                for key in ("base_url", "token", "notebook_id"):
+                    assert_true(info.get(key), f"{name}: 解析结果缺 {key}")
+                # 返回的是 (exit_code, output) 元组 —— 别当字符串用
+                exit_code, output = _exec_via_jupyter(
+                    info, f"echo {marker}", display_stub, timeout=90
+                )
+                if exit_code == 0 and marker in (output or ""):
+                    # 只报名字和 id 前 8 位 —— 输出会被贴进 PR 和飞书，
+                    # 绝不能带 token 或完整 access url
+                    return f"{name}（{nid[:8]}…）执行成功，回显匹配"
+                failures.append(f"{name}: exit={exit_code}，回显未匹配")
+            except Exception as exc:  # noqa: BLE001
+                failures.append(f"{name}: {type(exc).__name__}: {str(exc)[:60]}")
+            finally:
+                display_stub.lines.clear()
+        raise AssertionError(
+            f"试了 {len(candidates[:5])} 台开发机都没跑通：" + "; ".join(failures)
+        )
+
+    _exec_real()
+
     cooldown()
 
     @check("hpc-usage 默认形态", "qzcli hpc-usage")
@@ -549,16 +709,71 @@ def main() -> int:
             if args.spec:
                 spec = next((s for s in specs if s["id"] == args.spec), None)
                 assert_true(spec, f"指定的 spec {args.spec} 不在可用列表里")
+                lcg = (
+                    args.compute_group
+                    or (spec.get("logic_compute_group_ids") or [None])[0]
+                )
             else:
-                # 挑 GPU 数最小的，别占大机器
-                spec = min(specs, key=lambda s: (s["gpu_count"] or 99))
-            lcg = (
-                args.compute_group or (spec.get("logic_compute_group_ids") or [None])[0]
-            )
+                # 挑 GPU 数最小的，别占大机器 —— 但**必须挑到一个真能收这个任务的组**。
+                #
+                # 以前是 `min(specs, ...)` 然后闭眼取 `logic_compute_group_ids[0]`。
+                # spec 是从历史任务反推的，它记着的组现在可能已经不合适了，
+                # 提交就报 `InvalidParameter: no node spec found in
+                # logic_compute_group ...`。和「挑项目」是同一类病：
+                # **挑候选时不验证它真的能用**。
+                #
+                # 判据不能只是「这个组有规格」—— 实测 CI-情境智能 13 个组里：
+                #   4 个是 0 个 node_spec（GPU资源组 / MOVA-2.0-cuda13.2 / …）
+                #   3 个只有 CPU 规格且 support_job_type 只含 interactive_modeling
+                #     （开发机专用，收不了训练任务）
+                # 所以要求该组存在一个 node_spec **同时**满足：
+                #   support_job_type 含 distributed_training，且 gpu_count 够用。
+                spec, lcg = None, None
+                tried = []
+                ns_cache = {}
+
+                def _node_specs(gid):
+                    if gid not in ns_cache:
+                        try:
+                            ns_cache[gid] = a.list_node_specs(ws, gid)
+                        except (QzAPIError, requests.RequestException) as exc:
+                            tried.append(f"{gid[:12]}…查规格失败({type(exc).__name__})")
+                            ns_cache[gid] = []
+                    return ns_cache[gid]
+
+                def _can_take(gid, need_gpu):
+                    ns = _node_specs(gid)
+                    if not ns:
+                        tried.append(f"{gid[:12]}…(0 个 node_spec)")
+                        return False
+                    for x in ns:
+                        if "distributed_training" not in (
+                            x.get("support_job_type") or ""
+                        ):
+                            continue
+                        if (x.get("gpu_count") or 0) >= need_gpu:
+                            return True
+                    mx = max((x.get("gpu_count") or 0) for x in ns)
+                    tried.append(f"{gid[:12]}…(不收训练任务或最大仅 {mx} 卡)")
+                    return False
+
+                for cand in sorted(specs, key=lambda s: (s["gpu_count"] or 99)):
+                    need = cand.get("gpu_count") or 0
+                    for gid in cand.get("logic_compute_group_ids") or []:
+                        if _can_take(gid, need):
+                            spec, lcg = cand, gid
+                            break
+                    if lcg:
+                        break
+                assert_true(
+                    lcg,
+                    "没有任何 (spec, 计算组) 组合能收下这个训练任务。试过: "
+                    + ", ".join(dict.fromkeys(tried)),
+                )
             assert_true(lcg, "拿不到计算组")
-            proj = (get_workspace_resources(ws) or {}).get("projects") or {}
-            project_id = next(iter(proj), None)
-            assert_true(project_id, "拿不到 project_id")
+            assert_true(spec, "拿不到 spec")
+            project_id, why = pick_submittable_project(a, ws, cookie)
+            assert_true(project_id, f"拿不到可提交的 project_id：{why}")
 
             payload = {
                 "name": f"qzcli-v2-smoke-{int(time.time())}",
@@ -600,7 +815,13 @@ def main() -> int:
             assert_true(jid, f"响应里没有 job_id: {r}")
             state["new_job"] = jid
             state["new_job_name"] = payload["name"]
-            return f"job_id={jid} spec={spec['gpu_count']}卡 优先级=10(低优)"
+            # ⚠️ 别再写死数字。这行以前是「优先级=10(低优)」，而 payload 发的是 1 ——
+            # 既和实际不符，还把 v0.4.6 刚更正过的方向（1=低优、10=最高优）又教反一遍。
+            sent_priority = payload.get("task_priority")
+            return (
+                f"job_id={jid} spec={spec['gpu_count']}卡 "
+                f"优先级={sent_priority}(1=低优, 10=最高优)"
+            )
 
         _create()
 
@@ -620,11 +841,32 @@ def main() -> int:
 
             @check("停止任务", "qzcli stop")
             def _stop():
-                ok = a.stop_job_with_cookie(state["new_job"], cookie)
+                # ⚠️ 以前这里只断言 stop 返回 True、打一行 5 秒后的状态就完事。
+                # 「发出了停止指令」不等于「任务停了」—— 同一个洞在 HPC 那条上
+                # 真的漏过一个任务在队列里，事后手工停的。这可是 8 卡机器。
+                #
+                # 所以：轮询到终态才算过；到不了终态就**明确报出残留任务 id**，
+                # 而不是留一句"当前 status=RUNNING"让人以为正常。
+                jid = state["new_job"]
+                ok = a.stop_job_with_cookie(jid, cookie)
                 assert_true(ok, "stop 返回 False")
-                time.sleep(5)
-                d = a._get_job_detail_v2(state["new_job"], cookie)
-                return f"已发停止指令，当前 status={d.get('status')}"
+
+                # 训练任务和 HPC **状态词表不一样**：HPC 是 STOPPED/RUNNING，
+                # 训练是 job_stopped/job_running（见 display.py 的 STATUS_* 表）。
+                # 我第一版照抄 HPC 的词表，结果任务明明已经 job_stopped，
+                # 却报「60 秒仍未进入终态、可能有残留」—— 假警报会让人以后忽略真警报。
+                TERMINAL = {"job_stopped", "job_succeeded", "job_failed"}
+                st = None
+                for _ in range(20):  # 最多等 60 秒
+                    time.sleep(3)
+                    st = (a._get_job_detail_v2(jid, cookie) or {}).get("status")
+                    if st in TERMINAL:
+                        return f"已停止（status={st}）"
+                assert_true(
+                    False,
+                    f"stop 发出后 60 秒仍未进入终态（status={st}），"
+                    f"**可能有残留任务占着卡**，手工确认: {jid}",
+                )
 
             _stop()
 
@@ -674,9 +916,8 @@ def main() -> int:
                     f"{node_gpu!r} 不符 —— 这样提交会永远排队等一种不存在的卡",
                 )
 
-                proj = (get_workspace_resources(ws) or {}).get("projects") or {}
-                project_id = next(iter(proj), None)
-                assert_true(project_id, "拿不到 project_id")
+                project_id, why = pick_submittable_project(a, ws, cookie)
+                assert_true(project_id, f"拿不到可提交的 project_id：{why}")
 
                 payload = {
                     "name": f"qzcli-lowpri-queue-smoke-{int(time.time())}",
@@ -791,11 +1032,51 @@ def main() -> int:
             def _hpc_stop():
                 # qzcli 目前没有 HPC 停止命令，直接打 v2 Action 收尾，
                 # 顺便验证它可用 —— 这也是补 `qzcli hpc-stop` 的前置。
-                a._request_v2("hpc", "StopJob", {"job_id": state["hpc_job"]})
-                time.sleep(5)
-                got = a.list_hpc_jobs(ws, page_size=50).get("jobs") or []
-                me = next((j for j in got if j.get("job_id") == state["hpc_job"]), None)
-                return f"status={me.get('status') if me else '（列表里暂未刷新）'}"
+                #
+                # ⚠️ 提交完**立刻**停会撞竞态：平台只接受
+                # QUEUEING/CREATING/RUNNING/SUCCEEDED_RETAINING/FAILED_RETAINING，
+                # 而刚提交的任务还没进这些状态，StopJob 直接 Conflict ——
+                # 然后任务就**留在队列里没人管**。实测踩过一次，事后手工停的。
+                #
+                # 残留资源比测试变红严重得多，所以这里等到可停止再停，
+                # 停完还要确认真的到了终态，不是发完命令就当完事。
+                jid = state["hpc_job"]
+                STOPPABLE = {
+                    "QUEUEING",
+                    "CREATING",
+                    "RUNNING",
+                    "SUCCEEDED_RETAINING",
+                    "FAILED_RETAINING",
+                }
+                TERMINAL = {"STOPPED", "SUCCEEDED", "FAILED", "CANCELLED"}
+
+                def _status():
+                    return (a._request_v2("hpc", "GetJob", {"job_id": jid}) or {}).get(
+                        "status"
+                    )
+
+                st = None
+                for _ in range(20):  # 最多等 60 秒
+                    st = _status()
+                    if st in STOPPABLE or st in TERMINAL:
+                        break
+                    time.sleep(3)
+                if st in TERMINAL:
+                    return f"任务已自行结束（status={st}），无需停止"
+
+                assert_true(st in STOPPABLE, f"等了 60 秒仍不可停止（status={st}）")
+                a._request_v2("hpc", "StopJob", {"job_id": jid})
+
+                for _ in range(20):  # 最多等 60 秒确认终态
+                    time.sleep(3)
+                    st = _status()
+                    if st in TERMINAL:
+                        return f"已停止（status={st}）"
+                assert_true(
+                    False,
+                    f"StopJob 发出后 60 秒仍未到终态（status={st}），"
+                    f"**可能有残留任务**，手工确认: {jid}",
+                )
 
             _hpc_stop()
     else:

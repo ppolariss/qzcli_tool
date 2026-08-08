@@ -32,6 +32,7 @@ from .config import (
     save_token_cache,
 )
 from .crypto import encrypt_password
+from .diag import swallowed
 
 # /api/v2/* requires this header — without it APISIX gateway redirects to
 # Keycloak login (returning HTML) even when the Bearer token is valid.
@@ -465,12 +466,13 @@ def _relogin_file_lock():
                     import fcntl as _f
 
                     _f.flock(fh.fileno(), _f.LOCK_UN)
-            except Exception:
-                pass
+            except OSError as exc:
+                # 解锁失败也要继续走到 close()；进程退出时内核会释放锁。
+                swallowed("锁/解锁", exc)
             try:
                 fh.close()
-            except Exception:
-                pass
+            except OSError as exc:
+                swallowed("锁/关闭句柄", exc)
 
 
 def _v2_then_v1(name: str, v2_call, v1_call, *, logger=None):
@@ -1669,6 +1671,79 @@ class QzAPI:
             "order_by": [{"field": "created_at", "order": "desc"}],
         }
 
+    def get_notebook_access_url(
+        self, notebook_id: str, cookie: str = ""
+    ) -> Dict[str, str]:
+        """开发机的 web 访问地址（Jupyter Lab / VS Code）。
+
+        v2 ``notebook GetNotebookAccessUrl``，v2 不通时回落 v1 的 301 跳转。
+
+        **上游 2026-08 才补上这个 action。** 在此之前 v2 全域拿不到 Jupyter 地址
+        （只有 ``extra_info.ProxyJump``），所以 ``qzcli exec`` 是最后一个 v1 依赖，
+        文档里一直记着「无任何 v2 对应」。
+
+        实测两边给的是**同一条 URL**（同 host、同路径、同 token），所以下游解析逻辑
+        不用动；v2 还多给一个 ``vscode_url``。
+
+        Returns:
+            ``{"jupyter_url": str, "vscode_url": str}``；拿不到时对应键为空串。
+        """
+
+        def _v2() -> Dict[str, str]:
+            r = self._request_v2(
+                "notebook",
+                "GetNotebookAccessUrl",
+                {"notebook_id": notebook_id},
+                cookie=cookie,
+                referer_path="/notebooks",
+            )
+            return {
+                "jupyter_url": (r or {}).get("jupyter_url") or "",
+                "vscode_url": (r or {}).get("vscode_url") or "",
+            }
+
+        def _v1() -> Dict[str, str]:
+            return {
+                "jupyter_url": self._notebook_lab_url_v1(notebook_id, cookie),
+                "vscode_url": "",
+            }
+
+        return _v2_then_v1("notebook/lab", _v2, _v1)
+
+    def _notebook_lab_url_v1(self, notebook_id: str, cookie: str = "") -> str:
+        """v1 兜底：``GET /api/v1/notebook/lab/{id}`` 的 301 ``Location``。
+
+        这个端点不返回 JSON —— 它靠重定向把带 token 的 Jupyter 地址放在响应头里，
+        所以不能走 ``_curl_post``，只能单独发一次不跟重定向的 GET。
+        """
+        import requests as _requests
+
+        if not cookie:
+            cookie = (get_cookie() or {}).get("cookie", "")
+        resp = _requests.get(
+            f"{self.base_url}/api/v1/notebook/lab/{notebook_id}",
+            headers={
+                "cookie": cookie,
+                "user-agent": "Mozilla/5.0",
+                "accept": "text/html",
+            },
+            allow_redirects=False,
+            timeout=15,
+            proxies=(
+                {"http": get_proxy(), "https": get_proxy()} if get_proxy() else None
+            ),
+        )
+        if resp.status_code in (301, 302, 303, 307):
+            location = resp.headers.get("Location", "")
+            if "keycloak" in location:
+                raise QzAPIError("Cookie 已过期", 401)
+            return location
+        if resp.status_code == 401:
+            raise QzAPIError("Cookie 已过期", 401)
+        raise QzAPIError(
+            f"获取 Jupyter URL 失败: HTTP {resp.status_code}", resp.status_code
+        )
+
     def list_notebooks_with_cookie(
         self,
         workspace_id: str,
@@ -2504,7 +2579,7 @@ class QzAPI:
 
     @with_rate_limit_retry
     @with_auth_retry
-    def _project_list_items(self, cookie: str = "") -> List[Dict[str, Any]]:
+    def _project_list_items_v1(self, cookie: str = "") -> List[Dict[str, Any]]:
         """``POST /api/v1/project/list`` → ``data.items``。
 
         ``cookie`` 省略时**从磁盘兜底**，与 ``_request_v2`` 同构。少了这一步，
@@ -2572,15 +2647,106 @@ class QzAPI:
 
         return items
 
+    @with_rate_limit_retry
+    def _project_list_items_v2(self, cookie: str = "") -> List[Dict[str, Any]]:
+        """v2 ``project GetProjectForPage`` → ``items``。
+
+        比 v1 的 ``ListProjects`` 干净，但**不是**"只返回你所属的项目" ——
+        这条断言曾经写在这里，是错的，实测推翻了它。真实情况：
+
+        - v2 返回 11 条、v1 返回 12 条，**两边不是子集关系**：v2 排除了 2 个
+          「已结束且用户不在其中」的项目，又补上 1 个 v1 没给的。
+        - v2 返回的 11 条里**有 1 条 ``is_member=False``**（状态
+          ``PASS_MODIFY_RESOURCE``）。所以调用方要按成员身份过滤的话，
+          **必须自己滤**，不能指望平台滤过了。
+        - ``is_member`` 只在 v2 可信：v1 对全部 12 条一律返回 ``False``，
+          包括用户明显是成员的项目。拿 v1 的这个字段过滤会一个都不剩。
+
+        下游依赖的 ``name`` / ``space_list[].id`` / ``space_list[].usage_status``
+        与 v1 逐字段一致。
+
+        **v2 丢了预算数据**（已知缺口，非本仓可修）：
+
+        - ``remain_budget`` 键在，但值是空字符串 ``''``；v1 有真实数值
+        - ``member_remain_budget``（**你个人**在该项目下的剩余额度）v2 直接没有
+
+        这两个不是一回事：实测「公共科研项目」v1 的 ``remain_budget`` 是
+        9.98 亿而 ``member_remain_budget`` 只有 673 —— 前者是项目池，后者是
+        你个人配额。目前全仓无人消费这两个字段，所以迁 v2 无功能损失；但
+        「提交前提示你在该项目还剩多少额度」这类功能在 v2 上做不了，
+        需要平台侧补齐。
+
+        分页：一次取 200 打底，并**按响应里的 ``total`` 校验有没有被截断**。
+        以前只发 ``{page:1, page_size:200}`` 就直接返回 ``items`` —— 真有人超过
+        200 个项目时多出来的会被静默丢掉，症状是 ``list_workspaces`` 少列几个
+        工作空间、``qzcli ws`` 少几行，**退出码还是 0**。跟 ``except: pass``
+        是同一类病，所以这里宁可多打一两次请求也要把话说全。
+
+        注意 ``total`` 是**字符串**（实测 ``'11'``），不能直接跟 len() 比大小。
+
+        上游 spec 里 v1 的 ``ListProjects`` 已被移除，这条是唯一正式接口。
+        """
+        page_size = 200
+        items: List[Dict[str, Any]] = []
+        page = 1
+        while True:
+            result = (
+                self._request_v2(
+                    "project",
+                    "GetProjectForPage",
+                    {"page": page, "page_size": page_size},
+                    cookie=cookie,
+                    referer_path="/operations/projects",
+                )
+                or {}
+            )
+            batch = result.get("items") or []
+            items.extend(batch)
+
+            try:
+                total = int(result.get("total") or 0)
+            except (TypeError, ValueError):
+                # total 形状变了就别猜 —— 拿到手的照常返回，但留痕，
+                # 免得"翻页判断失效"这件事本身又变成一个静默故障。
+                swallowed(
+                    "project/list 分页",
+                    ValueError(f"total 不是数字: {result.get('total')!r}"),
+                )
+                break
+
+            if len(items) >= total or not batch:
+                break
+            page += 1
+            if page > 50:  # 10000 个项目，现实里不可能；防翻页条件失灵时死循环
+                swallowed(
+                    "project/list 分页",
+                    RuntimeError(f"翻到第 {page} 页仍未取满 total={total}，停止"),
+                )
+                break
+
+        return items
+
+    def _project_list_items(self, cookie: str = "") -> List[Dict[str, Any]]:
+        """项目列表原始条目。v2 优先，v2 路由不通时回落 v1。
+
+        **返回值形状是下游 9 个调用点的契约**：
+        ``[{id, name, space_list: [{id, name, usage_status, ...}], ...}]``。
+        形状变了不会报错，只会让 ``list_workspaces`` 静默返空 —— 那比崩掉更难查。
+        """
+        return _v2_then_v1(
+            "project/list",
+            lambda: self._project_list_items_v2(cookie),
+            lambda: self._project_list_items_v1(cookie),
+        )
+
     def list_projects_raw(self, cookie: str = "") -> List[Dict[str, Any]]:
-        """项目列表原始条目（``/api/v1/project/list`` 的 ``data.items``）。
+        """项目列表原始条目。
 
         每条含 ``id`` / ``name`` / ``space_list[]``，即**项目 → 它属于哪些工作空间**
         的权威映射。``list_workspaces`` 和「项目归属核实」都基于它。
 
-        为什么用 v1：v2 的 ``project ListProjects`` 对普通账号是 ``AccessForbidden``
-        （实测），全域也没有别的接口能给出这个映射。详见
-        ``docs/v1_to_v2_mapping.md``。
+        走 v2 ``project GetProjectForPage``（上游 2026-08 放开了普通用户权限；
+        在那之前它是 ``AccessForbidden``，qzcli 只能用 v1）。v2 路由不通时自动回落。
         """
         return self._project_list_items(cookie)
 
@@ -2597,7 +2763,18 @@ class QzAPI:
         Returns:
             工作空间列表 [{"id": "ws-xxx", "name": "工作空间名称"}, ...]
         """
-        items = self._project_list_items(cookie)
+        return self._workspaces_from_project_items(self._project_list_items(cookie))
+
+    def _workspaces_from_project_items(
+        self, items: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """项目条目 → 去重后的工作空间列表。
+
+        单独抽出来，是为了让**需要绕开分发器的调用方**能直接喂 v1 或 v2 的结果。
+        典型是 ``tools/parity_sweep.py``：它要验的对象之一就是项目列表，如果枚举
+        工作空间也走默认分发器，就成了拿被测对象驱动测试 —— 真坏了的话可能只扫到
+        部分空间却报「全部一致」。
+        """
         # 从项目的 space_list 中提取工作空间（去重）
         #
         # 注意 project/list 会把**你不是成员的项目**也返回回来，其 space_list 里
@@ -2819,8 +2996,10 @@ class QzAPI:
                 for cookie in session.cookies:
                     if "qz.sii.edu.cn" in cookie.domain:
                         all_cookies[cookie.name] = cookie.value
-            except Exception:
-                pass
+            except requests.RequestException as exc:
+                # 只兜网络问题。以前这里是 except Exception —— 属性名写错之类的
+                # 真 bug 会被吞成「拿不到 session cookie」，把人往登录态失效上引。
+                swallowed("登录/预热会话", exc)
 
         if not all_cookies or not self._has_session_cookie(all_cookies):
             raise QzAPIError("登录成功但未获取到 session cookie")
