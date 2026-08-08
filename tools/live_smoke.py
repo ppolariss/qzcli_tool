@@ -67,9 +67,16 @@ def pick_submittable_project(a, ws: str, cookie: str):
     问题是缓存里可能混着你已经退出的项目，拿到它提交就报
     ``AccessForbidden: 您已离开所选项目，无法创建``。低优排队用例就是栽在这个上。
 
-    换到 v2 ``GetProjectForPage`` 之后，平台侧只返回「当前用户所属」的项目，
-    所以**优先问平台**，而不是信缓存 —— 缓存是不是新鲜的，这里控制不了。
-    平台问不到才退回缓存（离线 / 权限异常时至少还能跑）。
+    换到 v2 ``GetProjectForPage`` 之后**优先问平台**，而不是信缓存 ——
+    缓存新不新鲜这里控制不了。平台问不到才退回缓存（离线时至少还能跑）。
+
+    ⚠️ v2 **不是**只返回你所属的项目。实测 11 个里有 1 个 ``is_member=False``
+    （状态 ``PASS_MODIFY_RESOURCE``）。所以这里必须自己按 ``is_member`` 过滤，
+    不能假设"平台已经帮你滤过了"。
+
+    ``is_member`` 只在 v2 可信：v1 对全部 12 个项目一律返回 ``False``（包括你
+    明显是成员的那些），拿它过滤会一个都不剩。因此字段缺失时**不过滤**，
+    宁可选到一个可能不能提交的项目（后续会明确报错），也不要静默返回"没有项目"。
 
     返回 ``(project_id, 来源说明)``，拿不到返回 ``(None, 原因)``。
     """
@@ -80,11 +87,24 @@ def pick_submittable_project(a, ws: str, cookie: str):
         why = f"平台查询失败({type(exc).__name__})"
     else:
         why = "平台无匹配项目"
-    # 平台返回的项目里，挑挂在目标工作空间下的那个
-    for proj in items:
-        for space in proj.get("space_list") or []:
-            if space.get("id") == ws and not space.get("usage_status"):
-                return proj.get("id"), f"平台确认属于本空间：{proj.get('name')}"
+    # 平台返回的项目里，挑挂在目标工作空间下、且你确实是成员的那个。
+    # 分两轮：先要 is_member 为真的；一个都没有再放宽 —— 见上面 docstring
+    # 里关于 v1 的 is_member 恒为 False 的说明。
+    for require_member in (True, False):
+        for proj in items:
+            if require_member and not proj.get("is_member"):
+                continue
+            for space in proj.get("space_list") or []:
+                if space.get("id") == ws and not space.get("usage_status"):
+                    tag = (
+                        "成员项目"
+                        if proj.get("is_member")
+                        else "非成员项目(可能提交失败)"
+                    )
+                    return (
+                        proj.get("id"),
+                        f"平台确认属于本空间的{tag}：{proj.get('name')}",
+                    )
     cached = (get_workspace_resources(ws) or {}).get("projects") or {}
     fallback = next(iter(cached), None)
     if fallback:
