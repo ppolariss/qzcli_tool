@@ -815,7 +815,13 @@ def main() -> int:
             assert_true(jid, f"响应里没有 job_id: {r}")
             state["new_job"] = jid
             state["new_job_name"] = payload["name"]
-            return f"job_id={jid} spec={spec['gpu_count']}卡 优先级=10(低优)"
+            # ⚠️ 别再写死数字。这行以前是「优先级=10(低优)」，而 payload 发的是 1 ——
+            # 既和实际不符，还把 v0.4.6 刚更正过的方向（1=低优、10=最高优）又教反一遍。
+            sent_priority = payload.get("task_priority")
+            return (
+                f"job_id={jid} spec={spec['gpu_count']}卡 "
+                f"优先级={sent_priority}(1=低优, 10=最高优)"
+            )
 
         _create()
 
@@ -845,7 +851,11 @@ def main() -> int:
                 ok = a.stop_job_with_cookie(jid, cookie)
                 assert_true(ok, "stop 返回 False")
 
-                TERMINAL = {"STOPPED", "SUCCEEDED", "FAILED", "CANCELLED", "STOPPING"}
+                # 训练任务和 HPC **状态词表不一样**：HPC 是 STOPPED/RUNNING，
+                # 训练是 job_stopped/job_running（见 display.py 的 STATUS_* 表）。
+                # 我第一版照抄 HPC 的词表，结果任务明明已经 job_stopped，
+                # 却报「60 秒仍未进入终态、可能有残留」—— 假警报会让人以后忽略真警报。
+                TERMINAL = {"job_stopped", "job_succeeded", "job_failed"}
                 st = None
                 for _ in range(20):  # 最多等 60 秒
                     time.sleep(3)
