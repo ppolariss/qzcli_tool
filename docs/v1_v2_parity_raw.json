@@ -1,9 +1,9 @@
 [
   {
-    "kind": "SCHEMA",
+    "kind": "SCHEMA_REVIEWED",
     "endpoint": "projects",
     "workspace": "（全局）",
-    "detail": "元素字段不同：只在 v1=['member_remain_budget'] 只在 v2=[]"
+    "detail": "member_remain_budget：v1 独有，v2 无对应。含义是「你个人在该项目下的剩余额度」（区别于项目池的 remain_budget —— 实测公共科研项目 9.98 亿 vs 673）。全仓 grep 无任何消费点，迁 v2 无功能损失；但 v2 全 169 个 action 里也没有替代接口，点券可见性在 v2 上归零，已记在 _project_list_items_v2 的 docstring 里。"
   },
   {
     "kind": "VALUE",
@@ -12,15 +12,9 @@
     "detail": "10 条交集里字段值不一致：is_member×10, remain_budget×10, sub_project_list×1"
   },
   {
-    "kind": "SCHEMA",
-    "endpoint": "jobs",
-    "workspace": "分布式训练空间",
-    "detail": "元素字段不同：只在 v1=['running_time_ms'] 只在 v2=[]"
-  },
-  {
     "kind": "VALUE",
     "endpoint": "jobs",
     "workspace": "分布式训练空间",
-    "detail": "20 条交集里字段值不一致：node_count×1, node_infos×1, timeline×1"
+    "detail": "20 条交集里字段值不一致：timeline×3"
   }
 ]
