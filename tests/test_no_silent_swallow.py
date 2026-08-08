@@ -77,9 +77,7 @@ class RepoWideSwallowScanTests(unittest.TestCase):
         """
         src = "try:\n    f()\nexcept Exception:\n    pass\n"
         tree = ast.parse(src)
-        handler = next(
-            n for n in ast.walk(tree) if isinstance(n, ast.ExceptHandler)
-        )
+        handler = next(n for n in ast.walk(tree) if isinstance(n, ast.ExceptHandler))
         broad = ast.unparse(handler.type) in ("Exception", "BaseException")
         silent = all(isinstance(s, ast.Pass) for s in handler.body)
         self.assertTrue(broad and silent, "扫描器判不出最基本的犯案形状")
@@ -181,3 +179,39 @@ class ExecTimeoutReasonTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SmokeTerminalStatusVocabTests(unittest.TestCase):
+    """`live_smoke` 判「任务停了没」用的状态词表必须和 qzcli 真实用的一致。
+
+    这条是被自己坑出来的：训练任务停止的终态判据我照抄了 HPC 的 `STOPPED`，
+    但训练任务用的是 `job_stopped`（小写带前缀）。结果任务明明已经停了，
+    smoke 却报「60 秒仍未进入终态，**可能有残留任务占着卡**」。
+
+    **假警报比不报警更糟** —— 报一次「可能有残留」而实际没有，下次真有残留时
+    没人会当回事。所以这里结构性地钉住：训练任务的终态词必须真的存在于
+    `display.py` 的状态表里，抄错一个字母立刻红。
+    """
+
+    def test_training_terminal_words_exist_in_display_table(self):
+        import re
+
+        from qzcli import display as disp
+
+        src = (REPO / "tools" / "live_smoke.py").read_text(encoding="utf-8")
+        m = re.search(r'TERMINAL = \{("job_[^}]+)\}', src)
+        self.assertIsNotNone(m, "没找到训练任务的 TERMINAL 词表，改名了？")
+        words = set(re.findall(r'"([a-z_]+)"', m.group(1)))
+        self.assertTrue(words, "TERMINAL 词表是空的")
+
+        known = set()
+        for name in dir(disp):
+            val = getattr(disp, name)
+            if isinstance(val, dict):
+                known.update(k for k in val if isinstance(k, str))
+        unknown = sorted(words - known)
+        self.assertEqual(
+            unknown,
+            [],
+            f"这些状态词在 display.py 的状态表里不存在，八成是抄错了: {unknown}",
+        )
