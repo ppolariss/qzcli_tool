@@ -8,8 +8,10 @@
 
 ## 换接口顺带修掉的真 bug
 
-v1 的 ``ListProjects`` 会把**已结束且当前用户不在其中**的项目也返回，
-而 ``GetProjectForPage`` 按 spec 描述只返回「当前用户所属」的。
+v1 的 ``ListProjects`` 会把**已结束且当前用户不在其中**的项目也返回。
+``GetProjectForPage`` 干净得多，但 **spec 描述的「只返回当前用户所属」是不准的** ——
+实测 11 条里有 1 条 ``is_member=False``（``CI-情境智能-探索课题``，状态
+``PASS_MODIFY_RESOURCE``）。要按成员身份过滤的调用方必须自己滤。
 
 实测本账号（别照推，这两边的差异不是简单的子集关系）：
 
@@ -156,3 +158,73 @@ class ProjectListV2Tests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PaginationTests(unittest.TestCase):
+    """``total`` 说有多少条，就必须真拿到多少条。
+
+    以前只发一次 ``{page:1, page_size:200}`` 就返回 ``items``，超出 200 的部分
+    被静默丢掉 —— 症状是 ``list_workspaces`` 少列工作空间、``qzcli ws`` 少几行，
+    **退出码还是 0**。和 ``except: pass`` 是同一类病。
+    """
+
+    def test_total_is_a_string_on_the_wire(self):
+        """平台实测返回 ``'11'`` 而不是 ``11``。
+
+        直接拿 len() 跟它比大小会 TypeError；写成 ``if total > len(items)``
+        这种「看着对」的代码会在真实数据上炸。这条把类型钉死。
+        """
+        api = _api()
+        with patch.object(
+            api, "_request_v2", return_value={"items": _V2_ITEMS, "total": "2"}
+        ) as v2:
+            items = api.list_projects_raw()
+        self.assertEqual(len(items), 2)
+        self.assertEqual(v2.call_count, 1, "拿满了就不该再翻页")
+
+    def test_keeps_paging_until_total_is_reached(self):
+        api = _api()
+        page1 = {
+            "items": [_project(f"p{i}", f"项目{i}") for i in range(200)],
+            "total": "250",
+        }
+        page2 = {
+            "items": [_project(f"q{i}", f"项目{i}") for i in range(50)],
+            "total": "250",
+        }
+        with patch.object(api, "_request_v2", side_effect=[page1, page2]) as v2:
+            items = api.list_projects_raw()
+        self.assertEqual(len(items), 250, "第 2 页的 50 个项目被丢了")
+        self.assertEqual(v2.call_count, 2)
+        self.assertEqual(v2.call_args_list[1][0][2]["page"], 2)
+
+    def test_stops_when_a_page_comes_back_empty(self):
+        """平台的 total 报大了也不能死循环。"""
+        api = _api()
+        with patch.object(
+            api,
+            "_request_v2",
+            side_effect=[
+                {"items": _V2_ITEMS, "total": "999"},
+                {"items": [], "total": "999"},
+            ],
+        ) as v2:
+            items = api.list_projects_raw()
+        self.assertEqual(len(items), 2)
+        self.assertEqual(v2.call_count, 2, "空页之后就该停")
+
+    def test_malformed_total_returns_what_we_got_and_leaves_a_trace(self):
+        """``total`` 形状变了不猜、不崩、不装作没事。"""
+        from qzcli import diag
+
+        diag.clear()
+        api = _api()
+        with patch.object(
+            api, "_request_v2", return_value={"items": _V2_ITEMS, "total": {"n": 2}}
+        ):
+            items = api.list_projects_raw()
+        self.assertEqual(len(items), 2, "拿到手的照常返回")
+        self.assertIsNotNone(
+            diag.last_reason("project/list 分页"),
+            "翻页判断失效本身也是个故障，必须留痕",
+        )

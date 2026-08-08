@@ -2676,17 +2676,55 @@ class QzAPI:
         「提交前提示你在该项目还剩多少额度」这类功能在 v2 上做不了，
         需要平台侧补齐。
 
-        分页：一次取 200，覆盖现有规模（本账号 11 个）。上游 spec 里 v1 的
-        ``ListProjects`` 已被移除，这条是唯一正式接口。
+        分页：一次取 200 打底，并**按响应里的 ``total`` 校验有没有被截断**。
+        以前只发 ``{page:1, page_size:200}`` 就直接返回 ``items`` —— 真有人超过
+        200 个项目时多出来的会被静默丢掉，症状是 ``list_workspaces`` 少列几个
+        工作空间、``qzcli ws`` 少几行，**退出码还是 0**。跟 ``except: pass``
+        是同一类病，所以这里宁可多打一两次请求也要把话说全。
+
+        注意 ``total`` 是**字符串**（实测 ``'11'``），不能直接跟 len() 比大小。
+
+        上游 spec 里 v1 的 ``ListProjects`` 已被移除，这条是唯一正式接口。
         """
-        result = self._request_v2(
-            "project",
-            "GetProjectForPage",
-            {"page": 1, "page_size": 200},
-            cookie=cookie,
-            referer_path="/operations/projects",
-        )
-        return (result or {}).get("items") or []
+        page_size = 200
+        items: List[Dict[str, Any]] = []
+        page = 1
+        while True:
+            result = (
+                self._request_v2(
+                    "project",
+                    "GetProjectForPage",
+                    {"page": page, "page_size": page_size},
+                    cookie=cookie,
+                    referer_path="/operations/projects",
+                )
+                or {}
+            )
+            batch = result.get("items") or []
+            items.extend(batch)
+
+            try:
+                total = int(result.get("total") or 0)
+            except (TypeError, ValueError):
+                # total 形状变了就别猜 —— 拿到手的照常返回，但留痕，
+                # 免得"翻页判断失效"这件事本身又变成一个静默故障。
+                swallowed(
+                    "project/list 分页",
+                    ValueError(f"total 不是数字: {result.get('total')!r}"),
+                )
+                break
+
+            if len(items) >= total or not batch:
+                break
+            page += 1
+            if page > 50:  # 10000 个项目，现实里不可能；防翻页条件失灵时死循环
+                swallowed(
+                    "project/list 分页",
+                    RuntimeError(f"翻到第 {page} 页仍未取满 total={total}，停止"),
+                )
+                break
+
+        return items
 
     def _project_list_items(self, cookie: str = "") -> List[Dict[str, Any]]:
         """项目列表原始条目。v2 优先，v2 路由不通时回落 v1。
