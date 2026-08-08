@@ -709,13 +709,69 @@ def main() -> int:
             if args.spec:
                 spec = next((s for s in specs if s["id"] == args.spec), None)
                 assert_true(spec, f"指定的 spec {args.spec} 不在可用列表里")
+                lcg = (
+                    args.compute_group
+                    or (spec.get("logic_compute_group_ids") or [None])[0]
+                )
             else:
-                # 挑 GPU 数最小的，别占大机器
-                spec = min(specs, key=lambda s: (s["gpu_count"] or 99))
-            lcg = (
-                args.compute_group or (spec.get("logic_compute_group_ids") or [None])[0]
-            )
+                # 挑 GPU 数最小的，别占大机器 —— 但**必须挑到一个真能收这个任务的组**。
+                #
+                # 以前是 `min(specs, ...)` 然后闭眼取 `logic_compute_group_ids[0]`。
+                # spec 是从历史任务反推的，它记着的组现在可能已经不合适了，
+                # 提交就报 `InvalidParameter: no node spec found in
+                # logic_compute_group ...`。和「挑项目」是同一类病：
+                # **挑候选时不验证它真的能用**。
+                #
+                # 判据不能只是「这个组有规格」—— 实测 CI-情境智能 13 个组里：
+                #   4 个是 0 个 node_spec（GPU资源组 / MOVA-2.0-cuda13.2 / …）
+                #   3 个只有 CPU 规格且 support_job_type 只含 interactive_modeling
+                #     （开发机专用，收不了训练任务）
+                # 所以要求该组存在一个 node_spec **同时**满足：
+                #   support_job_type 含 distributed_training，且 gpu_count 够用。
+                spec, lcg = None, None
+                tried = []
+                ns_cache = {}
+
+                def _node_specs(gid):
+                    if gid not in ns_cache:
+                        try:
+                            ns_cache[gid] = a.list_node_specs(ws, gid)
+                        except (QzAPIError, requests.RequestException) as exc:
+                            tried.append(f"{gid[:12]}…查规格失败({type(exc).__name__})")
+                            ns_cache[gid] = []
+                    return ns_cache[gid]
+
+                def _can_take(gid, need_gpu):
+                    ns = _node_specs(gid)
+                    if not ns:
+                        tried.append(f"{gid[:12]}…(0 个 node_spec)")
+                        return False
+                    for x in ns:
+                        if "distributed_training" not in (
+                            x.get("support_job_type") or ""
+                        ):
+                            continue
+                        if (x.get("gpu_count") or 0) >= need_gpu:
+                            return True
+                    mx = max((x.get("gpu_count") or 0) for x in ns)
+                    tried.append(f"{gid[:12]}…(不收训练任务或最大仅 {mx} 卡)")
+                    return False
+
+                for cand in sorted(specs, key=lambda s: (s["gpu_count"] or 99)):
+                    need = cand.get("gpu_count") or 0
+                    for gid in cand.get("logic_compute_group_ids") or []:
+                        if _can_take(gid, need):
+                            spec, lcg = cand, gid
+                            break
+                    if lcg:
+                        break
+                assert_true(
+                    lcg,
+                    "没有任何 (spec, 计算组) 组合能收下这个训练任务。试过: "
+                    + ", ".join(dict.fromkeys(tried)),
+                )
             assert_true(lcg, "拿不到计算组")
+            assert_true(spec, "拿不到 spec")
             project_id, why = pick_submittable_project(a, ws, cookie)
             assert_true(project_id, f"拿不到可提交的 project_id：{why}")
 
@@ -779,11 +835,28 @@ def main() -> int:
 
             @check("停止任务", "qzcli stop")
             def _stop():
-                ok = a.stop_job_with_cookie(state["new_job"], cookie)
+                # ⚠️ 以前这里只断言 stop 返回 True、打一行 5 秒后的状态就完事。
+                # 「发出了停止指令」不等于「任务停了」—— 同一个洞在 HPC 那条上
+                # 真的漏过一个任务在队列里，事后手工停的。这可是 8 卡机器。
+                #
+                # 所以：轮询到终态才算过；到不了终态就**明确报出残留任务 id**，
+                # 而不是留一句"当前 status=RUNNING"让人以为正常。
+                jid = state["new_job"]
+                ok = a.stop_job_with_cookie(jid, cookie)
                 assert_true(ok, "stop 返回 False")
-                time.sleep(5)
-                d = a._get_job_detail_v2(state["new_job"], cookie)
-                return f"已发停止指令，当前 status={d.get('status')}"
+
+                TERMINAL = {"STOPPED", "SUCCEEDED", "FAILED", "CANCELLED", "STOPPING"}
+                st = None
+                for _ in range(20):  # 最多等 60 秒
+                    time.sleep(3)
+                    st = (a._get_job_detail_v2(jid, cookie) or {}).get("status")
+                    if st in TERMINAL:
+                        return f"已停止（status={st}）"
+                assert_true(
+                    False,
+                    f"stop 发出后 60 秒仍未进入终态（status={st}），"
+                    f"**可能有残留任务占着卡**，手工确认: {jid}",
+                )
 
             _stop()
 
@@ -949,11 +1022,51 @@ def main() -> int:
             def _hpc_stop():
                 # qzcli 目前没有 HPC 停止命令，直接打 v2 Action 收尾，
                 # 顺便验证它可用 —— 这也是补 `qzcli hpc-stop` 的前置。
-                a._request_v2("hpc", "StopJob", {"job_id": state["hpc_job"]})
-                time.sleep(5)
-                got = a.list_hpc_jobs(ws, page_size=50).get("jobs") or []
-                me = next((j for j in got if j.get("job_id") == state["hpc_job"]), None)
-                return f"status={me.get('status') if me else '（列表里暂未刷新）'}"
+                #
+                # ⚠️ 提交完**立刻**停会撞竞态：平台只接受
+                # QUEUEING/CREATING/RUNNING/SUCCEEDED_RETAINING/FAILED_RETAINING，
+                # 而刚提交的任务还没进这些状态，StopJob 直接 Conflict ——
+                # 然后任务就**留在队列里没人管**。实测踩过一次，事后手工停的。
+                #
+                # 残留资源比测试变红严重得多，所以这里等到可停止再停，
+                # 停完还要确认真的到了终态，不是发完命令就当完事。
+                jid = state["hpc_job"]
+                STOPPABLE = {
+                    "QUEUEING",
+                    "CREATING",
+                    "RUNNING",
+                    "SUCCEEDED_RETAINING",
+                    "FAILED_RETAINING",
+                }
+                TERMINAL = {"STOPPED", "SUCCEEDED", "FAILED", "CANCELLED"}
+
+                def _status():
+                    return (a._request_v2("hpc", "GetJob", {"job_id": jid}) or {}).get(
+                        "status"
+                    )
+
+                st = None
+                for _ in range(20):  # 最多等 60 秒
+                    st = _status()
+                    if st in STOPPABLE or st in TERMINAL:
+                        break
+                    time.sleep(3)
+                if st in TERMINAL:
+                    return f"任务已自行结束（status={st}），无需停止"
+
+                assert_true(st in STOPPABLE, f"等了 60 秒仍不可停止（status={st}）")
+                a._request_v2("hpc", "StopJob", {"job_id": jid})
+
+                for _ in range(20):  # 最多等 60 秒确认终态
+                    time.sleep(3)
+                    st = _status()
+                    if st in TERMINAL:
+                        return f"已停止（status={st}）"
+                assert_true(
+                    False,
+                    f"StopJob 发出后 60 秒仍未到终态（status={st}），"
+                    f"**可能有残留任务**，手工确认: {jid}",
+                )
 
             _hpc_stop()
     else:
