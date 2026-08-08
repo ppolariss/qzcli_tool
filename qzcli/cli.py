@@ -15,6 +15,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+import requests
+
 from . import __version__
 from .api import (
     QzAPIError,
@@ -48,6 +50,7 @@ from .config import (
     update_workspace_compute_groups,
     update_workspace_projects,
 )
+from .diag import last_reason, swallowed
 from .display import get_display
 from .store import JobRecord, get_store
 
@@ -689,8 +692,9 @@ def cmd_status(args):
                     if sched:
                         r, m = sched
                         display.print(f"[yellow]排队原因[/yellow]: {r} — {m}")
-            except Exception:
-                pass  # 诊断是附加信息，绝不打断 status 主流程
+            except (QzAPIError, requests.RequestException) as exc:
+                # 诊断是附加信息，绝不打断 status 主流程；但原因要留痕。
+                swallowed("status/排队原因诊断", exc)
 
         if args.json:
             import json
@@ -2164,41 +2168,48 @@ def cmd_avail(args):
         ws_label = (cached or {}).get("name", "") or str(
             workspace_option.get("name", "") or workspace_id
         )
+        # try 只包住**取数**。以前它连后面的统计一起包了，于是字段改名、除零、
+        # 某个空间没权限，都会让「HPC 节点 CPU/内存利用率」整段静默消失 ——
+        # 退出码还是 0，看着像"今天就是没有 HPC 节点"。
         try:
-            hpc_nodes = [
-                node
-                for node in _with_live_cookie(
+            all_nodes = _with_live_cookie(
+                api,
+                display,
+                lambda live_cookie: _fetch_all_node_dimensions(
                     api,
-                    display,
-                    lambda live_cookie: _fetch_all_node_dimensions(
-                        api,
-                        workspace_id,
-                        live_cookie,
-                        logic_compute_group_id=lcg_filter,
-                        page_size=200,
-                    ),
-                    workspace_id=workspace_id,
-                )
-                if node.get("node_type") == "hpc"
-            ]
-            if not hpc_nodes:
-                continue
-            if not hpc_any:
-                display.print("\n[bold]HPC 节点 CPU/内存利用率[/bold]")
-                hpc_any = True
-            total_hpc = len(hpc_nodes)
-            cpu_rates = [n.get("cpu", {}).get("usage_rate", 0) for n in hpc_nodes]
-            mem_rates = [n.get("memory", {}).get("usage_rate", 0) for n in hpc_nodes]
-            avg_cpu = sum(cpu_rates) / total_hpc * 100
-            avg_mem = sum(mem_rates) / total_hpc * 100
-            busy = sum(1 for r in cpu_rates if r > 0.05)
-            display.print(
-                f"  {ws_label}: 节点 {total_hpc} | 忙碌 {busy} "
-                f"| 平均CPU [cyan]{avg_cpu:.1f}%[/cyan] "
-                f"| 平均MEM [cyan]{avg_mem:.1f}%[/cyan]"
+                    workspace_id,
+                    live_cookie,
+                    logic_compute_group_id=lcg_filter,
+                    page_size=200,
+                ),
+                workspace_id=workspace_id,
             )
-        except Exception:
-            pass
+        except (QzAPIError, requests.RequestException) as exc:
+            # 单个空间取不到不该拖垮整张表，但要让人看见少了谁。
+            swallowed("avail/HPC 节点取数", exc)
+            display.print(
+                f"  [dim]{ws_label}: 节点利用率取数失败"
+                f"（{type(exc).__name__}），已跳过[/dim]"
+            )
+            continue
+
+        hpc_nodes = [n for n in all_nodes if n.get("node_type") == "hpc"]
+        if not hpc_nodes:
+            continue
+        if not hpc_any:
+            display.print("\n[bold]HPC 节点 CPU/内存利用率[/bold]")
+            hpc_any = True
+        total_hpc = len(hpc_nodes)
+        cpu_rates = [n.get("cpu", {}).get("usage_rate", 0) for n in hpc_nodes]
+        mem_rates = [n.get("memory", {}).get("usage_rate", 0) for n in hpc_nodes]
+        avg_cpu = sum(cpu_rates) / total_hpc * 100
+        avg_mem = sum(mem_rates) / total_hpc * 100
+        busy = sum(1 for r in cpu_rates if r > 0.05)
+        display.print(
+            f"  {ws_label}: 节点 {total_hpc} | 忙碌 {busy} "
+            f"| 平均CPU [cyan]{avg_cpu:.1f}%[/cyan] "
+            f"| 平均MEM [cyan]{avg_mem:.1f}%[/cyan]"
+        )
     return 0
 
 
@@ -4450,8 +4461,10 @@ def _lookup_spec_for_payload(
             display=display,
             emit_messages=False,
         )
-    except Exception:
-        pass
+    except (QzAPIError, requests.RequestException) as exc:
+        # 预加载失败不致命：下面读缓存还有机会命中。但真拿不到规格时的报错
+        # 要能回溯到这里，别只剩一句「找不到规格」。
+        swallowed("create/规格预加载", exc)
 
     spec_obj = _read_normalized_spec(workspace_id, spec_id)
     if not (
@@ -7517,8 +7530,10 @@ def _exec_launch(jupyter_info, cmd_str, display, job_id=None):
             json={"type": "directory"},
             timeout=10,
         )
-    except Exception:
-        pass
+    except _requests.RequestException as exc:
+        # 目录多半已存在；真建不出来的话，后面读 exit 文件会一路 404 到超时，
+        # 那时 last_reason() 能把这条捞回去。
+        swallowed("exec/建中转目录", exc)
 
     # 2. 通过 Terminal 发送一条复合命令（fire-and-forget）
     #    输出写到 /tmp/.qzcli/<session>/，通过 symlink 让 Contents API 可读
@@ -7606,8 +7621,8 @@ def _delete_terminal(base_http, headers, term_name):
         _requests.delete(
             f"{base_http}/api/terminals/{term_name}", headers=headers, timeout=10
         )
-    except Exception:
-        pass
+    except _requests.RequestException as exc:
+        swallowed("exec/关闭 terminal", exc)
 
 
 def _exec_poll(jupyter_info, job_id, display, timeout=120, cleanup_on_done=True):
@@ -7634,8 +7649,8 @@ def _exec_poll(jupyter_info, job_id, display, timeout=120, cleanup_on_done=True)
                 _requests.delete(
                     f"{base_http}/api/contents/{fname}", headers=headers, timeout=5
                 )
-            except Exception:
-                pass
+            except _requests.RequestException as exc:
+                swallowed("exec/清理临时文件", exc)
 
     deadline = _time.time() + timeout
     exit_code = 1
@@ -7665,8 +7680,11 @@ def _exec_poll(jupyter_info, job_id, display, timeout=120, cleanup_on_done=True)
                 if cleanup_on_done:
                     cleanup()
                 return exit_code, output, True
-        except Exception:
-            pass
+        except (_requests.RequestException, ValueError) as exc:
+            # 单轮失败不该中断轮询（命令可能还没写出 exit 文件）。但**必须留痕**：
+            # 这里以前是 except Exception: pass，结果 403 / 坏 JSON 连吞 120 秒，
+            # 最后只报一句「超时」，跟真实原因毫无关系。ValueError 覆盖 json 解析失败。
+            swallowed("exec/轮询", exc)
 
         poll_interval = min(poll_interval * 1.5, 5)
 
@@ -7684,8 +7702,10 @@ def _exec_via_jupyter(jupyter_info, cmd_str, display, timeout=120):
         jupyter_info, job_id, display, timeout=timeout
     )
     if not finished:
+        why = last_reason("exec/")
+        hint = f"\n  轮询期间最后一次失败: {why}" if why else ""
         display.print_warning(
-            f"命令执行超时（{timeout}s），远端命令仍在运行，输出可能不完整。"
+            f"命令执行超时（{timeout}s），远端命令仍在运行，输出可能不完整。{hint}"
             f"\n  继续拉取剩余输出: qzcli exec-attach {jupyter_info['notebook_id']} {job_id}"
         )
     return exit_code, output

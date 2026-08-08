@@ -136,7 +136,12 @@ def _capture_login_sessions(proxy_value):
     ), patch.object(api_mod._time, "sleep", lambda *_: None):
         try:
             api.login_with_cas("u", "p")
-        except Exception:
+        except api_mod.QzTransientError:
+            # _Probe 抛 RequestException 当哨兵提前中断登录流程，而 login_with_cas
+            # 会把它包成 QzTransientError —— 所以这里接的是**包装后**的类型。
+            # 原来写的是 except Exception，接得住但也接得住一切：哨兵哪天不再被
+            # 包装、或者 _Probe 里写错个属性名，测试都照样绿。收窄之后这类
+            # 假绿会立刻变红。
             pass
     return created
 
