@@ -58,9 +58,10 @@ REVIEWED_SCHEMA_DIFFS = {
     ("projects", "member_remain_budget"): (
         "v1 独有，v2 无对应。含义是「你个人在该项目下的剩余额度」"
         "（区别于项目池的 remain_budget —— 实测公共科研项目 9.98 亿 vs 673）。"
-        "全仓 grep 无任何消费点，迁 v2 无功能损失；"
-        "但 v2 全 169 个 action 里也没有替代接口，点券可见性在 v2 上归零，"
-        "已记在 _project_list_items_v2 的 docstring 里。"
+        "全仓 grep 无任何消费点，迁 v2 无功能损失。"
+        "（2026-08-09 勘误：此处原本写着「v2 无替代接口」，是错的 —— "
+        "预算数据走 project.GetProjectBudgetUsageOverview / "
+        "GetProjectMemberBudgetUsage，只是不在 qz CLI 的 spec 里。）"
     ),
 }
 
