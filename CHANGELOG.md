@@ -2,6 +2,33 @@
 
 ## Unreleased
 
+## v0.4.8 - 2026-08-09
+
+### 勘误：v0.4.7 里两个关于「平台缺口」的结论是错的
+
+v0.4.7 的发布说明、`docs/v1_to_v2_mapping.md`、`api.py` 的 docstring 和
+`parity_sweep` 的白名单理由里，都写过下面两条——**都是错的**：
+
+| 原结论 | 实测 |
+|---|---|
+| 「v2 拿不到点券/预算数据，169 个 action 无替代，点券可见性归零」 | `project GetProjectBudgetUsageOverview` 返回 `{total, used, remain, train, inference, storage}`，比 v1 的单个 `remain_budget` 还细；个人额度走 `GetProjectMemberBudgetUsage` |
+| 「平台无 `ListWorkspaces`，只能从项目列表推导工作空间」 | `workspace ListWorkspaces` 一直可用，`{page_num, page_size}` 直接返回完整 items |
+
+**犯错的原因只有一个：把 `qz` CLI 的 spec 当成了 v2 的完整接口面。**
+实测 Web 控制台在用 **21 个服务**，而 spec 只收了 11 个；单看 `project` 服务，
+spec 里 1 个 action，前端在用 32 个。spec 里完全没有的服务包括
+`file` / `audit` / `storage` / `billing` / `sandbox*` 共 12 个。
+
+以后判断「v2 有没有某能力」，不能只查 spec —— 要么真调一次
+（未知 action 会明确返回 `InvalidAction: unknown action: <X>`），
+要么对照前端产物。
+
+完整取证过程和给平台方的问题清单见
+`docs/report_v2_api_spec_gap.md`。
+
+本次只改注释、docstring 和文档，**没有任何行为变更**。
+
+
 ## v0.4.7 - 2026-08-08
 
 **主题：把「不报错的坏」变成能看见的坏。** 这一版没有新功能，全部是消除静默失败 ——
@@ -59,10 +86,12 @@
 
 ### 已知缺口（非本仓可修）
 
-v2 拿不到点券数据：`remain_budget` 键在但值恒为空字符串，`member_remain_budget`
-直接没有，且 v2 全 169 个 action 里无替代（`workspace` 下的 10 个 quota 接口返回的是
-资源配额，单位是卡和核，不是钱）。目前全仓无消费点，无功能损失；
-但「提交前提示额度不足」这类功能在纯 v2 上做不出来。
+`project.GetProjectForPage` 的 `remain_budget` 键在但值恒为空字符串，
+`member_remain_budget` 直接没有。目前全仓无消费点，无功能损失。
+
+> **2026-08-09 勘误**：本节原文断言「v2 全 169 个 action 里无替代，点券可见性在
+> v2 上归零」。**这是错的**，见 v0.4.8 的勘误条目 —— 预算数据在 v2 里有，
+> 只是不在 qz CLI 的 spec 里。
 
 ### 发版闸门自身的 4 个 bug（`--submit` 跑了三轮才过）
 
