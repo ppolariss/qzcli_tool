@@ -2665,16 +2665,30 @@ class QzAPI:
         下游依赖的 ``name`` / ``space_list[].id`` / ``space_list[].usage_status``
         与 v1 逐字段一致。
 
-        **v2 丢了预算数据**（已知缺口，非本仓可修）：
+        **这个 action 自己不带预算值**：
 
         - ``remain_budget`` 键在，但值是空字符串 ``''``；v1 有真实数值
-        - ``member_remain_budget``（**你个人**在该项目下的剩余额度）v2 直接没有
+        - ``member_remain_budget``（**你个人**在该项目下的剩余额度）这里没有
 
         这两个不是一回事：实测「公共科研项目」v1 的 ``remain_budget`` 是
         9.98 亿而 ``member_remain_budget`` 只有 673 —— 前者是项目池，后者是
-        你个人配额。目前全仓无人消费这两个字段，所以迁 v2 无功能损失；但
-        「提交前提示你在该项目还剩多少额度」这类功能在 v2 上做不了，
-        需要平台侧补齐。
+        你个人配额。全仓无人消费这两个字段，所以迁 v2 无功能损失。
+
+        .. note:: **2026-08-09 勘误**
+
+           这里原本写着「v2 丢了预算数据……在 v2 上做不了，需要平台侧补齐」。
+           **那是错的。** 预算数据在 v2 里有，只是不在这个 action 上，也不在
+           qz CLI 的 spec 里：
+
+           - ``project GetProjectBudgetUsageOverview`` → ``{total, used, remain,
+             train, inference, storage}``，比 v1 的单个 ``remain_budget`` 还细
+           - ``project GetProjectMemberBudgetUsage`` → 每个成员的
+             ``budget`` / ``remain_budget`` / ``used_budget``
+
+           犯错的原因是**把 qz CLI 的 spec 当成了 v2 的完整接口面**。实测前端
+           在用 21 个服务、169 个 action，而 spec 只收了 11 个服务；单看
+           ``project`` 服务，spec 里 1 个 action，前端在用 32 个。
+           以后判断「v2 有没有某能力」，不能只查 spec。
 
         分页：一次取 200 打底，并**按响应里的 ``total`` 校验有没有被截断**。
         以前只发 ``{page:1, page_size:200}`` 就直接返回 ``items`` —— 真有人超过
