@@ -20,7 +20,23 @@ DEFAULT_CONFIG = {
 }
 
 
-def get_proxy() -> str:
+def should_bypass_proxy(url: str) -> bool:
+    """按 ``NO_PROXY`` / ``no_proxy`` 判断这个 URL 该不该绕过代理。
+
+    直接复用 ``requests.utils.should_bypass_proxies`` —— 匹配规则有一堆边角
+    （前导点、端口、IP 段、``*``），自己手写一定漏。
+    """
+    try:
+        from requests.utils import should_bypass_proxies
+    except ImportError:  # pragma: no cover —— requests 是硬依赖，兜底而已
+        return False
+    try:
+        return bool(should_bypass_proxies(url, no_proxy=None))
+    except Exception:  # noqa: BLE001 —— 判不出来就当不绕过，保持旧行为
+        return False
+
+
+def get_proxy(url: str = "") -> str:
     """获取 HTTP 请求所用代理地址。
 
     精度顺序: ``~/.qzcli/config.json`` 的 ``proxy`` 字段 → 环境变量
@@ -28,12 +44,33 @@ def get_proxy() -> str:
     scheme 的 URL,包含 ``http://``、``https://``、``socks4://``、``socks4a://``、
     ``socks5://``、``socks5h://``;``qzcli.api._get_pool_manager`` 会根据
     scheme 选择合适的 urllib3 manager。空字符串表示不走代理(直连)。
+
+    **传 ``url`` 时会先看 ``NO_PROXY``**，命中就返回空串（直连）。
+
+    为什么加这个参数：qzcli 自建 urllib3 pool manager、CAS 登录还显式设了
+    ``trust_env=False``，等于把 requests 自带的 ``no_proxy`` 处理整个绕开了。
+    后果是**只要环境里有代理变量，``no_proxy`` 就是摆设**。
+
+    2026-08 真出过事：2224 上的看板进程带着 ``https_proxy=127.0.0.1:7891``
+    （clash），而 ``qz.sii.edu.cn`` 走那个代理是 SSL EOF。加 ``no_proxy=.sii.edu.cn``
+    没用，最后只能把整个代理环境清空 —— 副作用是那个进程从此完全没法用代理
+    访问外网。
+
+    ``url`` 不传时行为和以前**完全一致**，老调用点不受影响。
     """
     cfg = load_config()
-    proxy = cfg.get("proxy", "")
-    if proxy:
-        return proxy
-    return os.environ.get("ALL_PROXY") or os.environ.get("HTTPS_PROXY", "")
+    proxy = (
+        cfg.get("proxy", "")
+        or os.environ.get("ALL_PROXY")
+        or os.environ.get("HTTPS_PROXY", "")
+    )
+    if not proxy:
+        return ""
+    # NO_PROXY 对「配置文件里配的代理」同样生效 —— 用户写了 no_proxy 就是
+    # 表达「这个域名别走代理」，跟代理是从哪读来的无关。
+    if url and should_bypass_proxy(url):
+        return ""
+    return proxy
 
 
 # 配置目录

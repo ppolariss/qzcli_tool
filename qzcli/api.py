@@ -187,6 +187,17 @@ def with_auth_retry(method):
     return wrapper
 
 
+def _proxies_for(url: str):
+    """给 ``requests`` 用的 proxies 字典；命中 NO_PROXY 时返回 ``None``。
+
+    **不要给它加 lru_cache** —— 代理配置和 NO_PROXY 都可能在进程存活期间变
+    （改 config.json、改环境变量），缓存住就等于把旧判断钉死。
+    ``_get_pool_manager`` 缓存的是「按代理 URL 建好的 manager」，那是另一回事。
+    """
+    proxy = get_proxy(url)
+    return {"http": proxy, "https": proxy} if proxy else None
+
+
 @lru_cache(maxsize=8)
 def _get_pool_manager(proxy: str):
     """Return a cached urllib3 manager for the configured proxy URL."""
@@ -246,7 +257,7 @@ def _curl_post(
         separator = "&" if "?" in url else "?"
         url = f"{url}{separator}{urlencode(params)}"
 
-    pm = _get_pool_manager((get_proxy() or "").strip())
+    pm = _get_pool_manager((get_proxy(url) or "").strip())
     body = _json.dumps(json).encode("utf-8") if json is not None else None
     hdrs = dict(headers) if headers else {}
     header_names = {name.lower() for name in hdrs}
@@ -1729,9 +1740,7 @@ class QzAPI:
             },
             allow_redirects=False,
             timeout=15,
-            proxies=(
-                {"http": get_proxy(), "https": get_proxy()} if get_proxy() else None
-            ),
+            proxies=_proxies_for(f"{self.base_url}/api/v1/notebook/lab/{notebook_id}"),
         )
         if resp.status_code in (301, 302, 303, 307):
             location = resp.headers.get("Location", "")
@@ -2870,7 +2879,7 @@ class QzAPI:
 
         # 配置 SOCKS5 代理（WSL 等环境需要）
         # trust_env=False 避免环境变量 HTTP_PROXY（http://）覆盖 SOCKS5 代理
-        proxy = get_proxy()
+        proxy = get_proxy(self.base_url)
         if proxy:
             session.trust_env = False
             # 直接用原始 proxy —— 不要把 socks5h:// 降级成 socks5://。
