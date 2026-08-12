@@ -2,6 +2,7 @@
 启智平台 API 客户端
 """
 
+import contextlib
 import functools
 import inspect
 import json as _json
@@ -139,6 +140,51 @@ class QzTransientError(QzAPIError):
     """
 
 
+class QzAuthExpiredError(QzAPIError):
+    """登录态失效，且**当前不允许自动重登**（在 worker 线程里撞 401）。
+
+    继承 ``QzAPIError``（code=401），所以现有 ``except QzAPIError`` 仍能接住 ——
+    只是给出一句人能看懂的话，而不是让 worker 偷偷去打 CAS。
+
+    为什么要有它：见 ``with_auth_retry`` 和 ``_relogin_allowed`` 的说明。
+    一句话 —— **登录只在主线程发生一次，worker 只干活**。
+    """
+
+    def __init__(self, message="登录态已失效，请重试；若仍失败请运行 `qzcli login`"):
+        super().__init__(message, api_code="401")
+
+
+#: 「当前线程允许自动重登」的窗口标志（线程隔离）。
+#:
+#: 判据是 ``主线程 or 窗口内``：
+#: - **主线程**总是允许 —— 单线程命令、扇出前的串行阶段都在主线程，保住向后兼容
+#: - **窗口内**允许 —— 非主线程（如看板 / MCP 的工作线程）调 ``ensure_authenticated``
+#:   时临时开窗，让那一次串行探针能自愈
+#: - **worker 线程**两者皆非 —— ``ThreadPoolExecutor`` 起的线程既不是主线程、
+#:   也没开窗，撞 401 直接抛 ``QzAuthExpiredError``，绝不去打 CAS
+#:
+#: 这样就不必在每个扇出点显式包一层「禁止 worker 登录」——worker 天然被判为
+#: 不允许，禁令内建在判据里而非散落到每个调用点。
+_relogin_window = threading.local()
+
+
+def _relogin_allowed() -> bool:
+    if threading.current_thread() is threading.main_thread():
+        return True
+    return getattr(_relogin_window, "allowed", False)
+
+
+@contextlib.contextmanager
+def _allow_relogin_here():
+    """在当前线程临时开「允许重登」窗口。``ensure_authenticated`` 用。"""
+    prev = getattr(_relogin_window, "allowed", False)
+    _relogin_window.allowed = True
+    try:
+        yield
+    finally:
+        _relogin_window.allowed = prev
+
+
 # CAS 登录瞬时失败的重试参数（指数退避 + 抖动）。
 _LOGIN_MAX_TRIES = 3
 
@@ -156,8 +202,16 @@ def with_auth_retry(method):
     - 带 ``cookie`` 形参的方法，重试时会换上刚拿到的新 cookie；
     - 自行从磁盘读 cookie 的方法（如 ``_request_v2``），重试时自然读到刷新后的 cookie。
 
-    当没有凭据、``_auto_relogin`` 关闭、或重新登录失败时为 no-op：原始 401 会被重新
-    抛出，从而保留既有回退逻辑（例如 token 认证）。
+    **自动重登只在「允许的线程」发生。** 判据 = 主线程 or 处于
+    ``ensure_authenticated`` 开的窗口内。worker 线程两者皆非 —— 撞 401 直接抛
+    ``QzAuthExpiredError``，不去打 CAS。
+
+    禁令内建在这条判据里，而不是在每个扇出点包一层上下文：worker 天然被判为
+    不允许。登录因此收敛到「主线程一次」，可测量
+    （``scratchpad/who.py``：worker 登录数 = 0）。
+
+    当没有凭据、``_auto_relogin`` 显式关闭、或重新登录失败时为 no-op：原始 401
+    被重新抛出，保留既有回退（例如 token 认证）。
     """
     sig = inspect.signature(method)
     takes_cookie = "cookie" in sig.parameters
@@ -169,6 +223,11 @@ def with_auth_retry(method):
         except QzAPIError as exc:
             if exc.code != 401 or not getattr(self, "_auto_relogin", True):
                 raise
+            if not _relogin_allowed():
+                # worker 线程撞 401：不自愈。扇出前 ensure_authenticated 本应已在
+                # 主线程把 cookie 刷好；走到这里通常是「扇出中途才过期」的罕见情形。
+                # 与其让每个 worker 各自去打 CAS（把账号越锁越死），不如清楚地失败。
+                raise QzAuthExpiredError() from exc
             # 把**刚刚失败的那个 cookie** 交给 _relogin 当去重基准。少了它，
             # 调用方攥着旧 cookie 反复调用时（典型是分页循环），每次都会被判成
             # "还没人刷新过"而重新走一遍 CAS —— N 页 N 次登录。
@@ -185,6 +244,17 @@ def with_auth_retry(method):
             return method(self, *args, **kwargs)
 
     return wrapper
+
+
+def _proxies_for(url: str):
+    """给 ``requests`` 用的 proxies 字典；命中 NO_PROXY 时返回 ``None``。
+
+    **不要给它加 lru_cache** —— 代理配置和 NO_PROXY 都可能在进程存活期间变
+    （改 config.json、改环境变量），缓存住就等于把旧判断钉死。
+    ``_get_pool_manager`` 缓存的是「按代理 URL 建好的 manager」，那是另一回事。
+    """
+    proxy = get_proxy(url)
+    return {"http": proxy, "https": proxy} if proxy else None
 
 
 @lru_cache(maxsize=8)
@@ -246,7 +316,7 @@ def _curl_post(
         separator = "&" if "?" in url else "?"
         url = f"{url}{separator}{urlencode(params)}"
 
-    pm = _get_pool_manager((get_proxy() or "").strip())
+    pm = _get_pool_manager((get_proxy(url) or "").strip())
     body = _json.dumps(json).encode("utf-8") if json is not None else None
     hdrs = dict(headers) if headers else {}
     header_names = {name.lower() for name in hdrs}
@@ -313,6 +383,21 @@ _CAS_ERROR_RE = re.compile(
     r'<[^>]*class="[^"]*form-error[^"]*"[^>]*>(.*?)</', re.I | re.S
 )
 _TAG_RE = re.compile(r"<[^>]+>")
+
+
+#: 这些字样出现在 CAS 错误文案里，代表**凭据本身不对**（密码错、账号被锁）。
+#: 这类失败**重试没有意义，而且有害** —— 每次重试都是一次新的失败尝试，
+#: 攒够次数 CAS 会把账号锁死。2026-08-12 真锁过一次。
+_CREDENTIAL_FAILURE_MARKERS = ("锁定", "密码错误", "用户名或密码", "账号不存在")
+
+
+def is_credential_failure(message: str) -> bool:
+    """这条登录失败是不是「凭据不对」——即**绝不该自动重试**的那种。
+
+    区分它和「临时被挡」（频繁登录触发的限流/验证码）是有实际代价的：
+    后者等几分钟自己好，前者你越重试锁得越死。
+    """
+    return any(m in (message or "") for m in _CREDENTIAL_FAILURE_MARKERS)
 
 
 def _describe_cas_login_failure(html: str) -> str:
@@ -382,15 +467,31 @@ def _cooldown_path():
 
 
 def _recent_relogin_failure():
-    """返回冷却期内的上次失败信息（``str``），不在冷却期则返回 ``None``。"""
+    """返回「本次不该再自动登录」的原因（``str``），可以登则返回 ``None``。
+
+    分两档，因为这两种失败的正确处理**相反**：
+
+    - **凭据类**（密码错 / 账号被锁）：``is_credential_failure`` 命中 →
+      **永不自动重试**，直到用户自己 ``qzcli login`` 成功把记录清掉。
+      重试只会累积失败次数，把账号锁得更死。
+    - **其它**（网络抖动、CAS 临时限流）：60 秒冷却后可以再试，这类等等就好。
+
+    以前这里对所有失败一律 60 秒 —— 于是密码不对时每分钟自动送一次错误密码，
+    2026-08-12 把账号送进了「您的账号被锁定，请联系管理员」。
+    """
     now = _time.time()
     with _relogin_failure_lock:
+        msg = _relogin_failure["message"]
+        if msg and is_credential_failure(msg):
+            return msg
         if now - _relogin_failure["at"] < _RELOGIN_COOLDOWN_S:
-            return _relogin_failure["message"]
+            return msg
     # 进程内没有记录时看看别的进程有没有刚失败过
     try:
         raw = _cooldown_path().read_text(encoding="utf-8")
         at_str, _, message = raw.partition("\n")
+        if message and is_credential_failure(message):
+            return message
         if now - float(at_str) < _RELOGIN_COOLDOWN_S:
             return message or "上一次自动登录失败"
     except (OSError, ValueError):
@@ -549,6 +650,59 @@ class QzAPI:
 
     def _post(self, url: str, **kwargs) -> _CurlResponse:
         return _curl_post(url, **kwargs)
+
+    def ensure_authenticated(self, cookie: str = "", probe: bool = True) -> str:
+        """**并发扇出之前**把鉴权在当前线程里走完，返回此后该用的 cookie。
+
+        做三件事：
+
+        1. 若处于「凭据类失败」封锁中（密码错/账号被锁），**当场抛错**，
+           不让命令扇出去撞 N 次 —— 那正是把锁定期拖长的机制
+        2. ``probe=True`` 时发一次最轻的已鉴权调用。撞 401 由
+           ``@with_auth_retry`` **在当前线程串行**处理 —— 这就是把登录从 worker
+           手里收回主线程的那一步
+        3. 返回盘上最新的 cookie（重登后已经换过）
+
+        **必须使用返回值**，否则 worker 攥着旧字符串照样各自撞 401。
+
+        探针只花一次请求，而且是**省下来的**：不做预检的话，第一个 worker 的
+        业务请求本来也会撞 401 再登录。区别只在于登录发生在主线程还是 worker 里。
+
+        Args:
+            cookie: 调用方手上的 cookie；留空则读盘。
+            probe: 是否发探针。测试里下层被 mock 时可关掉。
+        """
+        blocked = _recent_relogin_failure()
+        if blocked is not None and is_credential_failure(blocked):
+            raise QzAPIError(
+                f"{blocked}\n"
+                "已阻止本次并发请求：账号处于锁定/凭据失效状态时继续重试，"
+                "只会让 CAS 把锁定期拖得更长。请先解决登录问题再重试。"
+            )
+        candidate = cookie or (get_cookie() or {}).get("cookie", "")
+        if probe:
+            try:
+                # 探针在「允许重登」窗口内跑：这样即便调用方不在主线程
+                # （看板 / MCP 工作线程），这一次串行探针撞 401 也能自愈。
+                with _allow_relogin_here():
+                    self.get_user_detail(cookie=candidate)
+            except Exception as exc:  # noqa: BLE001 —— 见下
+                # 探针是**纯加分项**：它的唯一作用是让 401→重登发生在当前线程。
+                # 401 已由装饰器串行处理过；走到这里说明是别的问题（网络、限流、
+                # 底层 urllib3 异常…）。这里必须吞掉一切 ——
+                # **绝不能因为探针失败而让整条命令挂掉**，真问题让业务请求去报。
+                # 留痕，别静默（QZCLI_DEBUG=1 可见）。
+                swallowed("扇出前鉴权探针", exc)
+        return (get_cookie() or {}).get("cookie", "") or candidate
+
+    @with_rate_limit_retry
+    @with_auth_retry
+    def get_user_detail(self, cookie: str = "") -> Dict[str, Any]:
+        """当前登录用户信息。也是 :meth:`ensure_authenticated` 的探针 ——
+        选它是因为无参、不分页、返回体小。"""
+        return self._request_v2(
+            "user", "GetUserDetail", {}, cookie=cookie, referer_path="/operations"
+        )
 
     def _relogin(
         self,
@@ -1094,6 +1248,11 @@ class QzAPI:
     ) -> Dict[str, Dict[str, Any]]:
         """批量查询任务详情（并发）"""
         results = {}
+
+        # 扇出前在**当前线程**把鉴权走完，扇出期间禁止 worker 登录。
+        # 少了后半句，worker 撞 401 照样会去打 CAS —— 实测 8 线程时确实有 1 次，
+        # 发起者是 ThreadPoolExecutor 而不是主线程。次数少不等于对。
+        self.ensure_authenticated()
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_job = {
@@ -1729,9 +1888,7 @@ class QzAPI:
             },
             allow_redirects=False,
             timeout=15,
-            proxies=(
-                {"http": get_proxy(), "https": get_proxy()} if get_proxy() else None
-            ),
+            proxies=_proxies_for(f"{self.base_url}/api/v1/notebook/lab/{notebook_id}"),
         )
         if resp.status_code in (301, 302, 303, 307):
             location = resp.headers.get("Location", "")
@@ -2870,7 +3027,7 @@ class QzAPI:
 
         # 配置 SOCKS5 代理（WSL 等环境需要）
         # trust_env=False 避免环境变量 HTTP_PROXY（http://）覆盖 SOCKS5 代理
-        proxy = get_proxy()
+        proxy = get_proxy(self.base_url)
         if proxy:
             session.trust_env = False
             # 直接用原始 proxy —— 不要把 socks5h:// 降级成 socks5://。

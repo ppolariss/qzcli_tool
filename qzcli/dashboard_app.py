@@ -29,7 +29,16 @@ from qzcli.config import (
 
 # 可作为下钻层级 / 筛选的维度列（顺序即默认下钻顺序）
 # 「节点」= 物理节点(host)，可下钻 计算组→节点→任务 看每个节点摞了谁。
-HIERARCHY_DIMS = ["计算组", "节点", "GPU类型", "集群", "优先级档", "任务类型", "项目", "用户"]
+HIERARCHY_DIMS = [
+    "计算组",
+    "节点",
+    "GPU类型",
+    "集群",
+    "优先级档",
+    "任务类型",
+    "项目",
+    "用户",
+]
 DEFAULT_HIERARCHY = ["计算组", "优先级档", "项目", "用户"]
 COLOR_DIMS = [
     "优先级档",
@@ -76,12 +85,12 @@ PRIORITY_COLORS = {
 CARDING_COLOR_DIM = "整节点/碎卡"
 CARDING_COL = "节点分类"
 CARDING_COLORS = {
-    "碎卡": "#EF553B",          # 红：治理重点
-    "空整节点": "#00CC96",      # 绿：可直接排
-    "低优满占": "#F2C200",      # 黄：可整节点抢占
-    "高优满占": "#636EFA",      # 蓝：不可回收
-    "多节点混合": "#AB63FA",    # 紫：跨节点
-    "调度禁用": "#7f7f7f",      # 深灰：SchedulingDisabled/cordon，不可用
+    "碎卡": "#EF553B",  # 红：治理重点
+    "空整节点": "#00CC96",  # 绿：可直接排
+    "低优满占": "#F2C200",  # 黄：可整节点抢占
+    "高优满占": "#636EFA",  # 蓝：不可回收
+    "多节点混合": "#AB63FA",  # 紫：跨节点
+    "调度禁用": "#7f7f7f",  # 深灰：SchedulingDisabled/cordon，不可用
     "排队/未分配": "#c8c8c8",
     FREE_LABEL: FREE_COLOR,
 }
@@ -142,14 +151,17 @@ def _frag_one(ws_id):
     res = fragmentation.compute_node_fragmentation(node_map, rows)
     # 只保留「我的碎片分布」需要的最小行,避免 payload 膨胀
     res["rows"] = [
-        {"用户": r.get("用户", ""), "节点": r.get("节点", ""),
-         "GPU": r.get("GPU", 0), "优先级": r.get("优先级", 10)}
+        {
+            "用户": r.get("用户", ""),
+            "节点": r.get("节点", ""),
+            "GPU": r.get("GPU", 0),
+            "优先级": r.get("优先级", 10),
+        }
         for r in rows
     ]
     return res
 
 
-@st.cache_data(ttl=300, show_spinner="拉取全集群节点占用中…")
 def load_all_frag(ws_items):
     """跨所有 workspace 并行拉取 + 合并。ws_items = ((ws_id, ws_name), ...)(元组以便缓存)。
     返回 (all_lcg, all_nodes, all_rows),每条带 workspace 标签。"""
@@ -161,6 +173,15 @@ def load_all_frag(ws_items):
             return wname, _frag_one(wid)
         except Exception:
             return wname, None
+
+    # 扇出前串行确认鉴权状态（不发请求）。看板是长驻轮询进程，cookie 迟早会过期；
+    # 少了这步，过期那一刻 4×4=16 个线程会同时去登录，CAS 按失败次数延长锁定。
+    # 2026-08-12 账号被锁时，这个看板正在以这种方式轮询。
+    try:
+        get_api().ensure_authenticated()
+    except Exception as exc:  # noqa: BLE001 —— 看板不该因此白屏，但要说清原因
+        st.error(f"鉴权不可用，已跳过本次刷新：{exc}")
+        return [], [], []
 
     # 外层 workspace 并发。与 build_node_to_lcg_map 的内层 LCG 并发相乘 = 峰值并发,
     # 故压到 4：4×4=16 并发,削平对启智的读取峰值 QPS(实测 76→~16)。
@@ -204,7 +225,9 @@ def render_fragmentation(ws_options):
     all_lcg, all_nodes, all_rows = load_all_frag(tuple(ws_options))
 
     if not all_lcg:
-        st.info("没拉到节点数据。先在终端 `qzcli login` + `qzcli res -u`，再点上方「🔄 刷新数据」。")
+        st.info(
+            "没拉到节点数据。先在终端 `qzcli login` + `qzcli res -u`，再点上方「🔄 刷新数据」。"
+        )
         return
 
     sdf = pd.DataFrame(all_lcg)
@@ -218,42 +241,81 @@ def render_fragmentation(ws_options):
     k = st.columns(6)
     k[0].metric("空整节点", int(sdf["empty_whole"].sum()))
     k[1].metric("低优满占整节点", int(sdf["lowpri_whole"].sum()))
-    k[2].metric("碎片低优卡 🔧", int(sdf["frag_lowpri_cards"].sum()),
-                help="散在高低优混合节点上的低优卡，可抢占但凑不成整节点——治理重点；"
-                     "这正是 `qzcli avail --lp` 的「低优空余=0」看不到、但看板里能看到的那部分。")
+    k[2].metric(
+        "碎片低优卡 🔧",
+        int(sdf["frag_lowpri_cards"].sum()),
+        help="散在高低优混合节点上的低优卡，可抢占但凑不成整节点——治理重点；"
+        "这正是 `qzcli avail --lp` 的「低优空余=0」看不到、但看板里能看到的那部分。",
+    )
     k[3].metric("碎片空卡", int(sdf["frag_free_cards"].sum()))
-    k[4].metric("可凑整节点潜力", int(sdf["whole_node_potential"].sum()),
-                help="(空卡 + 碎片低优卡) // 每节点卡数，理想整合后能腾出的整节点数。"
-                     "已剔除调度禁用节点。")
-    k[5].metric("调度禁用 ⛔", int(sdf["sched_disabled_nodes"].sum()),
-                help=f"SchedulingDisabled / cordon 节点（machine-migration / software-fault 等），"
-                     f"共 {int(sdf['sched_disabled_free_gpus'].sum())} 张空卡看着可用实则调度不上去，"
-                     "已从上面所有「可用/可凑」量里剔除。")
+    k[4].metric(
+        "可凑整节点潜力",
+        int(sdf["whole_node_potential"].sum()),
+        help="(空卡 + 碎片低优卡) // 每节点卡数，理想整合后能腾出的整节点数。"
+        "已剔除调度禁用节点。",
+    )
+    k[5].metric(
+        "调度禁用 ⛔",
+        int(sdf["sched_disabled_nodes"].sum()),
+        help=f"SchedulingDisabled / cordon 节点（machine-migration / software-fault 等），"
+        f"共 {int(sdf['sched_disabled_free_gpus'].sum())} 张空卡看着可用实则调度不上去，"
+        "已从上面所有「可用/可凑」量里剔除。",
+    )
 
     st.subheader("① 全集群 · 各计算组：整节点 vs 碎卡")
-    cols = ["workspace", "lcg", "gpu_type", "total_nodes", "empty_whole",
-            "lowpri_whole", "frag_free_cards", "frag_lowpri_cards",
-            "sched_disabled_nodes", "whole_node_potential", "util_pct"]
-    ren = {"workspace": "工作空间", "lcg": "计算组", "gpu_type": "GPU类型",
-           "total_nodes": "总节点", "empty_whole": "空整节点",
-           "lowpri_whole": "低优满占整节点", "frag_free_cards": "碎片空卡",
-           "frag_lowpri_cards": "碎片低优卡", "sched_disabled_nodes": "调度禁用节点",
-           "whole_node_potential": "可凑整节点潜力", "util_pct": "利用率%"}
-    view1 = sdf[cols].rename(columns=ren).sort_values(
-        ["碎片低优卡", "可凑整节点潜力"], ascending=False)
+    cols = [
+        "workspace",
+        "lcg",
+        "gpu_type",
+        "total_nodes",
+        "empty_whole",
+        "lowpri_whole",
+        "frag_free_cards",
+        "frag_lowpri_cards",
+        "sched_disabled_nodes",
+        "whole_node_potential",
+        "util_pct",
+    ]
+    ren = {
+        "workspace": "工作空间",
+        "lcg": "计算组",
+        "gpu_type": "GPU类型",
+        "total_nodes": "总节点",
+        "empty_whole": "空整节点",
+        "lowpri_whole": "低优满占整节点",
+        "frag_free_cards": "碎片空卡",
+        "frag_lowpri_cards": "碎片低优卡",
+        "sched_disabled_nodes": "调度禁用节点",
+        "whole_node_potential": "可凑整节点潜力",
+        "util_pct": "利用率%",
+    }
+    view1 = (
+        sdf[cols]
+        .rename(columns=ren)
+        .sort_values(["碎片低优卡", "可凑整节点潜力"], ascending=False)
+    )
     st.dataframe(view1, use_container_width=True, hide_index=True)
 
     # ---- 桥:选一个要提交的计算组 → 一键拿它的碎卡节点排除参数 ----
-    st.markdown("**🔧 提交时避开碎卡** — 选你要提交作业的计算组，把它"
-                "**有空卡的碎卡节点**排掉，逼调度器用整节点/空节点(避免作业被塞进碎片):")
+    st.markdown(
+        "**🔧 提交时避开碎卡** — 选你要提交作业的计算组，把它"
+        "**有空卡的碎卡节点**排掉，逼调度器用整节点/空节点(避免作业被塞进碎片):"
+    )
     frag_all = {"nodes": all_nodes}
-    lcg_opts = sorted({n["lcg"] for n in all_nodes
-                       if n.get("class") == fragmentation.FRAGMENTED and n.get("lcg")})
+    lcg_opts = sorted(
+        {
+            n["lcg"]
+            for n in all_nodes
+            if n.get("class") == fragmentation.FRAGMENTED and n.get("lcg")
+        }
+    )
     if lcg_opts:
         pick = st.selectbox("计算组", lcg_opts, key="exclude_lcg")
         names = fragmentation.fragmented_node_names(frag_all, lcg=pick, only_free=True)
         if names:
-            st.caption(f"{pick}:{len(names)} 个有空卡的碎卡节点 → 粘到 `qzcli create` 后面")
+            st.caption(
+                f"{pick}:{len(names)} 个有空卡的碎卡节点 → 粘到 `qzcli create` 后面"
+            )
             st.code(fragmentation.format_exclude_args(names), language="bash")
         else:
             st.success(f"{pick} 没有「有空卡的碎卡节点」，无需排除 👍")
@@ -268,8 +330,9 @@ def render_fragmentation(ws_options):
     mc1, mc2 = st.columns([3, 1])
     me_default = _guess_me(users)
     with mc1:
-        me = st.selectbox("用户", users,
-                          index=users.index(me_default) if me_default in users else 0)
+        me = st.selectbox(
+            "用户", users, index=users.index(me_default) if me_default in users else 0
+        )
     with mc2:
         only_frag = st.checkbox("只看碎卡节点", value=True)
     my_by_node = defaultdict(int)
@@ -287,18 +350,32 @@ def render_fragmentation(ws_options):
     myrows = []
     for node, mycards in sorted(my_by_node.items(), key=lambda kv: -kv[1]):
         d = rec.get(node, {})
-        myrows.append({"节点": node, "工作空间": d.get("workspace", ""),
-                       "计算组": d.get("lcg", ""), "总卡": d.get("total", 0),
-                       "已用": d.get("used", 0), "空闲": d.get("free", 0),
-                       "我的卡": mycards, "节点低优卡": d.get("low_pri", 0),
-                       "分类": d.get("class", "")})
+        myrows.append(
+            {
+                "节点": node,
+                "工作空间": d.get("workspace", ""),
+                "计算组": d.get("lcg", ""),
+                "总卡": d.get("total", 0),
+                "已用": d.get("used", 0),
+                "空闲": d.get("free", 0),
+                "我的卡": mycards,
+                "节点低优卡": d.get("low_pri", 0),
+                "分类": d.get("class", ""),
+            }
+        )
     if not myrows:
         st.info(f"{me} 当前无占卡任务。")
         return
     frag_cnt = sum(1 for r in myrows if r["分类"] == fragmentation.FRAGMENTED)
-    st.caption(f"**{me}** 的卡分散在 **{len(myrows)}** 个节点，其中 **{frag_cnt}** 个是碎卡节点"
-               "(整节点没占满 / 高低优混合)——把这些迁走或凑整能少占节点。")
-    shown = [r for r in myrows if r["分类"] == fragmentation.FRAGMENTED] if only_frag else myrows
+    st.caption(
+        f"**{me}** 的卡分散在 **{len(myrows)}** 个节点，其中 **{frag_cnt}** 个是碎卡节点"
+        "(整节点没占满 / 高低优混合)——把这些迁走或凑整能少占节点。"
+    )
+    shown = (
+        [r for r in myrows if r["分类"] == fragmentation.FRAGMENTED]
+        if only_frag
+        else myrows
+    )
     if not shown:
         st.success("我没有碎卡节点 👍(卡都落在整节点上)。取消勾选可看全部。")
         return
@@ -524,8 +601,11 @@ def render_composition(df, free_by_lcg, ws_name):
         return
     cont = CONTINUOUS_COLOR.get(color_dim)
     # 「整节点/碎卡」配色映射到实际数据列「节点分类」
-    color_col = cont[0] if cont else (
-        CARDING_COL if color_dim == CARDING_COLOR_DIM else color_dim)
+    color_col = (
+        cont[0]
+        if cont
+        else (CARDING_COL if color_dim == CARDING_COLOR_DIM else color_dim)
+    )
     path_cols = hierarchy + [LEAF]
     agg_map = {"GPU": ("GPU", "sum"), "任务数": (LEAF, "size")}
     agg_extra = [("GPU利用率", "mean"), ("运行时长h", "max"), ("任务类型", "first")]

@@ -126,7 +126,9 @@ def fetch_frontend_actions(cookie, cache_dir, verbose=False):
     found = collections.defaultdict(set)
     for f in cache_dir.glob("*.js"):
         t = f.read_text(encoding="utf-8", errors="replace")
-        for svc, act in re.findall(r"/api/v2/([a-z\-]+)\?Action=([A-Za-z]+)", t):
+        # action 名可能带数字（实测 GetProjectListV2）。用 [A-Za-z]+ 会把它截成
+        # GetProjectListV，然后探活报「不存在」—— 一个自己造出来的假缺口。
+        for svc, act in re.findall(r"/api/v2/([a-z\-]+)\?Action=([A-Za-z0-9_]+)", t):
             found[svc].add(act)
     return found
 

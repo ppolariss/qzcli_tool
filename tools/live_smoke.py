@@ -31,6 +31,7 @@ sys.path.insert(0, str(REPO_ROOT))
 
 from qzcli import api as qzapi  # noqa: E402
 from qzcli.api import QzAPIError, get_api  # noqa: E402
+from qzcli.diag import swallowed  # noqa: E402
 from qzcli.config import (  # noqa: E402
     find_workspace_by_name,
     load_all_resources,
@@ -58,6 +59,39 @@ class _QuietDisplay:
         if name.startswith("print"):
             return self.print
         raise AttributeError(name)
+
+
+def _image_from_history(a, ws, lcg, cookie, fallback_image):
+    """从该计算组最近的真实任务里取 ``(image, image_type)``。
+
+    组里没有历史任务时退回 ``--image`` 的值 + ``SOURCE_PUBLIC``；
+    退回时**打印出来**，别让"用了兜底值"这件事静默发生。
+    """
+    try:
+        jobs = a.list_jobs_with_cookie(ws, cookie, page_size=200)
+        rows = (jobs.get("jobs") if isinstance(jobs, dict) else jobs) or []
+    except (QzAPIError, requests.RequestException) as exc:
+        swallowed("smoke/反推镜像", exc)
+        rows = []
+    for j in rows:
+        if j.get("logic_compute_group_id") != lcg:
+            continue
+        if "qzcli-" in (j.get("name") or ""):
+            continue  # 别拿自己上一轮的失败任务当样本
+        try:
+            detail = a._get_job_detail_v2(j["job_id"], cookie) or {}
+        except (QzAPIError, requests.RequestException) as exc:
+            swallowed("smoke/反推镜像", exc)
+            continue
+        for fc in detail.get("framework_config") or []:
+            img, itype = fc.get("image"), fc.get("image_type")
+            if img and itype:
+                return img, itype
+    print(
+        f"  [i] 该计算组没有可参考的历史任务，回退到 --image + SOURCE_PUBLIC：{fallback_image}",
+        file=sys.stderr,
+    )
+    return fallback_image, "SOURCE_PUBLIC"
 
 
 def pick_submittable_project(a, ws: str, cookie: str):
@@ -175,7 +209,18 @@ def main() -> int:
     ap.add_argument("--spec", help="提交用的 spec_id；不传则自动挑 GPU 数最小的")
     ap.add_argument(
         "--image",
-        default="docker.sii.shaipower.online/inspire-studio/dhyu-wan-torch29:0.4",
+        default="",
+        help=(
+            "提交用镜像。**留空=从该计算组的历史真实任务反推**（连 image_type 一起）。"
+            "以前这里写死 dhyu-wan-torch29:0.4，2026-08 它已从平台删除 —— "
+            "写死的外部资源注定会过期，换一个写死值只是把下次爆炸推迟"
+        ),
+    )
+    ap.add_argument(
+        "--image-type",
+        dest="image_type",
+        default="",
+        help="SOURCE_PUBLIC / SOURCE_PRIVATE；留空则跟随 --image 的来源",
     )
     ap.add_argument(
         "--queue-compute-group",
@@ -282,11 +327,28 @@ def main() -> int:
 
     _events()
 
+    #: 这些状态的任务**不可能有日志** —— 容器就没起来过。
+    #: 拿它们去试等于白白消耗扫描名额。
+    _NO_LOG_STATUSES = {"job_create_failed", "job_queuing", "job_creating"}
+
     @check("查看任务日志", "qzcli logs")
     def _logs():
-        # 找一个跑过的任务（CREATING 的没有日志）
-        jobs = a._list_jobs_v2(ws, cookie, page_size=30)["jobs"]
+        # 找一个真跑过的任务。
+        #
+        # 原来是「取最近 30 个，挨个试」—— 看着稳，实际会被**自己的残骸**噎死：
+        # 2026-08-12 排查 image_type 时连续失败了几轮，最近 30 个任务里 26 个是
+        # 本工具留下的 job_create_failed，全都没有日志，于是这条一直红，
+        # 而我一度把它误判成「平台日志接口坏了」（同一时刻单独跑 qzcli logs
+        # 其实是好的）。
+        #
+        # 两条改进：跳过不可能有日志的状态；跳过自己提交的 qzcli-* 任务。
+        # 名额留给真实任务。
+        jobs = a._list_jobs_v2(ws, cookie, page_size=60)["jobs"]
+        skipped = 0
         for j in jobs:
+            if j.get("status") in _NO_LOG_STATUSES or "qzcli-" in (j.get("name") or ""):
+                skipped += 1
+                continue
             try:
                 r = a.get_job_logs(j["job_id"], page_size=3)
             except QzAPIError:
@@ -295,7 +357,10 @@ def main() -> int:
             if hits:
                 state["log_job"] = j["job_id"]
                 return f"{j['job_id'][:20]}… 取到 {len(hits)} 条日志"
-        raise AssertionError("扫了 30 个任务都没取到日志")
+        raise AssertionError(
+            f"扫了 {len(jobs)} 个任务都没取到日志"
+            f"（其中 {skipped} 个因状态不可能有日志/是本工具自己的任务被跳过）"
+        )
 
     _logs()
 
@@ -775,6 +840,26 @@ def main() -> int:
             project_id, why = pick_submittable_project(a, ws, cookie)
             assert_true(project_id, f"拿不到可提交的 project_id：{why}")
 
+            # 镜像和 image_type **从该计算组的历史任务反推**，不写死。
+            #
+            # 这里原来是 `"image": args.image, "image_type": "SOURCE_PRIVATE"` ——
+            # 两个都写死。2026-08-12 的后果：提交一律
+            # `InternalError: Unauthorized`。二分定位到就是 image_type：
+            #
+            #     image_type=SOURCE_PRIVATE → ✗ InternalError: Unauthorized
+            #     image_type=SOURCE_PUBLIC  → ✓ 成功
+            #
+            # 默认镜像在**公共** registry，声明成 SOURCE_PRIVATE 会让后端拿它去
+            # 私有仓做鉴权，401 被包装成 InternalError。而且默认镜像本身也烂了
+            # （dhyu-wan-torch29:0.4 已经查不到）—— **写死的外部资源注定会过期**，
+            # 换成另一个写死值只是把下次爆炸推迟。
+            # **显式传的 --image 一律照用**，历史只在没传时兜底。
+            # 我第一版把这个顺序写反了：不管用户传没传，都拿历史值覆盖 ——
+            # 那是把用户对自己命令的控制权拿掉了，是倒退。
+            if args.image:
+                image, image_type = args.image, args.image_type or "SOURCE_PUBLIC"
+            else:
+                image, image_type = _image_from_history(a, ws, lcg, cookie, args.image)
             payload = {
                 "name": f"qzcli-v2-smoke-{int(time.time())}",
                 "logic_compute_group_id": lcg,
@@ -803,8 +888,8 @@ def main() -> int:
                             },
                             lcg,
                         ),
-                        "image": args.image,
-                        "image_type": "SOURCE_PRIVATE",
+                        "image": image,
+                        "image_type": image_type,
                         "instance_count": 1,
                         "shm_gi": max(64, int(spec["memory_size_gib"] * 0.5)),
                     }
@@ -1055,6 +1140,12 @@ def main() -> int:
                         "status"
                     )
 
+                # ⚠️ 提交后会先经过 UNKNOWN 这个**过渡态**（平台还没把状态写好）。
+                # 它既不在 STOPPABLE 也不在 TERMINAL —— 早先的循环两边都不匹配，
+                # 于是轮询到超时后 assert「等了 60 秒仍不可停止（status=UNKNOWN）」，
+                # 而任务其实很快就 SUCCEEDED 了（smoke 的 HPC 任务是秒级 echo）。
+                # 2026-08-12 的 submit 闸门就是这么红的，**并非真的停不掉、也无残留**。
+                # 所以 UNKNOWN 一律当「还没就绪，继续轮询」，只按最终落到哪个集合判定。
                 st = None
                 for _ in range(20):  # 最多等 60 秒
                     st = _status()
@@ -1064,7 +1155,12 @@ def main() -> int:
                 if st in TERMINAL:
                     return f"任务已自行结束（status={st}），无需停止"
 
-                assert_true(st in STOPPABLE, f"等了 60 秒仍不可停止（status={st}）")
+                assert_true(
+                    st in STOPPABLE,
+                    f"等了 60 秒仍未进入可停止/终态（status={st}）。"
+                    f"UNKNOWN 是提交后的过渡态，若一直卡在这里说明平台侧异常，"
+                    f"手工确认: {jid}",
+                )
                 a._request_v2("hpc", "StopJob", {"job_id": jid})
 
                 for _ in range(20):  # 最多等 60 秒确认终态

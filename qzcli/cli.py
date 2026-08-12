@@ -4,6 +4,7 @@ qzcli - 启智平台任务管理 CLI
 """
 
 import argparse
+import contextlib
 import re
 import shlex
 import sys
@@ -101,6 +102,139 @@ DEFAULT_CREATE_IMAGE = "docker.sii.shaipower.online/inspire-studio/dhyu-wan-torc
 DEFAULT_CREATE_IMAGE_TYPE = "SOURCE_PRIVATE"
 DEFAULT_CREATE_INSTANCES = 1
 DEFAULT_CREATE_SHM = 1200
+
+
+#: ``qzcli create`` 不指定镜像时的兜底。**它会过期**，所以只作为最后一档，
+#: 且用它之前会先试平台和历史 —— 见 :func:`resolve_create_image`。
+#:
+#: 2026-08-12 的教训：这两个常量曾被无条件使用，而其时
+#: ``dhyu-wan-torch29:0.4`` 已从平台删除、``SOURCE_PRIVATE`` 又和公共 registry
+#: 冲突（二分实测：同 payload 换成 ``SOURCE_PUBLIC`` 就成功）。于是**任何不指定
+#: 镜像的用户必然失败**，还只能拿到一句指不到镜像上的 ``InternalError:
+#: Unauthorized``。交互式创建时两者都是默认值，一路回车就中招。
+class _ImageResolutionError(Exception):
+    """定不出镜像时抛这个，由调用方转成友好报错。"""
+
+
+def _image_type_from_platform(api, cookie, image):
+    """问平台这个镜像到底是公开还是私有。拿不准就返回 ``None``（**不猜**）。
+
+    ⚠️ 这条路径**尚未在真机验证过**（写它时账号处于锁定状态）。``image`` 服务的
+    请求体形状比较刁（实测只发 ``page``/``page_size`` 会返回空列表，需要带
+    ``filter``），所以这里失败就安静地落到下一档，绝不因为它把 create 打挂。
+    """
+    try:
+        result = api._request_v2(
+            "image",
+            "ListImages",
+            {
+                "page": 1,
+                "page_size": 200,
+                "filter": {"name": image.split("/")[-1].split(":")[0]},
+            },
+            cookie=cookie,
+            referer_path="/jobs/images",
+        )
+    except Exception as exc:  # noqa: BLE001 —— 这只是加分项，不能拖垮主流程
+        swallowed("create/查镜像可见性", exc)
+        return None
+    for item in (result or {}).get("images") or (result or {}).get("items") or []:
+        url = item.get("image_url") or item.get("url") or ""
+        if url and url != image:
+            continue
+        vis = (item.get("visibility") or item.get("source") or "").upper()
+        if "PUBLIC" in vis:
+            return "SOURCE_PUBLIC"
+        if "PRIVATE" in vis:
+            return "SOURCE_PRIVATE"
+    return None
+
+
+def _image_from_history(api, cookie, workspace_id, want_image=None):
+    """从**用户自己近期真实跑过**的任务里取 ``(image, image_type)``。
+
+    比写死的常量新鲜：每个人都有历史，而常量会随平台删镜像而烂掉。
+    ``want_image`` 给定时只找用了那个镜像的任务（用来补它的 image_type）。
+    跳过创建就失败的任务和本工具自己提交的任务 —— 它们的镜像多半正是坏的那个。
+    """
+    try:
+        jobs = api.list_jobs_with_cookie(workspace_id, cookie, page_size=100)
+        rows = (jobs.get("jobs") if isinstance(jobs, dict) else jobs) or []
+    except Exception as exc:  # noqa: BLE001
+        swallowed("create/反推历史镜像", exc)
+        return None, None
+    for job in rows:
+        if job.get("status") in ("job_create_failed", "job_queuing"):
+            continue
+        if "qzcli-" in (job.get("name") or ""):
+            continue
+        try:
+            detail = api._get_job_detail_v2(job["job_id"], cookie) or {}
+        except Exception as exc:  # noqa: BLE001
+            swallowed("create/反推历史镜像", exc)
+            continue
+        for fc in detail.get("framework_config") or []:
+            img, itype = fc.get("image"), fc.get("image_type")
+            if not img or not itype:
+                continue
+            if want_image and img != want_image:
+                continue
+            return img, itype
+    return None, None
+
+
+def resolve_create_image(api, cookie, workspace_id, image, image_type, display=None):
+    """定出提交用的 ``(image, image_type)``。
+
+    优先级（**用户控制权永远第一**）：
+
+    1. 显式传了就用，**任何推断都不许覆盖**
+    2. 没传 ``image_type`` 时向平台查该镜像的真实可见性（best-effort）
+    3. 再退回用户自己近期成功任务用过的镜像
+    4. 都拿不到就**明确报错说清要传什么** —— 而不是拿一个必然失败的默认值去撞，
+       再甩一个 ``InternalError: Unauthorized`` 给用户
+
+    Raises:
+        _ImageResolutionError: 第 4 档。
+    """
+    if image and image_type:
+        return image, image_type  # 1. 用户说了算
+
+    if image:
+        # 2. 有镜像没类型：先问平台
+        guessed = _image_type_from_platform(api, cookie, image)
+        if guessed:
+            if display:
+                display.print(f"[dim]镜像类型取自平台：{guessed}[/dim]")
+            return image, guessed
+        # 3. 再看自己历史上用同一个镜像时填的什么
+        _, hist_type = _image_from_history(api, cookie, workspace_id, want_image=image)
+        if hist_type:
+            if display:
+                display.print(f"[dim]镜像类型取自你近期同镜像的任务：{hist_type}[/dim]")
+            return image, hist_type
+        raise _ImageResolutionError(
+            f"无法确定镜像 {image} 的类型（公开/私有）。\n"
+            "  请显式指定：--image-type SOURCE_PUBLIC 或 --image-type SOURCE_PRIVATE\n"
+            "  （公共 registry 的镜像填 SOURCE_PRIVATE 会让平台按私有仓鉴权，"
+            "报 InternalError: Unauthorized）"
+        )
+
+    # 3. 两个都没传：整体取自历史
+    hist_image, hist_type = _image_from_history(api, cookie, workspace_id)
+    if hist_image and hist_type:
+        if display:
+            display.print(f"[dim]未指定镜像，沿用你近期任务的：{hist_image}[/dim]")
+        return hist_image, image_type or hist_type
+
+    # 4. 明确报错，不拿必然失败的默认值去撞
+    raise _ImageResolutionError(
+        "未指定镜像，且在你近期的任务里也没找到可参考的镜像。\n"
+        "  请显式指定：--image <镜像地址> --image-type SOURCE_PUBLIC|SOURCE_PRIVATE\n"
+        "  可用镜像见平台「镜像」页面。"
+    )
+
+
 #: ``qzcli create`` 不带 ``--priority`` 时用的优先级。
 #:
 #: **数字越小优先级越低。** 实测提交值 → 平台档位：1→LOW、3→LOW、4→NORMAL、
@@ -1189,6 +1323,10 @@ def cmd_workspaces(args):
 
             from concurrent.futures import ThreadPoolExecutor, as_completed
 
+            # 扇出前串行确认鉴权状态（不发请求，见 api.ensure_authenticated）。
+            # 少了这步，cookie 失效那一刻每个 worker 都会各自撞 401 去登录。
+            _ensure_auth_before_fanout(api, "")
+
             try:
                 with ThreadPoolExecutor(max_workers=parallel_workers) as executor:
                     futures = [executor.submit(_fetch_one, ws) for ws in workspaces]
@@ -1684,6 +1822,9 @@ def cmd_avail(args):
                         return current_lcg_id, nodes
 
                     max_lcg_workers = min(6, len(compute_groups))
+                    # 扇出前串行确认鉴权（不发请求）。avail 是最容易触发这个问题的
+                    # 命令：按计算组并发，cookie 一失效就是 6 个线程同时登录。
+                    _ensure_auth_before_fanout(api, "")
                     with ThreadPoolExecutor(max_workers=max_lcg_workers) as executor:
                         for current_lcg_id, nodes in executor.map(
                             _fetch_lcg_nodes, compute_groups.keys()
@@ -2233,12 +2374,40 @@ _JOB_DETAIL_PATH_BY_TYPE = {
 }
 
 
+def _ensure_auth_before_fanout(api, cookie):
+    """**并发扇出之前**串行把鉴权走完，返回此后该用的 cookie。
+
+    为什么必须有这一步：本仓每个 API 方法都挂 ``@with_auth_retry``，撞 401 就
+    自己重登。单线程没问题；从 N 个 worker 里调用时，cookie 失效那一刻
+    **N 个 worker 会同时撞 401、同时去登录**。CAS 按失败次数延长锁定 ——
+    2026-08-12 就是这么把账号锁死的。
+
+    历史上为此加过四层保护（进程内锁、跨进程文件锁、按失败 cookie 去重、
+    失败冷却），**全在治「抢着登录时怎么办」，没有一层在治「为什么让 worker
+    去登录」**。这个函数治的是后者。
+
+    对照 inspire 插件：它压根没有自动重登，401 直接让用户去登录，并且把
+    「拉 permissions / user detail 建立鉴权上下文」列为业务动作之前的固定步骤。
+
+    **必须使用返回值** —— 重登后盘上 cookie 已经换了，继续用传进来的旧字符串
+    就退回「每个 worker 各自撞 401」的老路。
+
+    测试里的假 API 没有 ``ensure_authenticated``，原样返回即可：那种场景是
+    单线程 mock，不存在踩踏。
+    """
+    fn = getattr(api, "ensure_authenticated", None)
+    if fn is None:
+        return cookie
+    return fn(cookie) or cookie
+
+
 def fetch_all_task_dimensions(api, workspace_id, cookie, page_size=200, max_workers=4):
     """分页获取工作空间**当前在跑**任务的资源维度数据（list_task_dimension）。
 
     第一页即返回 ``total``，据此算出总页数后并发拉取其余页（顺序无关，聚合/可视
     化都不依赖任务顺序），避免逐页串行的高延迟。
     """
+    cookie = _ensure_auth_before_fanout(api, cookie)  # 扇出前，串行
     first = api.list_task_dimension(
         workspace_id, _live_cookie_for_paging(cookie), page_num=1, page_size=page_size
     )
@@ -2280,6 +2449,7 @@ def build_node_to_lcg_map(api, workspace_id, cookie):
     但 ``list_node_dimension`` 支持按 ``logic_compute_group_id`` 过滤，因此逐个
     lcg 拉取其成员节点即可反建「节点 → 计算组」映射（``cmd_avail`` 同法）。
     """
+    cookie = _ensure_auth_before_fanout(api, cookie)  # 扇出前，串行
     node_map = {}
     cluster_info = api.get_cluster_basic_info(workspace_id, cookie)
     lcgs = [
@@ -6375,19 +6545,28 @@ def _run_create_interactive(args, display, api) -> int:
         if args.cmd_str is None:
             return 1
 
+    # ⚠️ 这里**不再预填**写死的默认镜像。
+    #
+    # 以前预填 DEFAULT_CREATE_IMAGE + SOURCE_PRIVATE，用户一路回车就把它们变成了
+    # 「显式指定」——而那个镜像 2026-08 已从平台删除、类型又和公共 registry 冲突，
+    # 结果是必然失败并甩一句指不到镜像上的 InternalError: Unauthorized。
+    #
+    # 现在留空表示「让 qzcli 去平台/你的历史任务里找」，由 resolve_create_image
+    # 处理；找不到会明确告诉你要传什么。
     if args.image is None:
-        args.image = _prompt_text_input(
-            display, "Docker 镜像", DEFAULT_CREATE_IMAGE, required=True
+        entered = _prompt_text_input(
+            display, "Docker 镜像（留空=按你近期任务自动选）", "", required=False
         )
-        if args.image is None:
-            return 1
+        args.image = entered or None
 
     if args.image_type is None:
-        args.image_type = _prompt_text_input(
-            display, "镜像类型", DEFAULT_CREATE_IMAGE_TYPE, required=True
+        entered = _prompt_text_input(
+            display,
+            "镜像类型 SOURCE_PUBLIC/SOURCE_PRIVATE（留空=自动判定）",
+            "",
+            required=False,
         )
-        if args.image_type is None:
-            return 1
+        args.image_type = entered or None
 
     if args.instances is None:
         args.instances = _prompt_int_input(
@@ -6496,10 +6675,6 @@ def cmd_create(args):
         display.print_error("请指定执行命令: --command <cmd>")
         return 1
 
-    if args.image is None:
-        args.image = DEFAULT_CREATE_IMAGE
-    if args.image_type is None:
-        args.image_type = DEFAULT_CREATE_IMAGE_TYPE
     if args.instances is None:
         args.instances = DEFAULT_CREATE_INSTANCES
     if args.shm is None:
@@ -6706,6 +6881,28 @@ def cmd_create(args):
         else:
             display.print_error(str(e))
             return 1
+    # 镜像：显式传的一律照用；没传才去平台/历史里找，都找不到就明确报错。
+    #
+    # 这里以前是无条件套两个写死的常量（在 args 解析处），而其时默认镜像已从
+    # 平台删除、默认 image_type 又和公共 registry 冲突 —— **任何不指定镜像的
+    # 用户必然失败**，拿到的还是一句指不到镜像上的 InternalError: Unauthorized。
+    # 交互式创建时两者都是默认值，一路回车就中招。
+    #
+    # 放在这里而不是 args 解析处：解析处还没有 workspace_id / cookie，
+    # 查平台和查历史都做不了。
+    try:
+        args.image, args.image_type = resolve_create_image(
+            api,
+            (get_cookie() or {}).get("cookie", ""),
+            workspace_id,
+            args.image,
+            args.image_type,
+            display=display,
+        )
+    except _ImageResolutionError as exc:
+        display.print_error(str(exc))
+        return 1
+
     spec_price = build_resource_spec_price(spec_obj, compute_group_id)
 
     # --- Build payload ---
@@ -6874,6 +7071,108 @@ def cmd_create(args):
         print(json_mod.dumps(output, ensure_ascii=False))
 
     return 0
+
+
+def cmd_worker(args):
+    """在分布式训练任务的 worker 容器里执行命令 / 做通信体检。
+
+    和 ``qzcli exec`` 分开：那个服务 notebook 开发机（Jupyter proxy），
+    这个服务训练任务的 worker（WebSocket PTY），是两类完全不同的对象。
+    """
+    from .worker_exec import (
+        WorkerExecError,
+        default_instance_name,
+        run_in_worker,
+        run_many_in_worker,
+    )
+
+    display = get_display()
+    action = getattr(args, "worker_action", None)
+    job_id = getattr(args, "job_id", "")
+    inst = getattr(args, "instance", None) or default_instance_name(
+        job_id, getattr(args, "index", 0)
+    )
+
+    if action == "exec":
+        command = " ".join(getattr(args, "cmd_args", None) or []).strip()
+        if not command:
+            display.print_error("请指定要执行的命令")
+            display.print("[dim]示例: qzcli worker exec <job_id> nvidia-smi[/dim]")
+            return 1
+        display.print(f"[dim]目标实例: {inst}[/dim]")
+        try:
+            code, out = run_in_worker(job_id, command, inst)
+        except WorkerExecError as exc:
+            display.print_error(str(exc))
+            return 1
+        if out:
+            display.print(out)
+        if code != 0:
+            display.print(f"[yellow]exit_code={code}[/yellow]")
+        return 0 if code == 0 else code
+
+    if action == "diag":
+        # 通信体检：这几项是 2026-08-12 排查 142 节点 MoE 训练时验证有效的判据。
+        checks = [
+            (
+                "主机/GPU",
+                "hostname; nvidia-smi --query-gpu=index,name,utilization.gpu,memory.used --format=csv,noheader",
+            ),
+            (
+                "RDMA 端口",
+                "cat /sys/class/infiniband/*/ports/1/state 2>/dev/null | sort | uniq -c",
+            ),
+            (
+                # 网卡名和 counters 路径**因机型/容器挂载而异**：不能写死 mlx5_0，
+                # 实测有的节点根本没暴露 .../ports/1/counters（拿不到不等于有故障，
+                # 所以下面用 NO_COUNTERS 明示"测不了"，而不是伪装成 0 误码）。
+                "RDMA 误码",
+                "d=$(ls -d /sys/class/infiniband/*/ports/*/counters 2>/dev/null | head -1); "
+                'if [ -n "$d" ]; then for c in link_downed symbol_error port_rcv_errors; do '
+                'echo -n "$c="; cat "$d/$c" 2>/dev/null || echo NA; done; '
+                "else echo NO_COUNTERS（该容器未暴露 RDMA 计数器，无法判定）; fi",
+            ),
+            (
+                "到 master 的 TCP",
+                'test -n "$MASTER_ADDR" && (getent hosts "$MASTER_ADDR"; '
+                'timeout 5 bash -c "</dev/tcp/$MASTER_ADDR/${MASTER_PORT:-23456}" '
+                "&& echo TCP_OK || echo TCP_FAIL) || echo NO_MASTER_ADDR",
+            ),
+            ("NCCL 配置", "env | grep -E '^NCCL_|^MASTER_|^GLOO_' | sort"),
+        ]
+        display.print(f"[bold]worker 通信体检[/bold]  实例: {inst}\n")
+        failed = 0
+        # 所有检查跑在**同一条连接**里：逐条新建会被平台拒（socket already closed）
+        try:
+            outcomes = run_many_in_worker(job_id, checks, inst)
+        except WorkerExecError as exc:
+            display.print_error(str(exc))
+            return 1
+        for title, code, out in outcomes:
+            # ⚠️ 光看 exit_code 会误判：像 `... || echo TCP_FAIL` 这种，
+            # echo 本身成功 → code=0，但语义上是失败。所以再看输出里的失败标记。
+            # （实测踩过：单机任务 master 端口没监听，TCP_FAIL 却显示 ✓。）
+            bad_markers = ("TCP_FAIL", "NO_MASTER_ADDR", "Connection refused")
+            unhealthy = code != 0 or any(m in (out or "") for m in bad_markers)
+            # RDMA 误码是这套体检的核心判据：非 0 就是物理链路有问题，必须报红。
+            # 但「拿不到计数器」不等于「有故障」，NO_COUNTERS 只提示测不了、不算失败。
+            for line in (out or "").splitlines():
+                m = re.match(
+                    r"\s*(link_downed|symbol_error|port_rcv_errors)=(\d+)", line
+                )
+                if m and int(m.group(2)) > 0:
+                    unhealthy = True
+            mark = "[red]✗[/red]" if unhealthy else "[green]✓[/green]"
+            if unhealthy:
+                failed += 1
+            display.print(f"{mark} [bold]{title}[/bold]")
+            for line in (out or "").splitlines():
+                display.print(f"    {line}")
+            display.print("")
+        return 1 if failed else 0
+
+    display.print_error("请指定动作: exec / diag")
+    return 1
 
 
 def cmd_hpc(args):
@@ -8424,6 +8723,24 @@ def main():
     )
 
     # batch 命令 - 批量提交任务
+    worker_parser = subparsers.add_parser(
+        "worker", help="操作分布式训练任务的 worker 容器（exec / diag）"
+    )
+    worker_sub = worker_parser.add_subparsers(dest="worker_action")
+
+    _w_exec = worker_sub.add_parser("exec", help="在 worker 容器里执行命令")
+    _w_exec.add_argument("job_id", help="训练任务 ID（job-xxxx）")
+    # dest 不能叫 command —— 顶层 subparsers 已经用 args.command 存子命令名，
+    # 重名会让分发表拿到一个 list 而不是字符串（TypeError: unhashable type: list）。
+    _w_exec.add_argument("cmd_args", nargs="*", metavar="COMMAND", help="要执行的命令")
+    _w_exec.add_argument("--instance", help="实例名；缺省用 <job_id>-worker-<index>")
+    _w_exec.add_argument("--index", type=int, default=0, help="worker 序号（默认 0）")
+
+    _w_diag = worker_sub.add_parser("diag", help="worker 通信体检（GPU/RDMA/TCP/NCCL）")
+    _w_diag.add_argument("job_id", help="训练任务 ID（job-xxxx）")
+    _w_diag.add_argument("--instance", help="实例名；缺省用 <job_id>-worker-<index>")
+    _w_diag.add_argument("--index", type=int, default=0, help="worker 序号（默认 0）")
+
     hpc_parser = subparsers.add_parser("hpc", help="提交 HPC/CPU 任务到启智平台")
     hpc_parser.add_argument("--name", required=True, help="任务名称")
     hpc_parser.add_argument("--workspace", required=True, help="工作空间名称或 ID")
@@ -8550,6 +8867,7 @@ def main():
         "dashboard": cmd_dashboard,
         "create": cmd_create,
         "create-job": cmd_create,
+        "worker": cmd_worker,
         "hpc": cmd_hpc,
         "hpc-usage": cmd_hpc_usage,
         "batch": cmd_batch,

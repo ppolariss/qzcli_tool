@@ -190,22 +190,72 @@ POST /api/v2/audit?Action=ApplySecurityAudit
 
 ## 六、未能打通的接口（需要贵方补充）
 
-| 接口 | 现象 | 已试过 |
-|---|---|---|
-| `project?Action=ListMountProjects` | `AccessForbidden: Access denied` | `{file_path, project_name}`（参数名取自前端调用点） |
-| `file?Action=GetSystemStorageTypeList` | 空体 → `InternalError: invalid request type`；带 `workspace_id`/`space_id` → `unknown field` | `{}` / `{workspace_id}` / `{space_id}` |
+| 接口 | 结论 |
+|---|---|
+| `file?Action=GetSystemStorageTypeList` | ✅ **已解决**。正确请求体是 `{filter: {workspace_id}}`（要嵌一层 `filter`）。返回 `system_storages`：`hdd`(primary) / `ssd` / `qb-ilm` 等 |
+| `project?Action=ListMountProjects` | ❌ **仍不通，且已确认是权限门槛而非参数问题** |
+
+`ListMountProjects` 试过 4 种参数形状 —— `{filter:{workspace_id}}`、
+`{workspace_id, file_path}`、`{file_path}`、`{project_name}` ——
+**返回完全相同的 `AccessForbidden: Access denied`**。参数形状不同而错误一字不差，
+说明校验发生在参数解析之前，是权限拦截。
 
 `file?Action=CheckPermission` 用 `{file_path}` 可调通，但对我们测试的路径返回
 全空字段（`file_path:""`、`is_dir:false`），疑似还需要存储上下文参数。
 
 想请教：
 
-1. `ListMountProjects` 的 `AccessForbidden` 是权限门槛（需要项目 owner/maintainer？）
-   还是参数不全导致的？
-2. `GetSystemStorageTypeList` 的正确请求体是什么？
-3. 完整的挂载链路是否为
+1. `ListMountProjects` 需要什么权限？（项目 owner/maintainer？workspace admin？）
+2. 完整的挂载链路是否为
    `file CheckPermission` → `audit ApplySecurityAudit` → 审批 →
    `file DirectoryFileMount`？`CreateSubmitAudit` 在这条链上是什么位置？
+3. v1 的 `/api/v1/audit/security/apply` 与 v2 的 `audit?Action=ApplySecurityAudit`
+   请求体字段完全相同、两条并存。后续以哪条为准？v1 会下线吗？
+
+---
+
+## 六之补、只读 action 穷举探活（205 个）
+
+用 `tools/scan_v2_surface.py` 对全部**只读** action 逐个发一次最小请求
+（写操作 103 个一律跳过），按服务端返回分类：
+
+| 分类 | 数量 | 含义 |
+|---|---:|---|
+| 需参数（`InvalidParameter`） | 78 | **路由存在** |
+| 可用 | 51 | 空请求体即返回业务数据 |
+| 权限（`AccessForbidden`） | 45 | **路由存在** |
+| 网关 404 | 15 | 见下 |
+| `InternalError` | 9 | |
+| `ResourceNotFound` | 7 | |
+| **`unknown action`（真不存在）** | **0** | |
+
+**205 个只读 action，没有一个是真不存在的。** 这把「spec 是子集」从服务级
+坐实到了 action 级。
+
+> 说明：第一轮扫描曾报 `project GetProjectListV` 不存在，那是**我们提取正则的
+> bug** —— 真实名字是 `GetProjectListV2`，`[A-Za-z]+` 把结尾的 `2` 截掉了。
+> 已修正并重跑，此处数字是修正后的。
+
+### `inference-serving` 整个服务在网关上打不通
+
+15 个网关 404 里有 **14 个来自 `inference-serving`**，即被探到的**每一个**
+只读 action 都是 404：
+
+```
+GetServing            ListServings           GetServingLog
+ListServingInstances  ListServingVersions    ListServingEvents
+GetTaskMetric         GetTaskMetricBatch     GetServingApiMetric
+GetServingApiMetricBatch   GetServingConfigByWorkspaceId
+GetInferenceServingTerms   GetInferenceServingUserProjectList
+GetLastSuccessInferenceServingInfo
+```
+
+而 spec 里这个服务声明了 **23 个 action**。**不是部分不通，是整个服务没接上
+网关。** 建议要么接上路由，要么从 spec 里摘掉 —— 现状是 spec 承诺了一整套
+外部工具用不了的能力。
+
+剩下 1 个 404 之外的异常是 `billing GetProjectBillingDetail` 读超时（60s），
+与本报告测试期间 `qzcli logs` 的超时现象同类。
 
 ---
 
