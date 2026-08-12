@@ -326,6 +326,21 @@ _CAS_ERROR_RE = re.compile(
 _TAG_RE = re.compile(r"<[^>]+>")
 
 
+#: 这些字样出现在 CAS 错误文案里，代表**凭据本身不对**（密码错、账号被锁）。
+#: 这类失败**重试没有意义，而且有害** —— 每次重试都是一次新的失败尝试，
+#: 攒够次数 CAS 会把账号锁死。2026-08-12 真锁过一次。
+_CREDENTIAL_FAILURE_MARKERS = ("锁定", "密码错误", "用户名或密码", "账号不存在")
+
+
+def is_credential_failure(message: str) -> bool:
+    """这条登录失败是不是「凭据不对」——即**绝不该自动重试**的那种。
+
+    区分它和「临时被挡」（频繁登录触发的限流/验证码）是有实际代价的：
+    后者等几分钟自己好，前者你越重试锁得越死。
+    """
+    return any(m in (message or "") for m in _CREDENTIAL_FAILURE_MARKERS)
+
+
 def _describe_cas_login_failure(html: str) -> str:
     """从 CAS 登录页的 HTML 里读出**真实**的失败原因。
 
@@ -393,15 +408,31 @@ def _cooldown_path():
 
 
 def _recent_relogin_failure():
-    """返回冷却期内的上次失败信息（``str``），不在冷却期则返回 ``None``。"""
+    """返回「本次不该再自动登录」的原因（``str``），可以登则返回 ``None``。
+
+    分两档，因为这两种失败的正确处理**相反**：
+
+    - **凭据类**（密码错 / 账号被锁）：``is_credential_failure`` 命中 →
+      **永不自动重试**，直到用户自己 ``qzcli login`` 成功把记录清掉。
+      重试只会累积失败次数，把账号锁得更死。
+    - **其它**（网络抖动、CAS 临时限流）：60 秒冷却后可以再试，这类等等就好。
+
+    以前这里对所有失败一律 60 秒 —— 于是密码不对时每分钟自动送一次错误密码，
+    2026-08-12 把账号送进了「您的账号被锁定，请联系管理员」。
+    """
     now = _time.time()
     with _relogin_failure_lock:
+        msg = _relogin_failure["message"]
+        if msg and is_credential_failure(msg):
+            return msg
         if now - _relogin_failure["at"] < _RELOGIN_COOLDOWN_S:
-            return _relogin_failure["message"]
+            return msg
     # 进程内没有记录时看看别的进程有没有刚失败过
     try:
         raw = _cooldown_path().read_text(encoding="utf-8")
         at_str, _, message = raw.partition("\n")
+        if message and is_credential_failure(message):
+            return message
         if now - float(at_str) < _RELOGIN_COOLDOWN_S:
             return message or "上一次自动登录失败"
     except (OSError, ValueError):
