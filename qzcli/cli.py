@@ -7073,6 +7073,108 @@ def cmd_create(args):
     return 0
 
 
+def cmd_worker(args):
+    """在分布式训练任务的 worker 容器里执行命令 / 做通信体检。
+
+    和 ``qzcli exec`` 分开：那个服务 notebook 开发机（Jupyter proxy），
+    这个服务训练任务的 worker（WebSocket PTY），是两类完全不同的对象。
+    """
+    from .worker_exec import (
+        WorkerExecError,
+        default_instance_name,
+        run_in_worker,
+        run_many_in_worker,
+    )
+
+    display = get_display()
+    action = getattr(args, "worker_action", None)
+    job_id = getattr(args, "job_id", "")
+    inst = getattr(args, "instance", None) or default_instance_name(
+        job_id, getattr(args, "index", 0)
+    )
+
+    if action == "exec":
+        command = " ".join(getattr(args, "cmd_args", None) or []).strip()
+        if not command:
+            display.print_error("请指定要执行的命令")
+            display.print("[dim]示例: qzcli worker exec <job_id> nvidia-smi[/dim]")
+            return 1
+        display.print(f"[dim]目标实例: {inst}[/dim]")
+        try:
+            code, out = run_in_worker(job_id, command, inst)
+        except WorkerExecError as exc:
+            display.print_error(str(exc))
+            return 1
+        if out:
+            display.print(out)
+        if code != 0:
+            display.print(f"[yellow]exit_code={code}[/yellow]")
+        return 0 if code == 0 else code
+
+    if action == "diag":
+        # 通信体检：这几项是 2026-08-12 排查 142 节点 MoE 训练时验证有效的判据。
+        checks = [
+            (
+                "主机/GPU",
+                "hostname; nvidia-smi --query-gpu=index,name,utilization.gpu,memory.used --format=csv,noheader",
+            ),
+            (
+                "RDMA 端口",
+                "cat /sys/class/infiniband/*/ports/1/state 2>/dev/null | sort | uniq -c",
+            ),
+            (
+                # 网卡名和 counters 路径**因机型/容器挂载而异**：不能写死 mlx5_0，
+                # 实测有的节点根本没暴露 .../ports/1/counters（拿不到不等于有故障，
+                # 所以下面用 NO_COUNTERS 明示"测不了"，而不是伪装成 0 误码）。
+                "RDMA 误码",
+                "d=$(ls -d /sys/class/infiniband/*/ports/*/counters 2>/dev/null | head -1); "
+                'if [ -n "$d" ]; then for c in link_downed symbol_error port_rcv_errors; do '
+                'echo -n "$c="; cat "$d/$c" 2>/dev/null || echo NA; done; '
+                "else echo NO_COUNTERS（该容器未暴露 RDMA 计数器，无法判定）; fi",
+            ),
+            (
+                "到 master 的 TCP",
+                'test -n "$MASTER_ADDR" && (getent hosts "$MASTER_ADDR"; '
+                'timeout 5 bash -c "</dev/tcp/$MASTER_ADDR/${MASTER_PORT:-23456}" '
+                "&& echo TCP_OK || echo TCP_FAIL) || echo NO_MASTER_ADDR",
+            ),
+            ("NCCL 配置", "env | grep -E '^NCCL_|^MASTER_|^GLOO_' | sort"),
+        ]
+        display.print(f"[bold]worker 通信体检[/bold]  实例: {inst}\n")
+        failed = 0
+        # 所有检查跑在**同一条连接**里：逐条新建会被平台拒（socket already closed）
+        try:
+            outcomes = run_many_in_worker(job_id, checks, inst)
+        except WorkerExecError as exc:
+            display.print_error(str(exc))
+            return 1
+        for title, code, out in outcomes:
+            # ⚠️ 光看 exit_code 会误判：像 `... || echo TCP_FAIL` 这种，
+            # echo 本身成功 → code=0，但语义上是失败。所以再看输出里的失败标记。
+            # （实测踩过：单机任务 master 端口没监听，TCP_FAIL 却显示 ✓。）
+            bad_markers = ("TCP_FAIL", "NO_MASTER_ADDR", "Connection refused")
+            unhealthy = code != 0 or any(m in (out or "") for m in bad_markers)
+            # RDMA 误码是这套体检的核心判据：非 0 就是物理链路有问题，必须报红。
+            # 但「拿不到计数器」不等于「有故障」，NO_COUNTERS 只提示测不了、不算失败。
+            for line in (out or "").splitlines():
+                m = re.match(
+                    r"\s*(link_downed|symbol_error|port_rcv_errors)=(\d+)", line
+                )
+                if m and int(m.group(2)) > 0:
+                    unhealthy = True
+            mark = "[red]✗[/red]" if unhealthy else "[green]✓[/green]"
+            if unhealthy:
+                failed += 1
+            display.print(f"{mark} [bold]{title}[/bold]")
+            for line in (out or "").splitlines():
+                display.print(f"    {line}")
+            display.print("")
+        return 1 if failed else 0
+
+    display.print_error("请指定动作: exec / diag")
+    return 1
+
+
 def cmd_hpc(args):
     """提交 HPC/CPU 任务"""
     import json as json_mod
@@ -8621,6 +8723,24 @@ def main():
     )
 
     # batch 命令 - 批量提交任务
+    worker_parser = subparsers.add_parser(
+        "worker", help="操作分布式训练任务的 worker 容器（exec / diag）"
+    )
+    worker_sub = worker_parser.add_subparsers(dest="worker_action")
+
+    _w_exec = worker_sub.add_parser("exec", help="在 worker 容器里执行命令")
+    _w_exec.add_argument("job_id", help="训练任务 ID（job-xxxx）")
+    # dest 不能叫 command —— 顶层 subparsers 已经用 args.command 存子命令名，
+    # 重名会让分发表拿到一个 list 而不是字符串（TypeError: unhashable type: list）。
+    _w_exec.add_argument("cmd_args", nargs="*", metavar="COMMAND", help="要执行的命令")
+    _w_exec.add_argument("--instance", help="实例名；缺省用 <job_id>-worker-<index>")
+    _w_exec.add_argument("--index", type=int, default=0, help="worker 序号（默认 0）")
+
+    _w_diag = worker_sub.add_parser("diag", help="worker 通信体检（GPU/RDMA/TCP/NCCL）")
+    _w_diag.add_argument("job_id", help="训练任务 ID（job-xxxx）")
+    _w_diag.add_argument("--instance", help="实例名；缺省用 <job_id>-worker-<index>")
+    _w_diag.add_argument("--index", type=int, default=0, help="worker 序号（默认 0）")
+
     hpc_parser = subparsers.add_parser("hpc", help="提交 HPC/CPU 任务到启智平台")
     hpc_parser.add_argument("--name", required=True, help="任务名称")
     hpc_parser.add_argument("--workspace", required=True, help="工作空间名称或 ID")
@@ -8747,6 +8867,7 @@ def main():
         "dashboard": cmd_dashboard,
         "create": cmd_create,
         "create-job": cmd_create,
+        "worker": cmd_worker,
         "hpc": cmd_hpc,
         "hpc-usage": cmd_hpc_usage,
         "batch": cmd_batch,

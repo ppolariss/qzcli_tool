@@ -1140,6 +1140,12 @@ def main() -> int:
                         "status"
                     )
 
+                # ⚠️ 提交后会先经过 UNKNOWN 这个**过渡态**（平台还没把状态写好）。
+                # 它既不在 STOPPABLE 也不在 TERMINAL —— 早先的循环两边都不匹配，
+                # 于是轮询到超时后 assert「等了 60 秒仍不可停止（status=UNKNOWN）」，
+                # 而任务其实很快就 SUCCEEDED 了（smoke 的 HPC 任务是秒级 echo）。
+                # 2026-08-12 的 submit 闸门就是这么红的，**并非真的停不掉、也无残留**。
+                # 所以 UNKNOWN 一律当「还没就绪，继续轮询」，只按最终落到哪个集合判定。
                 st = None
                 for _ in range(20):  # 最多等 60 秒
                     st = _status()
@@ -1149,7 +1155,12 @@ def main() -> int:
                 if st in TERMINAL:
                     return f"任务已自行结束（status={st}），无需停止"
 
-                assert_true(st in STOPPABLE, f"等了 60 秒仍不可停止（status={st}）")
+                assert_true(
+                    st in STOPPABLE,
+                    f"等了 60 秒仍未进入可停止/终态（status={st}）。"
+                    f"UNKNOWN 是提交后的过渡态，若一直卡在这里说明平台侧异常，"
+                    f"手工确认: {jid}",
+                )
                 a._request_v2("hpc", "StopJob", {"job_id": jid})
 
                 for _ in range(20):  # 最多等 60 秒确认终态
