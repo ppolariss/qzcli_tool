@@ -90,3 +90,56 @@ class NoAutoRetryAfterCredentialFailureTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ManualLoginMustNotBeBlockedTests(unittest.TestCase):
+    """**手动 ``qzcli login`` 绝不能被凭据失败封锁挡住** —— 否则用户永久出不来。
+
+    这是个很脆的不变量：``a0cb5c2`` 之后，凭据类失败会**永久**挡住自动重登，
+    直到一次成功登录把记录清掉。而清记录的唯一途径就是手动登录。
+
+    所以「自动重登走 _relogin（受封锁约束）」和「手动登录直连 login_with_cas
+    （不受约束）」这个不对称是**故意的**。
+
+    危险在于：历史上有过一条 commit（``49fe82b``）批评
+    ``_refresh_cookie_for_interactive`` 绕过 ``_relogin`` 是 bug。将来很可能有人
+    本着"统一入口"的好意把 ``cmd_login`` 也接进 ``_relogin`` —— 那一刻，账号被锁
+    的用户就再也无法通过 qzcli 恢复了，只能手工删 ``~/.qzcli/.relogin.cooldown``。
+    """
+
+    def test_cmd_login_does_not_consult_the_block(self):
+        import pathlib
+        import re
+
+        src = (
+            pathlib.Path(__file__).resolve().parent.parent / "qzcli" / "cli.py"
+        ).read_text(encoding="utf-8")
+        start = src.index("def cmd_login(")
+        nxt = src.find("\ndef ", start + 1)
+        body = src[start : nxt if nxt > 0 else len(src)]
+
+        self.assertNotIn(
+            "_recent_relogin_failure",
+            body,
+            "cmd_login 查了封锁记录 —— 账号被锁的用户将无法通过 qzcli 恢复",
+        )
+        self.assertIsNotNone(
+            re.search(r"login_with_cas\(", body),
+            "cmd_login 不再直连 login_with_cas；若改走 _relogin，"
+            "凭据封锁会把用户永久挡在外面（封锁只能由一次成功登录解除）",
+        )
+
+    def test_cmd_login_clears_the_block_on_success(self):
+        import pathlib
+
+        src = (
+            pathlib.Path(__file__).resolve().parent.parent / "qzcli" / "cli.py"
+        ).read_text(encoding="utf-8")
+        start = src.index("def cmd_login(")
+        nxt = src.find("\ndef ", start + 1)
+        body = src[start : nxt if nxt > 0 else len(src)]
+        self.assertIn(
+            "_clear_relogin_failure",
+            body,
+            "登录成功却不清封锁记录 —— 自动重登会一直被上一次失败挡着",
+        )
