@@ -4,6 +4,7 @@ qzcli - 启智平台任务管理 CLI
 """
 
 import argparse
+import contextlib
 import re
 import shlex
 import sys

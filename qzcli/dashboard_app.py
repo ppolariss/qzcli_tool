@@ -162,7 +162,6 @@ def _frag_one(ws_id):
     return res
 
 
-@st.cache_data(ttl=300, show_spinner="拉取全集群节点占用中…")
 def load_all_frag(ws_items):
     """跨所有 workspace 并行拉取 + 合并。ws_items = ((ws_id, ws_name), ...)(元组以便缓存)。
     返回 (all_lcg, all_nodes, all_rows),每条带 workspace 标签。"""
