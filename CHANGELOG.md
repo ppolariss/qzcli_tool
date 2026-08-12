@@ -2,6 +2,62 @@
 
 ## Unreleased
 
+## v0.4.9 - 2026-08-12
+
+**主题：把登录/鉴权从「四年五层补丁」收口成一条可测量的架构约定。**
+
+### 登录只在主线程发生一次，worker 只干活
+
+根因：每个 API 方法挂 `@with_auth_retry`，撞 401 就自愈。单线程没问题；从 N 个
+并发 worker 调用时，cookie 失效那一刻 N 个 worker 同时撞 401、同时打 CAS，
+CAS 按失败次数延长锁定 —— 2026-08-12 账号就是这么被锁死的。
+
+历史上为此加过四层保护（进程内锁、跨进程文件锁、按失败 cookie 去重、失败冷却），
+全在治「抢着登录时怎么办」，没有一层治「为什么让 worker 去登录」。
+
+本版收口：
+
+- 新增判据 `_relogin_allowed()`：自动重登只在「主线程 or `ensure_authenticated`
+  窗口内」发生。worker 线程两者皆非，撞 401 直接抛 `QzAuthExpiredError`，不打 CAS。
+- 7 个并发扇出点全部前置鉴权（`ensure_authenticated`），worker 拿已刷新的 cookie 干活。
+- 保留主线程自愈 —— 单线程命令 cookie 过期仍自动续、用户无感（不做纯 inspire，
+  向后兼容）。
+
+实测：8 线程并发 → 总登录 1 次、**worker 0 次**、发起者 MainThread；
+账号锁定态 2h×24 轮命令 → CAS 打 1 次（旧版 24 次）。
+
+### 凭据类登录失败永不自动重试
+
+密码错/账号被锁时，旧版 60s 冷却后又试 —— 每次都是一次失败尝试，把锁定期越拖越长。
+本版 `is_credential_failure` 命中即永久封锁自动重登，直到手动 `qzcli login` 成功清除。
+`cmd_login` 直连不受封锁约束（账号被锁后唯一恢复途径），有结构测试钉死。
+
+### NO_PROXY 对 qzcli 生效
+
+qzcli 自建 urllib3 pool manager + 登录会话 `trust_env=False`，把 requests 的
+`no_proxy` 整个绕开了 —— 环境里只要有代理变量，`no_proxy` 就是摆设（2026-08-10
+2224 看板故障）。`get_proxy(url)` 现在按 `NO_PROXY` 判断该不该绕过。
+
+### create 镜像解析：显式 > 平台 > 历史 > 明确报错
+
+默认镜像 `dhyu-wan-torch29:0.4` 已从平台删除、默认 `image_type=SOURCE_PRIVATE`
+又和公共 registry 冲突 —— 任何不指定镜像的用户必然 `InternalError: Unauthorized`。
+改为：显式传的照用；没传 image_type 查平台可见性；再退回历史真实任务的镜像；
+都拿不到就明确报错说清要传什么。
+
+### 结构性防回归
+
+- `tests/test_auth_before_fanout.py`：AST 扫描每个扇出点必须前置鉴权 + 行为测试
+  验 worker 撞 401 抛 QzAuthExpiredError（变异验证过）。
+- `tests/test_credential_failure_no_retry.py`：凭据不重试 + cmd_login 不被封锁。
+- `tests/test_no_proxy_env.py` / `tests/test_image_resolution.py`。
+
+### 测试
+
+443 → 476。真机验证：ws/avail/usage 零重登留痕；create --dry-run 不指定镜像
+自动填历史镜像 + SOURCE_PUBLIC。
+
+
 ## v0.4.8 - 2026-08-09
 
 ### 勘误：v0.4.7 里两个关于「平台缺口」的结论是错的
