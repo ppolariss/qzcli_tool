@@ -19,6 +19,13 @@ except ImportError:
     PROMPT_TOOLKIT_TEST_AVAILABLE = False
 
 TEST_IMAGE = "registry.example.com/test/train-image:latest"
+#: 交互式用例现在必须**显式**给镜像类型。
+#:
+#: 以前这里喂空串，靠 DEFAULT_CREATE_IMAGE_TYPE 兜底 —— 而那个默认值是
+#: SOURCE_PRIVATE，配上平台公共 registry 的镜像会让后端按私有仓鉴权，
+#: 报 InternalError: Unauthorized（2026-08-12 二分实测）。新契约是：
+#: 给了镜像却判不出类型就明确报错，不再拿一个必然失败的默认值去撞。
+TEST_IMAGE_TYPE = "SOURCE_PUBLIC"
 
 
 def build_fixture_value(label: str) -> str:
@@ -783,7 +790,7 @@ class CreateInteractiveTests(unittest.TestCase):
                 "interactive-job",
                 "bash run.sh",
                 TEST_IMAGE,
-                "",
+                TEST_IMAGE_TYPE,
                 "4",
                 "",
                 "8",
@@ -824,7 +831,9 @@ class CreateInteractiveTests(unittest.TestCase):
         self.assertEqual("lcg-1", args.compute_group)
         self.assertEqual(FakeInteractiveAPI.SPEC_ID, args.spec)
         self.assertEqual(TEST_IMAGE, args.image)
-        self.assertEqual(cli.DEFAULT_CREATE_IMAGE_TYPE, args.image_type)
+        self.assertEqual(
+            TEST_IMAGE_TYPE, args.image_type
+        )  # 显式值原样流过，不被推断覆盖
         self.assertEqual(4, args.instances)
         self.assertEqual(cli.DEFAULT_CREATE_SHM, args.shm)
         self.assertEqual(8, args.priority)
@@ -1099,7 +1108,7 @@ class CreateInteractiveTests(unittest.TestCase):
                 "arrow-job",
                 "sleep inf",
                 TEST_IMAGE,
-                "",
+                TEST_IMAGE_TYPE,
                 "",
                 "",
                 "",
@@ -1289,7 +1298,7 @@ class CreateInteractiveTests(unittest.TestCase):
                 "multi-group-job",
                 "sleep inf",
                 TEST_IMAGE,
-                "",
+                TEST_IMAGE_TYPE,
                 "",
                 "",
                 "",
@@ -1581,7 +1590,7 @@ class CreateInteractiveTests(unittest.TestCase):
                 "broken-spec-job",
                 "sleep inf",
                 TEST_IMAGE,
-                "",
+                TEST_IMAGE_TYPE,
                 "",
                 "",
                 "",
@@ -1812,7 +1821,7 @@ class CreateInteractiveTests(unittest.TestCase):
                 "snapshot-job",
                 "sleep inf",
                 TEST_IMAGE,
-                "",
+                TEST_IMAGE_TYPE,
                 "",
                 "",
                 "",
@@ -1882,7 +1891,7 @@ class CreateInteractiveTests(unittest.TestCase):
                 "prefetch-job",
                 "echo hi",
                 TEST_IMAGE,
-                "",
+                TEST_IMAGE_TYPE,
                 "",
                 "",
                 "",
@@ -2028,7 +2037,8 @@ class CreateInteractiveTests(unittest.TestCase):
         )
         self.assertTrue(
             any(
-                f"分布式 -> {AmbiguousDistributedWorkspaceAPI.DISTRIBUTED_WORKSPACE_ID}" in msg
+                f"分布式 -> {AmbiguousDistributedWorkspaceAPI.DISTRIBUTED_WORKSPACE_ID}"
+                in msg
                 for msg in display.messages
             )
         )
@@ -2090,8 +2100,7 @@ class CreateInteractiveTests(unittest.TestCase):
         self.assertEqual(1, len(display.progress.tasks))
         self.assertEqual(3, display.progress.tasks[0]["total"])
         descriptions = [
-            kwargs.get("description", "")
-            for _, kwargs in display.progress.updates
+            kwargs.get("description", "") for _, kwargs in display.progress.updates
         ]
         self.assertTrue(any("获取低优任务" in item for item in descriptions))
         self.assertTrue(any("获取节点数据" in item for item in descriptions))
@@ -2227,10 +2236,11 @@ class CreateInteractiveTests(unittest.TestCase):
         self.assertEqual(4, display.progress.tasks[0]["total"])
         self.assertEqual([0, 0, 0, 0], display.progress.advances)
         descriptions = [
-            kwargs.get("description", "")
-            for _, kwargs in display.progress.updates
+            kwargs.get("description", "") for _, kwargs in display.progress.updates
         ]
-        self.assertTrue(any("刷新 分布式训练空间 实时占用" in item for item in descriptions))
+        self.assertTrue(
+            any("刷新 分布式训练空间 实时占用" in item for item in descriptions)
+        )
 
     def test_cmd_avail_lists_ambiguous_live_workspace_matches_without_cache_tiebreak(
         self,
@@ -2274,9 +2284,7 @@ class CreateInteractiveTests(unittest.TestCase):
         self.assertEqual(1, ret)
         self.assertIn("匹配到多个工作空间", text)
         self.assertIn("分布式训练空间", text)
-        self.assertIn(
-            AmbiguousDistributedWorkspaceAPI.DISTRIBUTED_WORKSPACE_ID, text
-        )
+        self.assertIn(AmbiguousDistributedWorkspaceAPI.DISTRIBUTED_WORKSPACE_ID, text)
 
     def test_cmd_avail_does_not_prefetch_create_snapshot_or_specs(self):
         cache = ResourceCache()

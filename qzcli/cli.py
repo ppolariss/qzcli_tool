@@ -101,6 +101,139 @@ DEFAULT_CREATE_IMAGE = "docker.sii.shaipower.online/inspire-studio/dhyu-wan-torc
 DEFAULT_CREATE_IMAGE_TYPE = "SOURCE_PRIVATE"
 DEFAULT_CREATE_INSTANCES = 1
 DEFAULT_CREATE_SHM = 1200
+
+
+#: ``qzcli create`` 不指定镜像时的兜底。**它会过期**，所以只作为最后一档，
+#: 且用它之前会先试平台和历史 —— 见 :func:`resolve_create_image`。
+#:
+#: 2026-08-12 的教训：这两个常量曾被无条件使用，而其时
+#: ``dhyu-wan-torch29:0.4`` 已从平台删除、``SOURCE_PRIVATE`` 又和公共 registry
+#: 冲突（二分实测：同 payload 换成 ``SOURCE_PUBLIC`` 就成功）。于是**任何不指定
+#: 镜像的用户必然失败**，还只能拿到一句指不到镜像上的 ``InternalError:
+#: Unauthorized``。交互式创建时两者都是默认值，一路回车就中招。
+class _ImageResolutionError(Exception):
+    """定不出镜像时抛这个，由调用方转成友好报错。"""
+
+
+def _image_type_from_platform(api, cookie, image):
+    """问平台这个镜像到底是公开还是私有。拿不准就返回 ``None``（**不猜**）。
+
+    ⚠️ 这条路径**尚未在真机验证过**（写它时账号处于锁定状态）。``image`` 服务的
+    请求体形状比较刁（实测只发 ``page``/``page_size`` 会返回空列表，需要带
+    ``filter``），所以这里失败就安静地落到下一档，绝不因为它把 create 打挂。
+    """
+    try:
+        result = api._request_v2(
+            "image",
+            "ListImages",
+            {
+                "page": 1,
+                "page_size": 200,
+                "filter": {"name": image.split("/")[-1].split(":")[0]},
+            },
+            cookie=cookie,
+            referer_path="/jobs/images",
+        )
+    except Exception as exc:  # noqa: BLE001 —— 这只是加分项，不能拖垮主流程
+        swallowed("create/查镜像可见性", exc)
+        return None
+    for item in (result or {}).get("images") or (result or {}).get("items") or []:
+        url = item.get("image_url") or item.get("url") or ""
+        if url and url != image:
+            continue
+        vis = (item.get("visibility") or item.get("source") or "").upper()
+        if "PUBLIC" in vis:
+            return "SOURCE_PUBLIC"
+        if "PRIVATE" in vis:
+            return "SOURCE_PRIVATE"
+    return None
+
+
+def _image_from_history(api, cookie, workspace_id, want_image=None):
+    """从**用户自己近期真实跑过**的任务里取 ``(image, image_type)``。
+
+    比写死的常量新鲜：每个人都有历史，而常量会随平台删镜像而烂掉。
+    ``want_image`` 给定时只找用了那个镜像的任务（用来补它的 image_type）。
+    跳过创建就失败的任务和本工具自己提交的任务 —— 它们的镜像多半正是坏的那个。
+    """
+    try:
+        jobs = api.list_jobs_with_cookie(workspace_id, cookie, page_size=100)
+        rows = (jobs.get("jobs") if isinstance(jobs, dict) else jobs) or []
+    except Exception as exc:  # noqa: BLE001
+        swallowed("create/反推历史镜像", exc)
+        return None, None
+    for job in rows:
+        if job.get("status") in ("job_create_failed", "job_queuing"):
+            continue
+        if "qzcli-" in (job.get("name") or ""):
+            continue
+        try:
+            detail = api._get_job_detail_v2(job["job_id"], cookie) or {}
+        except Exception as exc:  # noqa: BLE001
+            swallowed("create/反推历史镜像", exc)
+            continue
+        for fc in detail.get("framework_config") or []:
+            img, itype = fc.get("image"), fc.get("image_type")
+            if not img or not itype:
+                continue
+            if want_image and img != want_image:
+                continue
+            return img, itype
+    return None, None
+
+
+def resolve_create_image(api, cookie, workspace_id, image, image_type, display=None):
+    """定出提交用的 ``(image, image_type)``。
+
+    优先级（**用户控制权永远第一**）：
+
+    1. 显式传了就用，**任何推断都不许覆盖**
+    2. 没传 ``image_type`` 时向平台查该镜像的真实可见性（best-effort）
+    3. 再退回用户自己近期成功任务用过的镜像
+    4. 都拿不到就**明确报错说清要传什么** —— 而不是拿一个必然失败的默认值去撞，
+       再甩一个 ``InternalError: Unauthorized`` 给用户
+
+    Raises:
+        _ImageResolutionError: 第 4 档。
+    """
+    if image and image_type:
+        return image, image_type  # 1. 用户说了算
+
+    if image:
+        # 2. 有镜像没类型：先问平台
+        guessed = _image_type_from_platform(api, cookie, image)
+        if guessed:
+            if display:
+                display.print(f"[dim]镜像类型取自平台：{guessed}[/dim]")
+            return image, guessed
+        # 3. 再看自己历史上用同一个镜像时填的什么
+        _, hist_type = _image_from_history(api, cookie, workspace_id, want_image=image)
+        if hist_type:
+            if display:
+                display.print(f"[dim]镜像类型取自你近期同镜像的任务：{hist_type}[/dim]")
+            return image, hist_type
+        raise _ImageResolutionError(
+            f"无法确定镜像 {image} 的类型（公开/私有）。\n"
+            "  请显式指定：--image-type SOURCE_PUBLIC 或 --image-type SOURCE_PRIVATE\n"
+            "  （公共 registry 的镜像填 SOURCE_PRIVATE 会让平台按私有仓鉴权，"
+            "报 InternalError: Unauthorized）"
+        )
+
+    # 3. 两个都没传：整体取自历史
+    hist_image, hist_type = _image_from_history(api, cookie, workspace_id)
+    if hist_image and hist_type:
+        if display:
+            display.print(f"[dim]未指定镜像，沿用你近期任务的：{hist_image}[/dim]")
+        return hist_image, image_type or hist_type
+
+    # 4. 明确报错，不拿必然失败的默认值去撞
+    raise _ImageResolutionError(
+        "未指定镜像，且在你近期的任务里也没找到可参考的镜像。\n"
+        "  请显式指定：--image <镜像地址> --image-type SOURCE_PUBLIC|SOURCE_PRIVATE\n"
+        "  可用镜像见平台「镜像」页面。"
+    )
+
+
 #: ``qzcli create`` 不带 ``--priority`` 时用的优先级。
 #:
 #: **数字越小优先级越低。** 实测提交值 → 平台档位：1→LOW、3→LOW、4→NORMAL、
@@ -6411,19 +6544,28 @@ def _run_create_interactive(args, display, api) -> int:
         if args.cmd_str is None:
             return 1
 
+    # ⚠️ 这里**不再预填**写死的默认镜像。
+    #
+    # 以前预填 DEFAULT_CREATE_IMAGE + SOURCE_PRIVATE，用户一路回车就把它们变成了
+    # 「显式指定」——而那个镜像 2026-08 已从平台删除、类型又和公共 registry 冲突，
+    # 结果是必然失败并甩一句指不到镜像上的 InternalError: Unauthorized。
+    #
+    # 现在留空表示「让 qzcli 去平台/你的历史任务里找」，由 resolve_create_image
+    # 处理；找不到会明确告诉你要传什么。
     if args.image is None:
-        args.image = _prompt_text_input(
-            display, "Docker 镜像", DEFAULT_CREATE_IMAGE, required=True
+        entered = _prompt_text_input(
+            display, "Docker 镜像（留空=按你近期任务自动选）", "", required=False
         )
-        if args.image is None:
-            return 1
+        args.image = entered or None
 
     if args.image_type is None:
-        args.image_type = _prompt_text_input(
-            display, "镜像类型", DEFAULT_CREATE_IMAGE_TYPE, required=True
+        entered = _prompt_text_input(
+            display,
+            "镜像类型 SOURCE_PUBLIC/SOURCE_PRIVATE（留空=自动判定）",
+            "",
+            required=False,
         )
-        if args.image_type is None:
-            return 1
+        args.image_type = entered or None
 
     if args.instances is None:
         args.instances = _prompt_int_input(
@@ -6532,10 +6674,6 @@ def cmd_create(args):
         display.print_error("请指定执行命令: --command <cmd>")
         return 1
 
-    if args.image is None:
-        args.image = DEFAULT_CREATE_IMAGE
-    if args.image_type is None:
-        args.image_type = DEFAULT_CREATE_IMAGE_TYPE
     if args.instances is None:
         args.instances = DEFAULT_CREATE_INSTANCES
     if args.shm is None:
@@ -6742,6 +6880,28 @@ def cmd_create(args):
         else:
             display.print_error(str(e))
             return 1
+    # 镜像：显式传的一律照用；没传才去平台/历史里找，都找不到就明确报错。
+    #
+    # 这里以前是无条件套两个写死的常量（在 args 解析处），而其时默认镜像已从
+    # 平台删除、默认 image_type 又和公共 registry 冲突 —— **任何不指定镜像的
+    # 用户必然失败**，拿到的还是一句指不到镜像上的 InternalError: Unauthorized。
+    # 交互式创建时两者都是默认值，一路回车就中招。
+    #
+    # 放在这里而不是 args 解析处：解析处还没有 workspace_id / cookie，
+    # 查平台和查历史都做不了。
+    try:
+        args.image, args.image_type = resolve_create_image(
+            api,
+            (get_cookie() or {}).get("cookie", ""),
+            workspace_id,
+            args.image,
+            args.image_type,
+            display=display,
+        )
+    except _ImageResolutionError as exc:
+        display.print_error(str(exc))
+        return 1
+
     spec_price = build_resource_spec_price(spec_obj, compute_group_id)
 
     # --- Build payload ---

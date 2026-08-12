@@ -209,7 +209,18 @@ def main() -> int:
     ap.add_argument("--spec", help="提交用的 spec_id；不传则自动挑 GPU 数最小的")
     ap.add_argument(
         "--image",
-        default="docker.sii.shaipower.online/inspire-studio/dhyu-wan-torch29:0.4",
+        default="",
+        help=(
+            "提交用镜像。**留空=从该计算组的历史真实任务反推**（连 image_type 一起）。"
+            "以前这里写死 dhyu-wan-torch29:0.4，2026-08 它已从平台删除 —— "
+            "写死的外部资源注定会过期，换一个写死值只是把下次爆炸推迟"
+        ),
+    )
+    ap.add_argument(
+        "--image-type",
+        dest="image_type",
+        default="",
+        help="SOURCE_PUBLIC / SOURCE_PRIVATE；留空则跟随 --image 的来源",
     )
     ap.add_argument(
         "--queue-compute-group",
@@ -842,7 +853,13 @@ def main() -> int:
             # 私有仓做鉴权，401 被包装成 InternalError。而且默认镜像本身也烂了
             # （dhyu-wan-torch29:0.4 已经查不到）—— **写死的外部资源注定会过期**，
             # 换成另一个写死值只是把下次爆炸推迟。
-            image, image_type = _image_from_history(a, ws, lcg, cookie, args.image)
+            # **显式传的 --image 一律照用**，历史只在没传时兜底。
+            # 我第一版把这个顺序写反了：不管用户传没传，都拿历史值覆盖 ——
+            # 那是把用户对自己命令的控制权拿掉了，是倒退。
+            if args.image:
+                image, image_type = args.image, args.image_type or "SOURCE_PUBLIC"
+            else:
+                image, image_type = _image_from_history(a, ws, lcg, cookie, args.image)
             payload = {
                 "name": f"qzcli-v2-smoke-{int(time.time())}",
                 "logic_compute_group_id": lcg,

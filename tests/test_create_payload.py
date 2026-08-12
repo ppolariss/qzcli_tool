@@ -39,6 +39,12 @@ class _FakeAPI:
         return []
 
 
+#: 用例里显式指定的镜像。以前这里是 ``None`` → 落到 ``DEFAULT_CREATE_IMAGE``，
+#: 而那个默认镜像 2026-08 已从平台删除、默认 image_type 又和公共 registry 冲突。
+_EXPLICIT_IMAGE = "docker.example.invalid/qzcli-test:1"
+_EXPLICIT_IMAGE_TYPE = "SOURCE_PUBLIC"
+
+
 def _build_args(**overrides):
     args = argparse.Namespace(
         interactive=False,
@@ -48,8 +54,11 @@ def _build_args(**overrides):
         project="project-test",
         compute_group="lcg-test",
         spec="spec-test",
-        image=None,
-        image_type=None,
+        # 显式给镜像：这些用例验的是 payload 形状和路由，不该被镜像解析牵连。
+        # 更重要的是，**显式传的镜像必须原样进 payload、不被任何推断覆盖** ——
+        # 那是 resolve_create_image 的第一优先级，下面的断言正是在钉它。
+        image=_EXPLICIT_IMAGE,
+        image_type=_EXPLICIT_IMAGE_TYPE,
         instances=None,
         shm=None,
         priority=None,
@@ -168,10 +177,9 @@ class CreatePayloadTests(unittest.TestCase):
         )
 
         # framework_config sibling keys still carry image/instance/shm.
-        self.assertEqual(
-            cli.DEFAULT_CREATE_IMAGE,
-            fc["image"],
-        )
+        # 断言的是「**用户显式传的**镜像原样进 payload」，不是「默认值进 payload」——
+        # 后者是旧契约，而那个默认镜像已经失效。
+        self.assertEqual(_EXPLICIT_IMAGE, fc["image"])
         self.assertEqual(1, fc["instance_count"])
         self.assertEqual(cli.DEFAULT_CREATE_SHM, fc["shm_gi"])
 
