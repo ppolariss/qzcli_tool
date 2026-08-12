@@ -1189,6 +1189,10 @@ def cmd_workspaces(args):
 
             from concurrent.futures import ThreadPoolExecutor, as_completed
 
+            # 扇出前串行确认鉴权状态（不发请求，见 api.ensure_authenticated）。
+            # 少了这步，cookie 失效那一刻每个 worker 都会各自撞 401 去登录。
+            _ensure_auth_before_fanout(api, "")
+
             try:
                 with ThreadPoolExecutor(max_workers=parallel_workers) as executor:
                     futures = [executor.submit(_fetch_one, ws) for ws in workspaces]
@@ -1684,6 +1688,9 @@ def cmd_avail(args):
                         return current_lcg_id, nodes
 
                     max_lcg_workers = min(6, len(compute_groups))
+                    # 扇出前串行确认鉴权（不发请求）。avail 是最容易触发这个问题的
+                    # 命令：按计算组并发，cookie 一失效就是 6 个线程同时登录。
+                    _ensure_auth_before_fanout(api, "")
                     with ThreadPoolExecutor(max_workers=max_lcg_workers) as executor:
                         for current_lcg_id, nodes in executor.map(
                             _fetch_lcg_nodes, compute_groups.keys()
@@ -2233,12 +2240,40 @@ _JOB_DETAIL_PATH_BY_TYPE = {
 }
 
 
+def _ensure_auth_before_fanout(api, cookie):
+    """**并发扇出之前**串行把鉴权走完，返回此后该用的 cookie。
+
+    为什么必须有这一步：本仓每个 API 方法都挂 ``@with_auth_retry``，撞 401 就
+    自己重登。单线程没问题；从 N 个 worker 里调用时，cookie 失效那一刻
+    **N 个 worker 会同时撞 401、同时去登录**。CAS 按失败次数延长锁定 ——
+    2026-08-12 就是这么把账号锁死的。
+
+    历史上为此加过四层保护（进程内锁、跨进程文件锁、按失败 cookie 去重、
+    失败冷却），**全在治「抢着登录时怎么办」，没有一层在治「为什么让 worker
+    去登录」**。这个函数治的是后者。
+
+    对照 inspire 插件：它压根没有自动重登，401 直接让用户去登录，并且把
+    「拉 permissions / user detail 建立鉴权上下文」列为业务动作之前的固定步骤。
+
+    **必须使用返回值** —— 重登后盘上 cookie 已经换了，继续用传进来的旧字符串
+    就退回「每个 worker 各自撞 401」的老路。
+
+    测试里的假 API 没有 ``ensure_authenticated``，原样返回即可：那种场景是
+    单线程 mock，不存在踩踏。
+    """
+    fn = getattr(api, "ensure_authenticated", None)
+    if fn is None:
+        return cookie
+    return fn(cookie) or cookie
+
+
 def fetch_all_task_dimensions(api, workspace_id, cookie, page_size=200, max_workers=4):
     """分页获取工作空间**当前在跑**任务的资源维度数据（list_task_dimension）。
 
     第一页即返回 ``total``，据此算出总页数后并发拉取其余页（顺序无关，聚合/可视
     化都不依赖任务顺序），避免逐页串行的高延迟。
     """
+    cookie = _ensure_auth_before_fanout(api, cookie)  # 扇出前，串行
     first = api.list_task_dimension(
         workspace_id, _live_cookie_for_paging(cookie), page_num=1, page_size=page_size
     )
@@ -2280,6 +2315,7 @@ def build_node_to_lcg_map(api, workspace_id, cookie):
     但 ``list_node_dimension`` 支持按 ``logic_compute_group_id`` 过滤，因此逐个
     lcg 拉取其成员节点即可反建「节点 → 计算组」映射（``cmd_avail`` 同法）。
     """
+    cookie = _ensure_auth_before_fanout(api, cookie)  # 扇出前，串行
     node_map = {}
     cluster_info = api.get_cluster_basic_info(workspace_id, cookie)
     lcgs = [

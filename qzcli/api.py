@@ -592,6 +592,55 @@ class QzAPI:
     def _post(self, url: str, **kwargs) -> _CurlResponse:
         return _curl_post(url, **kwargs)
 
+    def ensure_authenticated(self, cookie: str = "") -> str:
+        """**并发扇出之前**确认鉴权状态，返回此后该用的 cookie。**不额外发请求。**
+
+        ## 治的是什么
+
+        本仓每个 API 方法都挂 ``@with_auth_retry``：撞 401 就自动重登。单线程没
+        问题；从 N 个并发 worker 调用时，cookie 失效那一刻 **N 个 worker 同时撞
+        401、同时去登录**。CAS 按失败次数延长锁定 —— 2026-08-12 账号就是这么锁死的。
+
+        为此陆续加过四层保护（进程内锁、跨进程文件锁、按失败 cookie 去重、失败
+        冷却），**全在治「抢着登录时怎么办」，没有一层在治「为什么让 worker 去
+        登录」**。这个方法治后者。
+
+        ## 为什么不发探针请求
+
+        第一版实现是「发一次最轻的已鉴权调用当探针」。实测有两个问题：
+        每条命令平白多一次往返；而且它会打断那些本来就 mock 好下层的测试。
+
+        更重要的是**没必要**：这些扇出函数在扇出前本来就有一次串行调用
+        （``list_task_dimension`` / ``get_cluster_basic_info`` …），那次调用已经
+        会在当前线程里串行触发 401→重登。**真正缺的只是把刷新后的 cookie 交给
+        worker** —— 调用方攥着的还是进函数时那个旧字符串，于是 N 个 worker 各自
+        再撞一次 401。
+
+        所以这里做两件事，都不花请求：
+
+        1. 从盘上取**最新**的 cookie（可能已被前面那次串行调用刷新过）
+        2. 若当前处于「凭据类失败」封锁中，**立刻抛错**，不让命令扇出去撞 N 次
+
+        Args:
+            cookie: 调用方手上的 cookie；留空则读盘。
+
+        Returns:
+            此后该用的 cookie。**必须使用返回值** —— 继续用传进来的旧字符串就
+            退回「每个 worker 各自撞 401」的老路。
+
+        Raises:
+            QzAPIError: 处于凭据类失败封锁中（密码错/账号被锁）。这种情况下扇出
+                只会把锁定期拖得更长，宁可当场失败并说清原因。
+        """
+        blocked = _recent_relogin_failure()
+        if blocked is not None and is_credential_failure(blocked):
+            raise QzAPIError(
+                f"{blocked}\n"
+                "已阻止本次并发请求：账号处于锁定/凭据失效状态时继续重试，"
+                "只会让 CAS 把锁定期拖得更长。请先解决登录问题再重试。"
+            )
+        return (get_cookie() or {}).get("cookie", "") or cookie
+
     def _relogin(
         self,
         propagate_errors: bool = False,
@@ -1136,6 +1185,10 @@ class QzAPI:
     ) -> Dict[str, Dict[str, Any]]:
         """批量查询任务详情（并发）"""
         results = {}
+
+        # 扇出前串行确认鉴权状态（不发请求，见 ensure_authenticated 的说明）。
+        # 少了这步，cookie 失效时 max_workers 个线程会同时撞 401、同时去登录。
+        self.ensure_authenticated()
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_job = {
