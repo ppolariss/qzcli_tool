@@ -3,3 +3,4 @@ prompt_toolkit>=3.0
 PySocks>=1.7
 requests>=2.28
 rich>=13.0
+websocket-client>=1.0

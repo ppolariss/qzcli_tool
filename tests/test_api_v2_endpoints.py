@@ -139,6 +139,57 @@ class StopJobTests(unittest.TestCase):
         self.assertEqual(seen["params"], {"Action": "StopJob"})
         self.assertEqual(seen["body"], {"job_id": "job-7"})
 
+    def test_stop_hits_hpc_StopJob(self):
+        seen = {}
+
+        def fake_post(url, *, json=None, params=None, **_):
+            seen.update(url=url, params=params, body=json)
+            return _Resp(200, {"Result": {}})
+
+        with mock.patch.object(api, "_curl_post", side_effect=fake_post):
+            self.assertTrue(
+                _client().stop_job_with_cookie("hpc-job-7", "ck")
+            )
+        self.assertEqual(seen["url"], "https://qz.example/api/v2/hpc")
+        self.assertEqual(seen["params"], {"Action": "StopJob"})
+        self.assertEqual(seen["body"], {"job_id": "hpc-job-7"})
+
+    def test_hpc_route_404_falls_back_to_cookie_v1(self):
+        calls = []
+
+        def fake_post(url, **_):
+            calls.append(url)
+            if "/api/v2/hpc" in url:
+                return _Resp(404, None, content_type="text/plain")
+            return _Resp(200, {"code": 0, "data": {}})
+
+        with mock.patch.object(api, "_curl_post", side_effect=fake_post):
+            self.assertTrue(
+                _client().stop_job_with_cookie("hpc-job-7", "ck")
+            )
+        self.assertEqual(
+            calls,
+            [
+                "https://qz.example/api/v2/hpc",
+                "https://qz.example/api/v1/hpc_jobs/stop",
+            ],
+        )
+        self.assertFalse(any("/openapi/" in url for url in calls))
+
+    def test_public_stop_never_calls_openapi(self):
+        calls = []
+
+        def fake_post(url, **_):
+            calls.append(url)
+            return _Resp(200, {"Result": {}})
+
+        with mock.patch.object(api, "_curl_post", side_effect=fake_post), mock.patch.object(
+            api, "get_cookie", return_value={"cookie": "ck"}
+        ):
+            self.assertTrue(_client().stop_job("hpc-job-7"))
+        self.assertEqual(calls, ["https://qz.example/api/v2/hpc"])
+        self.assertFalse(any("/openapi/" in url for url in calls))
+
     def test_business_error_never_double_stops(self):
         """唯一迁到 v2 的写操作。业务错误（任务已结束/无权限）必须直接抛，
         绝不能回落 v1 导致停两次。"""
@@ -206,7 +257,7 @@ class HpcPriorityTests(unittest.TestCase):
 
 
 class ListSpecsTests(unittest.TestCase):
-    """/openapi/v1/specs/list 已 404 之后的后备链路：预定义规格表 → 历史任务反推。
+    """规格后备链路：v2 预定义规格表 → v2 历史任务反推。
 
     这里专测「历史任务反推」那一级，所以把前面的预定义规格表那级短路掉
     （返回空 schedule_config），否则会真去打网络。
@@ -251,6 +302,14 @@ class ListSpecsTests(unittest.TestCase):
         self.assertEqual(specs[0]["gpu_type"], "NVIDIA_H200_SXM_141G")
         self.assertEqual(specs[0]["logic_compute_group_ids"], ["lcg-1"])
 
+    def test_never_probes_removed_openapi_specs(self):
+        client = self._no_predef(_client())
+        with mock.patch.object(client, "_request") as legacy, mock.patch.object(
+            client, "list_jobs_with_cookie", return_value={"jobs": []}
+        ):
+            self.assertEqual(client.list_specs("lcg-1", "ws-1"), [])
+        legacy.assert_not_called()
+
     def test_filters_out_other_compute_groups(self):
         jobs = [
             {
@@ -273,16 +332,6 @@ class ListSpecsTests(unittest.TestCase):
         client = self._no_predef(_client())
         with mock.patch.object(client, "_request", side_effect=QzAPIError("404", 404)):
             self.assertEqual(client.list_specs("lcg-1"), [])
-
-    def test_legacy_endpoint_wins_when_alive(self):
-        """老接口还活着就用它 —— 它才是"规格清单"的权威来源，
-        历史任务反推只能看到跑过的那些。"""
-        client = self._no_predef(_client())
-        with mock.patch.object(
-            client, "_request", return_value={"data": {"specs": [{"id": "s-1"}]}}
-        ), mock.patch.object(client, "list_jobs_with_cookie") as hist:
-            self.assertEqual(client.list_specs("lcg-1", "ws-1"), [{"id": "s-1"}])
-        hist.assert_not_called()
 
 
 class V2FallbackToV1Tests(unittest.TestCase):

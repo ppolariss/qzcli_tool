@@ -75,6 +75,15 @@ class _CountingAPI(QzAPI):
         time.sleep(0.03)
         return f"inspire-session=fresh-{n}"
 
+    @api_mod.with_auth_retry
+    def get_user_detail(self, cookie=""):
+        """本地鉴权探针桩，避免测试把假 cookie 发到真实平台。"""
+        if cookie == _STALE_COOKIE:
+            with self._lock:
+                self.unauthorized_calls += 1
+            raise QzAPIError("Cookie 已过期或无效", 401)
+        return {"id": "user-test"}
+
 
 def _reset():
     api_mod._clear_relogin_failure()

@@ -968,29 +968,14 @@ class QzAPI:
         return result if raw else _unwrap_v2_result(result)
 
     def get_job_detail(self, job_id: str) -> Dict[str, Any]:
-        """查询任务详情（使用 cookie 认证，优先于 token）
+        """查询任务详情；v2 优先且仅按统一策略回落 cookie v1。
 
-        **限流不回落**：``QzRateLimitError`` 直接抛出去，不去打 v1 openapi。
-
-        以前这里是裸 ``except QzAPIError: pass``，而 ``QzRateLimitError`` 是
-        ``QzAPIError`` 的子类 —— 于是 429 被静默吞掉、转头再打一发 v1，
-        等于平台喊"慢点"的时候把请求量翻倍。``_v2_then_v1`` 里明令禁止过这件事，
-        但这是另一条独立路径，当时没一起改。
-
-        实测后果：``qzcli list -c --all-ws``（每个工作空间 5 线程扇出批量查详情）
-        在全量形态下稳定撞 429 —— 是 live_smoke 补上"默认形态"用例之后才暴露的。
+        这里不再捕获任意 ``QzAPIError`` 后改打 ``/openapi/v1``。路由级回落由
+        :func:`_v2_then_v1` 唯一负责；业务错误、401 和 429 都原样抛出。
         """
         cookie_data = get_cookie()
-        cookie = cookie_data.get("cookie") if cookie_data else None
-        if cookie:
-            try:
-                return self.get_job_detail_with_cookie(job_id, cookie)
-            except QzRateLimitError:
-                raise
-            except QzAPIError:
-                pass
-        result = self._request("/openapi/v1/train_job/detail", {"job_id": job_id})
-        return result.get("data", {})
+        cookie = cookie_data.get("cookie") if cookie_data else ""
+        return self.get_job_detail_with_cookie(job_id, cookie)
 
     def get_job_detail_with_cookie(self, job_id: str, cookie: str) -> Dict[str, Any]:
         """任务详情：优先 v2 ``train GetJob``，v2 路由不通时回落 v1。
@@ -1270,32 +1255,39 @@ class QzAPI:
         return results
 
     def stop_job(self, job_id: str) -> bool:
-        """停止任务（优先 cookie 认证，回退 token）"""
+        """停止训练或 HPC 任务，全程使用 cookie 认证的 v2/v1 路由。
+
+        旧实现会在 cookie 路径报任意错误后静默改打 ``/openapi/v1``。这既会
+        吞掉 v2 的业务错误，也可能在限流时把写请求重复发送。现在统一交给
+        :meth:`stop_job_with_cookie`：v2 优先，只在路由不通时回落 cookie v1。
+        """
         cookie_data = get_cookie()
-        cookie = cookie_data.get("cookie") if cookie_data else None
-        if cookie:
-            try:
-                return self.stop_job_with_cookie(job_id, cookie)
-            except QzAPIError:
-                pass
-        try:
-            self._request("/openapi/v1/train_job/stop", {"job_id": job_id})
-            return True
-        except QzAPIError:
-            return False
+        cookie = cookie_data.get("cookie") if cookie_data else ""
+        return self.stop_job_with_cookie(job_id, cookie)
 
     def stop_job_with_cookie(self, job_id: str, cookie: str) -> bool:
-        """停止任务：优先 v2 ``train StopJob``，v2 路由不通时回落 v1。
+        """停止任务：按 ID 路由到 v2 ``train/hpc StopJob``。
 
         唯一迁到 v2 的**写**操作。回落判据依旧只认"路由不通"
         （404/405/50x/非 JSON）—— 业务错误（任务已结束、无权限）会直接抛给用户，
         绝不会因为回落而变成"停了两次"。
         """
+        if self.is_hpc_job_id(job_id):
+            return _v2_then_v1(
+                "hpc_jobs/stop",
+                lambda: self._stop_hpc_job_v2(job_id, cookie),
+                lambda: self._stop_hpc_job_v1(job_id, cookie),
+            )
         return _v2_then_v1(
             "train_job/stop",
             lambda: self._stop_job_v2(job_id, cookie),
             lambda: self._stop_job_v1(job_id, cookie),
         )
+
+    @staticmethod
+    def is_hpc_job_id(job_id: str) -> bool:
+        """返回任务 ID 是否属于 HPC API。"""
+        return str(job_id).startswith("hpc-job-")
 
     def _stop_job_v2(self, job_id: str, cookie: Optional[str] = None) -> bool:
         """``POST /api/v2/train?Action=StopJob``。"""
@@ -1307,6 +1299,19 @@ class QzAPI:
             referer_path=f"/jobs/distributedTrainingDetail/{job_id}",
         )
         # 成功即无 Error 信封；_request_v2 已在失败时抛异常
+        return True
+
+    def _stop_hpc_job_v2(
+        self, job_id: str, cookie: Optional[str] = None
+    ) -> bool:
+        """``POST /api/v2/hpc?Action=StopJob``。"""
+        self._request_v2(
+            "hpc",
+            "StopJob",
+            {"job_id": job_id},
+            cookie=cookie,
+            referer_path="/jobs/hpc",
+        )
         return True
 
     @with_auth_retry
@@ -1355,10 +1360,55 @@ class QzAPI:
             )
         return True
 
+    @with_auth_retry
+    def _stop_hpc_job_v1(self, job_id: str, cookie: str) -> bool:
+        """路由级兜底：``POST /api/v1/hpc_jobs/stop``（cookie 认证）。"""
+        url = f"{self.base_url}/api/v1/hpc_jobs/stop"
+        response = _curl_post(
+            url,
+            json={"job_id": job_id},
+            headers={
+                "accept": "application/json, text/plain, */*",
+                "content-type": "application/json",
+                "cookie": cookie,
+                "origin": self.base_url,
+                "referer": f"{self.base_url}/jobs/hpc",
+                "user-agent": V2_BROWSER_UA,
+            },
+            timeout=60,
+        )
+        if response.status_code == 401:
+            raise QzAPIError("Cookie 已过期或无效，请重新获取", 401)
+        if response.status_code == 429:
+            raise QzRateLimitError(
+                "触发平台限流（HTTP 429）",
+                429,
+                retry_after=_parse_retry_after(response.headers.get("Retry-After")),
+            )
+        if response.status_code != 200:
+            raise QzAPIError(
+                f"请求失败: HTTP {response.status_code}", response.status_code
+            )
+        try:
+            result = response.json()
+        except Exception:
+            raise QzAPIError("响应不是有效的 JSON，请检查 cookie 是否正确")
+        if result.get("code") != 0:
+            raise QzAPIError(
+                f"API 请求失败: {result.get('message', '未知错误')}",
+                result.get("code"),
+            )
+        return True
+
     def create_job(self, config: Dict[str, Any]) -> Dict[str, Any]:
-        """创建任务"""
-        result = self._request("/openapi/v1/train_job/create", config)
-        return result.get("data", result)
+        """创建训练任务：v2 Console API 优先，路由不通时回落 cookie v1。"""
+        cookie_data = get_cookie()
+        cookie = cookie_data.get("cookie") if cookie_data else ""
+        return _v2_then_v1(
+            "train_job/create",
+            lambda: self.create_job_v2(cookie, config),
+            lambda: self.create_job_with_cookie(cookie, config),
+        )
 
     @with_rate_limit_retry
     @with_auth_retry
@@ -2106,7 +2156,7 @@ class QzAPI:
 
         所以这里走两级：
 
-        1. 老 OpenAPI（唯一的"规格清单"语义来源，还活着就用）
+        1. v2 ``workspace GetScheduleConfig`` 的预定义训练规格表
         2. v2 ``train ListJobs`` 的历史任务：
            ``framework_config[].instance_spec_price_info`` 里带 ``quota_id``，
            而 quota_id 就是 spec_id，同时还带全套 cpu/gpu/内存/gpu_type。
@@ -2125,17 +2175,6 @@ class QzAPI:
             predef = self._specs_from_schedule_config(workspace_id, compute_group_id)
             if predef:
                 return predef
-
-        try:
-            result = self._request(
-                "/openapi/v1/specs/list", {"logic_compute_group_id": compute_group_id}
-            )
-            specs = result.get("data", {}).get("specs", [])
-            if specs:
-                return specs
-        except QzAPIError:
-            # 404 / invalid_grant 都算这一级不可用，静默降级到历史任务推断
-            pass
 
         if not workspace_id:
             return []

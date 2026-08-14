@@ -267,8 +267,8 @@ class RateLimitMustNotDoubleQpsTests(unittest.TestCase):
                     api.get_job_detail("job-1")
         self.assertEqual(v1_calls["n"], 0, "撞 429 之后还去打了 v1 —— 把请求量翻倍了")
 
-    def test_other_errors_still_fall_back_to_v1(self):
-        """对照组：非限流的错误仍要保留 v1 兜底，别把这条路修死了。"""
+    def test_business_error_never_falls_back_to_openapi(self):
+        """业务错误由 v2/cookie-v1 分发器处理，不能再绕去 openapi。"""
         api = api_mod.QzAPI(username="u", password="p")
         with sandbox_home(
             cookie='{"cookie": "inspire-session=ok", "workspace_id": "ws-1"}'
@@ -276,9 +276,8 @@ class RateLimitMustNotDoubleQpsTests(unittest.TestCase):
             with patch.object(
                 api,
                 "get_job_detail_with_cookie",
-                side_effect=api_mod.QzAPIError("v2 路由不通", 404),
-            ), patch.object(
-                api, "_request", return_value={"data": {"job_id": "job-1"}}
-            ):
-                got = api.get_job_detail("job-1")
-        self.assertEqual(got.get("job_id"), "job-1", "普通错误的 v1 兜底不该被误伤")
+                side_effect=api_mod.QzAPIError("AccessForbidden"),
+            ), patch.object(api, "_request") as legacy:
+                with self.assertRaises(api_mod.QzAPIError):
+                    api.get_job_detail("job-1")
+        legacy.assert_not_called()
