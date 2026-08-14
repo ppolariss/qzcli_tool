@@ -296,6 +296,7 @@ qzcli dashboard --no-browser         # headless（远端/无 GUI 场景）
 | 命令 | 别名 | 说明 |
 |------|------|------|
 | `list` | `ls` | 列出任务 |
+| `tasks` | `jobs`, `blame` | 查看工作空间任务维度（v2 优先）；`blame` 默认按用户汇总 |
 
 ```bash
 # Cookie 模式（从 API 获取）
@@ -308,6 +309,13 @@ qzcli ls -c -w 分布式 -n 50 # 显示 50 条
 qzcli ls                    # 默认列表
 qzcli ls -r                 # 运行中
 qzcli ls --no-refresh       # 不刷新状态
+
+# 任务维度看板（默认启动本地前端）
+qzcli blame
+qzcli blame -w 分布式
+
+# 只在终端输出 Blame Summary
+qzcli blame -w 分布式 --no-serve
 ```
 
 ### 创建任务

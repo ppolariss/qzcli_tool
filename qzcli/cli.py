@@ -54,6 +54,7 @@ from .config import (
 from .diag import last_reason, swallowed
 from .display import get_display
 from .store import JobRecord, get_store
+from .task_dimensions import cmd_task_dimensions
 
 try:
     from rich import box
@@ -8626,6 +8627,40 @@ def main():
         "--by-priority", "-r", action="store_true", help="按优先级统计"
     )
 
+    # tasks / jobs / blame - 任务维度查询与本地看板
+    task_dims_parser = subparsers.add_parser(
+        "tasks",
+        aliases=["jobs", "blame"],
+        help="查看 workspace ListTaskDimension（v2 优先）并启动本地前端",
+    )
+    task_dims_parser.add_argument("--workspace", "-w", help="工作空间 ID 或名称")
+    task_dims_parser.add_argument("--project", "-p", help="项目 ID 或名称")
+    task_dims_parser.add_argument(
+        "--page-size", type=int, default=2000, help="后端分页大小（默认 2000）"
+    )
+    task_dims_parser.add_argument(
+        "--debug-api", action="store_true", help="显示接口请求次数和耗时"
+    )
+    task_dims_parser.add_argument(
+        "--api-workers", type=int, default=8, help="分页接口并发数（默认 8）"
+    )
+    task_dims_parser.add_argument(
+        "--serve",
+        dest="serve",
+        action="store_true",
+        default=True,
+        help="启动本地前端（默认开启）",
+    )
+    task_dims_parser.add_argument(
+        "--no-serve", dest="serve", action="store_false", help="只输出命令行表格"
+    )
+    task_dims_parser.add_argument(
+        "--host", default="127.0.0.1", help="前端监听地址（默认 127.0.0.1）"
+    )
+    task_dims_parser.add_argument(
+        "--port", type=int, default=8765, help="前端监听端口（默认 8765）"
+    )
+
     # dashboard 命令 - 成分下钻可视化看板
     dashboard_parser = subparsers.add_parser(
         "dashboard",
@@ -8864,6 +8899,9 @@ def main():
         "avail": cmd_avail,
         "av": cmd_avail,
         "usage": cmd_usage,
+        "tasks": cmd_task_dimensions,
+        "jobs": cmd_task_dimensions,
+        "blame": cmd_task_dimensions,
         "dashboard": cmd_dashboard,
         "create": cmd_create,
         "create-job": cmd_create,
