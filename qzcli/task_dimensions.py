@@ -744,6 +744,32 @@ HTML_PAGE = """<!doctype html>
     const byId = (id) => document.getElementById(id);
     const COLUMN_WIDTH_STORAGE_KEY = "qzcli.task_dimensions.column_widths.v1";
 
+    function apiUrl(path, params = null) {
+      const base = new URL(window.location.href);
+      base.search = "";
+      base.hash = "";
+      if (!base.pathname.endsWith("/")) {
+        base.pathname = `${base.pathname}/`;
+      }
+      const url = new URL(String(path || "").replace(/^[/]+/, ""), base);
+      if (params) {
+        url.search = params.toString();
+      }
+      return url;
+    }
+
+    async function readJsonResponse(response) {
+      const contentType = response.headers.get("content-type") || "unknown";
+      const raw = await response.text();
+      try {
+        return JSON.parse(raw);
+      } catch (error) {
+        const preview = raw.trim().slice(0, 160);
+        const suffix = preview ? `: ${preview}` : "";
+        throw new Error(`HTTP ${response.status} returned non-JSON (${contentType})${suffix}`);
+      }
+    }
+
     function setLoadStatus(message = "", kind = "") {
       const status = byId("loadStatus");
       if (!status) return;
@@ -1256,7 +1282,7 @@ HTML_PAGE = """<!doctype html>
     }
 
     async function requestStop(jobIds) {
-      const response = await fetch("/api/stop", {
+      const response = await fetch(apiUrl("api/stop"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -1266,7 +1292,7 @@ HTML_PAGE = """<!doctype html>
           job_ids: jobIds,
         }),
       });
-      const payload = await response.json();
+      const payload = await readJsonResponse(response);
       if (!response.ok) {
         throw new Error(payload.error || "停止任务失败");
       }
@@ -1438,10 +1464,10 @@ HTML_PAGE = """<!doctype html>
       if (state.selectedWorkspaceId) params.set("workspace_id", state.selectedWorkspaceId);
       if (state.selectedProject) params.set("project", state.selectedProject);
       if (state.selectedGroup) params.set("group", state.selectedGroup);
-      const prefix = refresh ? "/api/refresh" : "/api/tasks";
+      const path = refresh ? "api/refresh" : "api/tasks";
       try {
-        const response = await fetch(params.size ? `${prefix}?${params.toString()}` : prefix, { cache: "no-store" });
-        const snapshot = await response.json();
+        const response = await fetch(apiUrl(path, params), { cache: "no-store" });
+        const snapshot = await readJsonResponse(response);
         if (!response.ok) {
           throw new Error(snapshot.error || `HTTP ${response.status}`);
         }

@@ -43,3 +43,24 @@ def test_flatten_task_dimension_produces_strict_json_for_non_finite_metrics():
 def test_json_bytes_rejects_non_finite_values_that_bypass_normalization():
     with pytest.raises(ValueError, match="Out of range float values"):
         task_dimensions._json_bytes({"rate_pct": float("inf")})
+
+
+def test_dashboard_api_requests_preserve_reverse_proxy_prefix():
+    html = task_dimensions.HTML_PAGE
+
+    assert "function apiUrl(path, params = null)" in html
+    assert "base.pathname = `${base.pathname}/`" in html
+    assert 'fetch(apiUrl("api/stop")' in html
+    assert "fetch(apiUrl(path, params)" in html
+    assert 'fetch("/api/' not in html
+    assert '"/api/refresh"' not in html
+    assert '"/api/tasks"' not in html
+
+
+def test_dashboard_reports_non_json_responses_before_parsing():
+    html = task_dimensions.HTML_PAGE
+
+    assert "async function readJsonResponse(response)" in html
+    assert "const raw = await response.text()" in html
+    assert "returned non-JSON" in html
+    assert "await response.json()" not in html
