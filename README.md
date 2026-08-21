@@ -318,6 +318,11 @@ qzcli blame -w 分布式
 qzcli blame -w 分布式 --no-serve
 ```
 
+`qzcli blame` 的前端合并 `workspace ListTaskDimension`（创建中/运行中的实时资源利用率）
+与 `train ListJobs`（排队中/保留态）。默认选中「创建中、运行中、成功保留、失败保留」；
+点击「只看排队中」可切到队列，也可逐个点击状态标签做任意组合筛选。队列可见范围遵循
+当前登录账号的平台权限。
+
 ### 创建任务
 
 | 命令 | 别名 | 说明 |

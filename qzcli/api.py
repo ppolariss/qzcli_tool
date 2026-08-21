@@ -1743,6 +1743,7 @@ class QzAPI:
         page_num: int = 1,
         page_size: int = 100,
         created_by: Optional[str] = None,
+        status_list: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """获取任务列表：优先 v2 ``train ListJobs``，v2 路由不通时回落 v1。
 
@@ -1751,10 +1752,20 @@ class QzAPI:
         return _v2_then_v1(
             "train_job/list",
             lambda: self._list_jobs_v2(
-                workspace_id, cookie, page_num, page_size, created_by
+                workspace_id,
+                cookie,
+                page_num,
+                page_size,
+                created_by,
+                status_list,
             ),
             lambda: self._list_jobs_v1(
-                workspace_id, cookie, page_num, page_size, created_by
+                workspace_id,
+                cookie,
+                page_num,
+                page_size,
+                created_by,
+                status_list,
             ),
         )
 
@@ -1765,6 +1776,7 @@ class QzAPI:
         page_num: int = 1,
         page_size: int = 100,
         created_by: Optional[str] = None,
+        status_list: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """``POST /api/v2/train?Action=ListJobs`` → ``Result.{jobs, total}``。"""
         body: Dict[str, Any] = {
@@ -1774,6 +1786,8 @@ class QzAPI:
         }
         if created_by:
             body["created_by"] = created_by
+        if status_list:
+            body["status_list"] = list(status_list)
         return self._request_v2(
             "train",
             "ListJobs",
@@ -1790,6 +1804,7 @@ class QzAPI:
         page_num: int = 1,
         page_size: int = 100,
         created_by: Optional[str] = None,
+        status_list: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """遗留路径 ``POST /api/v1/train_job/list`` → ``data.{jobs, total}``。"""
         url = f"{self.base_url}/api/v1/train_job/list"
@@ -1802,6 +1817,8 @@ class QzAPI:
 
         if created_by:
             payload["created_by"] = created_by
+        if status_list:
+            payload["status_list"] = list(status_list)
 
         # 需要完整的浏览器 headers 才能通过认证
         headers = {

@@ -65,6 +65,11 @@ class V2EndpointShapeTests(unittest.TestCase):
         _client().list_jobs_with_cookie("ws-1", "ck", created_by="user-9")
         self.assertEqual(self._last()["body"]["created_by"], "user-9")
 
+    def test_list_jobs_passes_status_list(self):
+        statuses = ["job_queuing", "job_failed_retaining"]
+        _client().list_jobs_with_cookie("ws-1", "ck", status_list=statuses)
+        self.assertEqual(self._last()["body"]["status_list"], statuses)
+
     def test_job_detail_hits_train_GetJob(self):
         _client().get_job_detail_with_cookie("job-1", "ck")
         call = self._last()

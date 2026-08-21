@@ -179,6 +179,58 @@ TASK_COLUMNS: List[Dict[str, str]] = [
 ]
 
 
+# 前端按生命周期阶段筛选，而不是把平台的大小写/前缀差异泄漏给用户。
+# `ListTaskDimension` 返回 ``RUNNING`` / ``CREATING``，训练任务列表返回
+# ``job_running`` / ``job_queuing``；两边必须归到同一组。
+STATUS_FILTER_OPTIONS: List[Dict[str, str]] = [
+    {"key": "queueing", "label": "排队中"},
+    {"key": "creating", "label": "创建中"},
+    {"key": "running", "label": "运行中"},
+    {"key": "succeeded_retaining", "label": "成功保留"},
+    {"key": "failed_retaining", "label": "失败保留"},
+    {"key": "other", "label": "其他状态"},
+]
+
+# 按用户要求：默认不显示队列；创建、运行和两种保留态默认选中。
+DEFAULT_STATUS_FILTER_KEYS = [
+    "creating",
+    "running",
+    "succeeded_retaining",
+    "failed_retaining",
+]
+
+# 资源维度接口已经覆盖创建中/运行中，并提供利用率。这里只向训练任务列表补拉
+# 无节点资源维度的状态，避免把几十万条历史终态任务拉回本地。
+SUPPLEMENTAL_TRAIN_JOB_STATUSES = [
+    "job_queuing",
+    "job_creating",
+    "job_succeeded_retaining",
+    "job_failed_retaining",
+]
+
+
+def _status_filter_key(status: Any) -> str:
+    """把平台原始状态归一到看板的可组合筛选组。"""
+    normalized = str(status or "").strip().lower().replace("-", "_")
+    if normalized.startswith("job_"):
+        normalized = normalized[4:]
+
+    if normalized in {"queue", "queued", "queueing", "queuing", "pending", "waiting"}:
+        return "queueing"
+    if normalized in {"create", "creating", "pending_create"}:
+        return "creating"
+    if normalized == "running":
+        return "running"
+    if normalized in {"succeeded_retaining", "success_retaining"}:
+        return "succeeded_retaining"
+    if normalized in {"failed_retaining", "failure_retaining"}:
+        return "failed_retaining"
+    return "other"
+
+
+_STATUS_LABEL_BY_KEY = {item["key"]: item["label"] for item in STATUS_FILTER_OPTIONS}
+
+
 def _authenticated_cookie_context(api) -> Tuple[str, str]:
     """返回最新 cookie 和配置中的默认 workspace。"""
     cookie_data = get_cookie() or {}
@@ -300,6 +352,24 @@ HTML_PAGE = """<!doctype html>
       display: grid;
       grid-template-columns: repeat(6, minmax(0, 1fr));
       gap: 10px;
+    }
+    .status-filter-panel {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 12px;
+      align-items: end;
+      margin-bottom: 14px;
+      padding-bottom: 14px;
+      border-bottom: 1px solid var(--line);
+    }
+    .status-filter-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+    .status-filter-actions button {
+      width: auto;
+      white-space: nowrap;
     }
     label {
       display: block;
@@ -573,8 +643,8 @@ HTML_PAGE = """<!doctype html>
       border: 1px solid rgba(93, 78, 55, 0.12);
       background: rgba(255,255,255,0.8);
     }
-    .status-running { color: var(--good); }
-    .status-queuing, .status-pending { color: var(--warn); }
+    .status-running, .status-succeeded { color: var(--good); }
+    .status-queuing, .status-pending, .status-creating { color: var(--warn); }
     .status-failed, .status-stopped { color: var(--bad); }
     @media (max-width: 1200px) {
       .stats, .controls { grid-template-columns: repeat(2, minmax(0, 1fr)); }
@@ -602,6 +672,16 @@ HTML_PAGE = """<!doctype html>
 
       <div class="card">
         <h2>Controls</h2>
+        <div class="status-filter-panel">
+          <div>
+            <label>任务状态（可组合）</label>
+            <div id="statusFilterChips" class="chip-box"></div>
+          </div>
+          <div class="status-filter-actions">
+            <button id="queueOnlyButton" type="button">只看排队中</button>
+            <button id="defaultStatusButton" type="button" class="secondary">恢复默认状态</button>
+          </div>
+        </div>
         <div class="controls">
           <div>
             <label for="workspaceSelect">Workspace</label>
@@ -733,6 +813,9 @@ HTML_PAGE = """<!doctype html>
       filterValue: "",
       search: "",
       onlyMine: false,
+      statusFilterOptions: [],
+      selectedStatusFilters: [],
+      statusFiltersInitialized: false,
       columnWidths: {},
       selectedRowIds: [],
       selectedWorkspaceId: "",
@@ -809,6 +892,8 @@ HTML_PAGE = """<!doctype html>
     function badgeClass(status) {
       const key = String(status || "").toLowerCase();
       if (key.includes("running")) return "status-running";
+      if (key.includes("succeeded")) return "status-succeeded";
+      if (key.includes("creating")) return "status-creating";
       if (key.includes("queue") || key.includes("pending")) return "status-queuing";
       if (key.includes("fail") || key.includes("stop")) return "status-failed";
       return "";
@@ -958,6 +1043,9 @@ HTML_PAGE = """<!doctype html>
       const search = state.search.trim().toLowerCase();
       const filterValue = state.filterValue.trim().toLowerCase();
       let rows = state.rows.filter((row) => {
+        if (!state.selectedStatusFilters.includes(row.status_group || "other")) {
+          return false;
+        }
         if (state.onlyMine && !row.is_mine) {
           return false;
         }
@@ -973,6 +1061,43 @@ HTML_PAGE = """<!doctype html>
       });
       rows.sort((a, b) => compare(a, b, state.sortKey, state.sortDir));
       return rows;
+    }
+
+    function renderStatusFilterChips() {
+      const root = byId("statusFilterChips");
+      root.innerHTML = "";
+      const counts = new Map();
+      for (const row of state.rows) {
+        const key = row.status_group || "other";
+        counts.set(key, (counts.get(key) || 0) + 1);
+      }
+
+      for (const option of state.statusFilterOptions) {
+        const active = state.selectedStatusFilters.includes(option.key);
+        const chip = document.createElement("button");
+        chip.type = "button";
+        chip.className = `chip${active ? " active" : ""}`;
+        chip.dataset.key = option.key;
+
+        const mark = document.createElement("span");
+        mark.className = "chip-mark";
+        mark.textContent = "✓";
+        const label = document.createElement("span");
+        label.textContent = option.label;
+        const count = document.createElement("kbd");
+        count.textContent = fmtNumber(counts.get(option.key) || 0);
+        chip.append(mark, label, count);
+
+        chip.addEventListener("click", () => {
+          state.selectedStatusFilters = active
+            ? state.selectedStatusFilters.filter((key) => key !== option.key)
+            : [...state.selectedStatusFilters, option.key];
+          state.selectedRowIds = [];
+          syncInputs();
+          render();
+        });
+        root.appendChild(chip);
+      }
     }
 
     function setOptions(select, items, includeEmpty = false, emptyLabel = "All") {
@@ -1058,7 +1183,7 @@ HTML_PAGE = """<!doctype html>
     function updateStats(rows) {
       const users = new Set(rows.map((row) => row.user_name).filter(Boolean));
       const projects = new Set(rows.map((row) => row.project_name).filter(Boolean));
-      const running = rows.filter((row) => String(row.status).toUpperCase() === "RUNNING").length;
+      const running = rows.filter((row) => row.status_group === "running").length;
       const gpu = rows.reduce((sum, row) => sum + Number(row.gpu_total || 0), 0);
       const cpu = rows.reduce((sum, row) => sum + Number(row.cpu_total || 0), 0);
       const mem = rows.reduce((sum, row) => sum + Number(row.memory_total || 0), 0);
@@ -1212,7 +1337,8 @@ HTML_PAGE = """<!doctype html>
               </td>
               ${columns.map((col) => {
                 const value = normalizeCell(row[col.key]);
-                const shortValue = shorten(value, Number(col.max_len || 0));
+                const displayValue = col.key === "status" ? (row.status_label || value) : value;
+                const shortValue = shorten(displayValue, Number(col.max_len || 0));
                 if (col.key === "status") {
                   return `<td title="${value.replace(/"/g, "&quot;")}"><span class="badge ${badgeClass(value)}">${shortValue || "-"}</span></td>`;
                 }
@@ -1261,6 +1387,7 @@ HTML_PAGE = """<!doctype html>
       byId("metricColumn").value = state.metricColumn;
       byId("onlyMineToggle").disabled = true;
       byId("onlyMineToggle").textContent = "All Tasks";
+      renderStatusFilterChips();
       setGroupBySelect(state.columns);
       renderGroupByChips(state.columns);
       updateSelectionControls();
@@ -1437,6 +1564,18 @@ HTML_PAGE = """<!doctype html>
         syncInputs();
         render();
       });
+      byId("queueOnlyButton").addEventListener("click", () => {
+        state.selectedStatusFilters = ["queueing"];
+        state.selectedRowIds = [];
+        syncInputs();
+        render();
+      });
+      byId("defaultStatusButton").addEventListener("click", () => {
+        state.selectedStatusFilters = [...(state.snapshot.default_status_filters || [])];
+        state.selectedRowIds = [];
+        syncInputs();
+        render();
+      });
       byId("refreshButton").addEventListener("click", () => loadData(true, "Refreshing data from QZ..."));
       byId("resetButton").addEventListener("click", () => {
         state.search = "";
@@ -1450,6 +1589,7 @@ HTML_PAGE = """<!doctype html>
         state.statsColumn = (state.snapshot.default_group_by || [])[0] || "status";
         state.metricColumn = "gpu_total";
         state.onlyMine = false;
+        state.selectedStatusFilters = [...(state.snapshot.default_status_filters || [])];
         state.selectedRowIds = [];
         syncInputs();
         render();
@@ -1478,6 +1618,11 @@ HTML_PAGE = """<!doctype html>
         state.rows = snapshot.rows || [];
         state.selectedRowIds = [];
         state.columns = snapshot.columns || [];
+        state.statusFilterOptions = snapshot.status_filter_options || [];
+        if (!state.statusFiltersInitialized) {
+          state.selectedStatusFilters = [...(snapshot.default_status_filters || [])];
+          state.statusFiltersInitialized = true;
+        }
         hydrateColumnWidths(state.columns);
         state.selectedWorkspaceId = snapshot.selected_workspace_id || "";
         state.selectedProject = snapshot.selected_project || "";
@@ -1559,6 +1704,10 @@ def _parse_created_at(value: str) -> int:
         return 0
 
     candidate = value.strip()
+    if candidate.isdigit():
+        timestamp = int(candidate)
+        # 平台任务列表用毫秒，少数旧响应可能用秒。
+        return timestamp if timestamp >= 10**12 else timestamp * 1000
     if candidate.count(" ") >= 4:
         candidate = candidate.rsplit(" ", 1)[0]
 
@@ -1568,6 +1717,17 @@ def _parse_created_at(value: str) -> int:
         except ValueError:
             continue
     return 0
+
+
+def _format_created_at(value: Any) -> Tuple[str, int]:
+    """返回适合展示的创建时间和毫秒时间戳。"""
+    raw = str(value or "")
+    epoch_ms = _parse_created_at(raw)
+    if raw.isdigit() and epoch_ms:
+        return datetime.fromtimestamp(epoch_ms / 1000).strftime(
+            "%Y-%m-%d %H:%M:%S"
+        ), epoch_ms
+    return raw, epoch_ms
 
 
 def _list_workspace_options() -> List[Dict[str, Any]]:
@@ -1908,12 +2068,41 @@ def _fetch_task_dimensions(
         api_workers=api_workers,
     )
 
+    supplemental_jobs = _fetch_paginated_items(
+        fetch_page=lambda page_num: api.list_jobs_with_cookie(
+            workspace_id,
+            cookie,
+            page_num=page_num,
+            page_size=page_size,
+            status_list=SUPPLEMENTAL_TRAIN_JOB_STATUSES,
+        ),
+        item_key="jobs",
+        endpoint="/api/v2/train?Action=ListJobs",
+        label="list_jobs(status_filter)",
+        page_size=page_size,
+        api_profile=api_profile,
+        api_debug=api_debug,
+        api_workers=api_workers,
+    )
+
     if project_name_filter:
         tasks = [
             task
             for task in tasks
             if project_name_filter
             in (task.get("project", {}) or {}).get("name", "").lower()
+        ]
+        supplemental_jobs = [
+            job
+            for job in supplemental_jobs
+            if project_name_filter in str(job.get("project_name", "") or "").lower()
+        ]
+
+    if project_id:
+        supplemental_jobs = [
+            job
+            for job in supplemental_jobs
+            if str(job.get("project_id", "") or "") == project_id
         ]
 
     if group_id:
@@ -1933,8 +2122,13 @@ def _fetch_task_dimensions(
                 (task.get("nodes_occupied") or {}).get("nodes") or []
             )
         ]
+        supplemental_jobs = [
+            job
+            for job in supplemental_jobs
+            if str(job.get("logic_compute_group_id", "") or "") == group_id
+        ]
 
-    rows = [
+    dimension_rows = [
         _flatten_task_dimension(
             task,
             workspace_id,
@@ -1942,6 +2136,21 @@ def _fetch_task_dimensions(
         )
         for task in tasks
     ]
+    supplemental_rows = [
+        _flatten_train_job(job, workspace_id, workspace_name)
+        for job in supplemental_jobs
+    ]
+
+    # 创建中任务可能短暂同时出现在两条接口里。资源维度行含真实利用率，优先保留；
+    # ListJobs 只补资源维度缺失的排队/保留态记录。
+    rows_by_id = {row["id"]: row for row in dimension_rows if row["id"]}
+    rows_without_id = [row for row in dimension_rows if not row["id"]]
+    for row in supplemental_rows:
+        if row["id"] and row["id"] not in rows_by_id:
+            rows_by_id[row["id"]] = row
+        elif not row["id"]:
+            rows_without_id.append(row)
+    rows = list(rows_by_id.values()) + rows_without_id
     result = {
         "workspace_id": workspace_id,
         "workspace_name": workspace_name,
@@ -1973,11 +2182,15 @@ def _flatten_task_dimension(
     node_names = nodes.get("nodes") or []
     created_at = str(task.get("created_at", "") or "")
     running_time_ms = _as_int(task.get("running_time_ms"))
+    status = str(task.get("status", "") or "")
+    status_group = _status_filter_key(status)
 
     return {
         "id": str(task.get("id", "") or ""),
         "name": str(task.get("name", "") or ""),
-        "status": str(task.get("status", "") or ""),
+        "status": status,
+        "status_group": status_group,
+        "status_label": _STATUS_LABEL_BY_KEY[status_group],
         "type": str(task.get("type", "") or ""),
         "priority": _as_int(task.get("priority")),
         "created_at": created_at,
@@ -2003,6 +2216,93 @@ def _flatten_task_dimension(
         "gpu_total": _as_float(gpu.get("total")),
         "gpu_used": _as_float(gpu.get("used")),
         "gpu_usage_rate_pct": round(_as_float(gpu.get("usage_rate")) * 100, 2),
+        "logic_compute_group_id": "",
+        "logic_compute_group_name": "",
+        "source": "task_dimension",
+    }
+
+
+def _flatten_train_job(
+    job: Dict[str, Any],
+    workspace_id: str,
+    workspace_name: str,
+    *,
+    is_mine: bool = False,
+) -> Dict[str, Any]:
+    """把 ``train ListJobs`` 记录补成与资源维度一致的前端行。"""
+    configs = [
+        item for item in (job.get("framework_config") or []) if isinstance(item, dict)
+    ]
+    requested_nodes = sum(
+        max(0, _as_int(item.get("instance_count"))) for item in configs
+    )
+    requested_gpu = sum(
+        max(0, _as_int(item.get("instance_count")))
+        * max(0, _as_int(item.get("gpu_count")))
+        for item in configs
+    )
+    cpu_total = sum(
+        max(0, _as_int(item.get("instance_count"))) * _as_float(item.get("cpu"))
+        for item in configs
+    )
+    memory_total = sum(
+        max(0, _as_int(item.get("instance_count"))) * _as_float(item.get("mem_gi"))
+        for item in configs
+    )
+
+    node_infos = [
+        item for item in (job.get("node_infos") or []) if isinstance(item, dict)
+    ]
+    node_names = []
+    for node in node_infos:
+        name = str(node.get("node_name") or node.get("name") or "")
+        if name:
+            node_names.append(name)
+
+    creator = job.get("created_by") or {}
+    status = str(job.get("status", "") or "")
+    status_group = _status_filter_key(status)
+    created_at, created_at_epoch = _format_created_at(job.get("created_at"))
+    gpu_total = _as_float(job.get("gpu_count")) or float(requested_gpu)
+    node_count = max(_as_int(job.get("node_count")), requested_nodes)
+    priority = _as_int(
+        job.get("priority_name") or job.get("task_priority") or job.get("priority")
+    )
+
+    return {
+        "id": str(job.get("job_id", "") or ""),
+        "name": str(job.get("name", "") or ""),
+        "status": status,
+        "status_group": status_group,
+        "status_label": _STATUS_LABEL_BY_KEY[status_group],
+        "type": "distributed_training",
+        "priority": priority,
+        "created_at": created_at,
+        "created_at_epoch": created_at_epoch,
+        "running_time_ms": 0,
+        "running_duration": format_duration("0"),
+        "is_mine": is_mine,
+        "workspace_id": workspace_id,
+        "workspace_name": workspace_name or workspace_id,
+        "project_id": str(job.get("project_id", "") or ""),
+        "project_name": str(job.get("project_name", "") or ""),
+        "user_id": str(creator.get("id", "") or ""),
+        "user_name": str(creator.get("name", "") or ""),
+        "node_types": "",
+        "node_count": node_count,
+        "node_names": ", ".join(node_names),
+        "cpu_total": cpu_total,
+        "cpu_used": 0.0,
+        "cpu_usage_rate_pct": 0.0,
+        "memory_total": memory_total,
+        "memory_used": 0.0,
+        "memory_usage_rate_pct": 0.0,
+        "gpu_total": gpu_total,
+        "gpu_used": 0.0,
+        "gpu_usage_rate_pct": 0.0,
+        "logic_compute_group_id": str(job.get("logic_compute_group_id", "") or ""),
+        "logic_compute_group_name": str(job.get("logic_compute_group_name", "") or ""),
+        "source": "train_list_jobs",
     }
 
 
@@ -2056,7 +2356,9 @@ def _build_snapshot(
         selected_workspace_id, rows
     )
     return {
-        "endpoint": "/api/v2/workspace?Action=ListTaskDimension",
+        "endpoint": (
+            "/api/v2/workspace?Action=ListTaskDimension + /api/v2/train?Action=ListJobs"
+        ),
         "workspace_id": data["workspace_id"],
         "workspace_name": data["workspace_name"],
         "project_display": data["project_display"],
@@ -2065,6 +2367,8 @@ def _build_snapshot(
         "generated_at": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
         "row_count": len(rows),
         "default_group_by": default_group_by,
+        "status_filter_options": STATUS_FILTER_OPTIONS,
+        "default_status_filters": DEFAULT_STATUS_FILTER_KEYS,
         "workspace_options": [
             {"id": item["id"], "name": item["name"]} for item in workspace_options
         ],
